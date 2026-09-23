@@ -74,6 +74,18 @@ LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s_instance->create_rtv();
         }
         return 0;
+    // Swallow WM_CLOSE — DefWindowProc would translate it to WM_DESTROY +
+    // exit. Alt+F4 / X-button / SC_CLOSE ALL reach us as WM_CLOSE. Overlay
+    // exits ONLY via game-death detector (running_=false in overlay::run)
+    // or user-initiated Quit menu. Prevents accidental Alt+F4 kill when
+    // overlay has focus (menu open).
+    case WM_CLOSE:
+        return 0;
+    // WM_SYSCOMMAND SC_CLOSE — Alt+Space→Close menu, taskbar close. Same
+    // policy: ignore. Other SC_* (SC_MINIMIZE etc.) fall through to Def.
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_CLOSE) return 0;
+        break;
     case WM_DESTROY:
         if (s_instance) s_instance->running_ = false;
         PostQuitMessage(0);
