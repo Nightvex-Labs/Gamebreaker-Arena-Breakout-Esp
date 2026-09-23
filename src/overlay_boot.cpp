@@ -9,6 +9,7 @@
 #include <atomic>
 #include <thread>
 #include <math.h>
+#include <stdio.h>
 #include <imgui.h>
 #include "abi_ui/overlay.hpp"
 #include "abi_ui/control_panel.hpp"
@@ -215,6 +216,16 @@ extern "C" int AhOverlayRun(void) {
                 if (const char* wn = abi::items::lookup(le.weapon_id)) {
                     e.weapon_asset = wn;
                     e.weapon = std::string(wn).substr(0, 5);
+                } else {
+                    // ID not in item_names.hpp — surface it so we can extend
+                    // the catalog. Short form "ID:xxxxx" (last 5 digits) for
+                    // label; full 9-digit id in asset for hover/log side.
+                    char buf[16];
+                    _snprintf_s(buf, _TRUNCATE, "%u", (unsigned)(le.weapon_id % 100000u));
+                    e.weapon = std::string("?") + buf;
+                    char asset[32];
+                    _snprintf_s(asset, _TRUNCATE, "unknown:%u", (unsigned)le.weapon_id);
+                    e.weapon_asset = asset;
                 }
             }
             stub_snap.entities.push_back(std::move(e));

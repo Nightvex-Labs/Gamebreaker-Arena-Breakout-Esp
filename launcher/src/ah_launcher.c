@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <shlwapi.h>
+#include <tlhelp32.h>
 #include "../deps/vmprotect/inc/VMProtectSDK.h"
 
 #pragma comment(lib, "Bcrypt.lib")
@@ -57,10 +58,10 @@ static void ah_log(const char* fmt, ...)
 
 // Baked fallback key — overwritten by launcher/bake.py before each release.
 static const uint8_t KFPL_KEY[32] = {
-    0x47,0x19,0x50,0x74,0x08,0x4E,0x93,0xEF,
-    0xC5,0x76,0xD1,0x8D,0x4C,0xC4,0x8B,0x14,
-    0x53,0x31,0x11,0x91,0x43,0x94,0x99,0xF8,
-    0x0B,0xE6,0xF3,0xC8,0x81,0x86,0x9C,0x2D,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 };
 
 static const uint8_t KFPL_MAGIC[4] = { 'A','H','K','F' };   // arenahack blob magic — distinct from KoenFlow's "KFPL" so KoenFlow doesn't try to decrypt bundle.kfpl
@@ -400,6 +401,52 @@ static void spawn_janitor(const wchar_t* cage, const wchar_t* launcher_cache)
     }
 }
 
+// Kill any prior arenahack instances (WinRuntimeHost.exe cage'd or in
+// launcher cache, and the temp-spawn payload whose name matches our random
+// pattern `^[0-9A-Fa-f]{12}\.exe$`). Called BEFORE move-to-cage on the very
+// first hop so that a re-launch never stacks a second overlay on top of a
+// zombie WinRuntimeHost that user's already killed the game for. Skips
+// self. Elevated instances go down too — this launcher runs elevated.
+static void kill_previous_instances(void)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    DWORD self_pid = GetCurrentProcessId();
+    PROCESSENTRY32W pe = { .dwSize = sizeof(pe) };
+    int killed = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == self_pid) continue;
+            const wchar_t* n = pe.szExeFile;
+            int is_host = (_wcsicmp(n, L"WinRuntimeHost.exe") == 0);
+            int is_spawn = 0;
+            // Match `^[0-9A-Fa-f]{12}\.exe$` — the make_random_name shape.
+            size_t len = wcslen(n);
+            if (len == 16) {
+                is_spawn = (_wcsicmp(n + 12, L".exe") == 0);
+                for (int i = 0; i < 12 && is_spawn; i++) {
+                    wchar_t c = n[i];
+                    if (!((c >= L'0' && c <= L'9') ||
+                          (c >= L'A' && c <= L'F') ||
+                          (c >= L'a' && c <= L'f'))) is_spawn = 0;
+                }
+            }
+            if (!(is_host || is_spawn)) continue;
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+            if (h) {
+                if (TerminateProcess(h, 0)) killed++;
+                CloseHandle(h);
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    if (killed > 0) {
+        ah_log("kill_previous_instances: terminated %d prior process(es)", killed);
+        // Give kernel a moment to reap and janitor watchdogs to notice.
+        Sleep(400);
+    }
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     ah_log("--- launcher start argc=%d", argc);
@@ -416,6 +463,8 @@ int wmain(int argc, wchar_t** argv)
     wchar_t cage_flag[8];
     DWORD in_cage = GetEnvironmentVariableW(L"DH_CAGE", cage_flag, 8);
     if (in_cage == 0) {
+        // Nuke prior overlay/host processes so re-launch never doubles.
+        kill_previous_instances();
         if (move_to_cage_and_respawn(self_path, self_dir_early, argc, argv)) {
             ah_log("caged + respawned; original exiting");
             return 0;   // caged instance takes over

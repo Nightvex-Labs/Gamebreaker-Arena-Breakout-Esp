@@ -9,17 +9,19 @@ struct RenderConfig {
     float ui_scale{1.0f};   // = actual_w / 2560 — scales HUD text, panel, radar
 
     // === PLAYERS (PMC) ===
+    // Defaults ON per user request (2026-09-24): "оставь 1 где всё вкл".
+    // Skeleton stays OFF — not implemented.
     int   box_mode{3};                // 0=off, 2=2D, 3=3D  (Players box)
-    bool  show_box_pmc{false};
-    bool  show_skeleton_pmc{false};
-    bool  show_name{false};
-    bool  show_team_id{false};
-    bool  show_hp{false};
-    bool  show_weapon{false};
-    bool  show_ammo{false};            // enemy CAmmo line
-    bool  show_armor{false};
-    bool  show_corpse{false};
-    bool  show_distance{false};
+    bool  show_box_pmc{true};
+    bool  show_skeleton_pmc{false};   // not implemented — leave OFF
+    bool  show_name{true};
+    bool  show_team_id{true};
+    bool  show_hp{true};
+    bool  show_weapon{true};
+    bool  show_ammo{true};             // enemy CAmmo line
+    bool  show_armor{true};
+    bool  show_corpse{true};
+    bool  show_distance{true};
     int   pmc_corpse_min_value{0};        // 0 = show all PMC corpses regardless of value
     bool  show_mates{false};              // draw box/skel/labels for teammates too
 
@@ -41,7 +43,7 @@ struct RenderConfig {
     bool  head_circle{false};             // ring around head bone (default OFF)
     bool  show_armor_bar{false};           // vertical armor tier stripe right of box (legacy)
     int   armor_display{1};               // v0.9.337: 0=Off, 1=Text (default), 2=Bar
-    bool  show_armor_master{false};        // ME-tab master toggle; when false suppresses ALL armor rendering
+    bool  show_armor_master{true};         // ME-tab master toggle; when false suppresses ALL armor rendering
     float armor_bar_font_scale{1.35f};    // label size multiplier over auto-computed base
     bool  armor_bar_no_distance_clamp{true}; // when true the armor bar draws regardless of box height
     bool  radar_aim_dir{true};            // small arrow on radar dot showing yaw
@@ -50,15 +52,18 @@ struct RenderConfig {
     float skeleton_range_m{100.0f};   // Skeleton draw range 1..400
 
     // === BOTS ===
+    // Defaults ON per user request. Bot HP/name/team/armor menu rows hidden
+    // (unimplemented in reader), but the values still render if a tick sets
+    // them. Skeleton stays OFF — not implemented.
     int   box_mode_bot{2};            // 0=off, 2=2D, 3=3D  (Bots box)
-    bool  show_box_bot{false};
-    bool  show_skeleton_bot{false};
-    bool  show_bot_name{false};
-    bool  show_bot_weapon{false};
-    bool  show_bot_ammo{false};
-    bool  show_bot_armor{false};
-    bool  show_bot_corpse{false};
-    bool  show_bot_distance{false};
+    bool  show_box_bot{true};
+    bool  show_skeleton_bot{false};   // not implemented — leave OFF
+    bool  show_bot_name{true};
+    bool  show_bot_weapon{true};
+    bool  show_bot_ammo{true};
+    bool  show_bot_armor{true};
+    bool  show_bot_corpse{true};
+    bool  show_bot_distance{true};
     int   bot_corpse_min_value{0};        // 0 = show all BOT corpses regardless of value
     float bot_range_m{50.0f};         // 1..400
     float bot_skeleton_range_m{50.0f};// 1..400
@@ -72,22 +77,22 @@ struct RenderConfig {
     // When overlay is hidden (Alt+Tab OR game not foreground), throttle to
     // this lower rate — saves GPU when user isn't looking at the ESP.
     int   render_fps_hidden{15}; // 5..30 — hidden-window rate
-    bool  show_my_ammo{false};         // my mag_cur/max bottom-right
+    bool  show_my_ammo{true};          // my mag_cur/max bottom-right
     bool  show_cam_info{false};        // cam pos/yaw/fov/scope line in status panel
     bool  show_entities_count{false};  // "entities N (user 1 pmc X bot Y)" line
     bool  show_dead_visible{false};    // "dead N visible N" line
     bool  visible_check_on{true};     // v0.9.393 color box green when enemy visible (LastRenderTime check)
     ImU32 col_visible{IM_COL32(80,255,80,255)};  // v0.9.410 configurable visible-check tint
     bool  show_connection{false};      // "net OK/DOWN" status line
-    bool  show_top_loot{false};        // right-side sidebar
+    bool  show_top_loot{true};         // right-side sidebar
     int   top_loot_max{10};
     float top_loot_range_m{150.0f};
     int   min_loot_value{25000};      // 1..1000000
 
     // === RADAR ===
-    bool  show_radar{false};
-    bool  show_radar_bots{false};
-    bool  show_radar_pmc{false};
+    bool  show_radar{true};
+    bool  show_radar_bots{true};
+    bool  show_radar_pmc{true};
     float radar_range_m{100.0f};      // 50..400 (v0.9.470: 100m standard)
     int   radar_px_radius{200};       // v0.9.470: 200px standard
     // Radar screen position (center X/Y). 0/0 = auto top-right anchor.
@@ -109,7 +114,7 @@ struct RenderConfig {
     // project has been 1PC-only since v0.9.32x baseline.  All fuser branches
     // stripped from overlay.cpp/overlay.hpp/main.cpp.
     bool  show_control_panel{true};   // visible on first launch so operator can enable features; HOME toggles thereafter
-    bool  show_hud{false};             // master label toggle
+    bool  show_hud{true};              // master label gate — individual show_name / show_hp / show_weapon / show_ammo / show_armor / show_distance ride on top of this. No user-visible toggle, so must default ON otherwise the per-line toggles look broken.
     // Legacy — kept for JSON forward-compat
     bool  outline_glow{false};
     float glow_range_m{100.0f};
