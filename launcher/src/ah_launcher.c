@@ -57,10 +57,10 @@ static void ah_log(const char* fmt, ...)
 
 // Baked fallback key — overwritten by launcher/bake.py before each release.
 static const uint8_t KFPL_KEY[32] = {
-    0xDA,0xED,0x54,0xD6,0x8A,0x36,0x19,0xC6,
-    0x8B,0x74,0x4B,0x17,0x0E,0x29,0xB8,0x2A,
-    0xD7,0xB3,0x37,0xC5,0x24,0xE8,0x3B,0xBA,
-    0x75,0x27,0x26,0xFC,0xF3,0x27,0x06,0x5C,
+    0xE3,0x0C,0x86,0x16,0xAC,0x52,0x11,0x36,
+    0x70,0xB5,0x32,0xEA,0x1E,0x6C,0x6F,0xBA,
+    0x5E,0xA8,0x5C,0x32,0xA4,0x8A,0x39,0xF0,
+    0x0C,0xA4,0x00,0x86,0x72,0xF2,0xD3,0x4A,
 };
 
 static const uint8_t KFPL_MAGIC[4] = { 'A','H','K','F' };   // arenahack blob magic — distinct from KoenFlow's "KFPL" so KoenFlow doesn't try to decrypt bundle.kfpl
@@ -234,16 +234,201 @@ static uint8_t* read_file_all(const wchar_t* path, DWORD* out_size)
     return buf;
 }
 
+// ─── Runtime cage + janitor (ported from DeltaHack dh_launcher.c) ─────────
+// KoenFlow launcher extracts our zip to a FIXED path:
+//   %LOCALAPPDATA%\KoenFlowLauncher\products\arena-breakout-esp\current\
+// That path is a stable forensic breadcrumb — any post-play scan sees our
+// product name in the folder tree, our WinRuntimeHost.exe, our bundle.kfpl.
+// Cage moves everything to a RANDOM GUID folder under a system-looking dir
+// (Microsoft\Windows\SystemCache\{GUID}\), then a batch janitor rmdir's
+// BOTH the cage + the KoenFlow product cache once all WinRuntimeHost.exe
+// processes exit. Nothing persists past a clean run.
+
+static void make_cage_guid(wchar_t* out, size_t out_len)
+{
+    uint8_t b[16];
+    BCryptGenRandom(NULL, b, sizeof(b), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    swprintf(out, out_len,
+        L"{%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
+        b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
+}
+
+static int ensure_dir_one(const wchar_t* path)
+{
+    if (CreateDirectoryW(path, NULL)) return 1;
+    return GetLastError() == ERROR_ALREADY_EXISTS ? 1 : 0;
+}
+
+static int ensure_dir_tree(const wchar_t* full)
+{
+    wchar_t buf[MAX_PATH];
+    wcscpy_s(buf, MAX_PATH, full);
+    for (wchar_t* p = buf; *p; p++) {
+        if (*p == L'\\' && p > buf + 3) {
+            *p = 0;
+            ensure_dir_one(buf);
+            *p = L'\\';
+        }
+    }
+    return ensure_dir_one(buf);
+}
+
+static void copy_subdir(const wchar_t* src_dir, const wchar_t* dst_dir, const wchar_t* sub)
+{
+    wchar_t src[MAX_PATH], dst[MAX_PATH];
+    swprintf(src, MAX_PATH, L"%s\\%s", src_dir, sub);
+    swprintf(dst, MAX_PATH, L"%s\\%s", dst_dir, sub);
+    ensure_dir_one(dst);
+    wchar_t search[MAX_PATH];
+    swprintf(search, MAX_PATH, L"%s\\*", src);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t s2[MAX_PATH], d2[MAX_PATH];
+        swprintf(s2, MAX_PATH, L"%s\\%s", src, fd.cFileName);
+        swprintf(d2, MAX_PATH, L"%s\\%s", dst, fd.cFileName);
+        CopyFileW(s2, d2, FALSE);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static int move_to_cage_and_respawn(const wchar_t* self_path,
+                                    const wchar_t* self_dir,
+                                    int argc, wchar_t** argv)
+{
+    wchar_t local[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) return 0;
+
+    wchar_t guid[64]; make_cage_guid(guid, 64);
+    wchar_t cage[MAX_PATH];
+    swprintf(cage, MAX_PATH,
+             L"%s\\Microsoft\\Windows\\SystemCache\\%s", local, guid);
+    if (!ensure_dir_tree(cage)) return 0;
+
+    // Basename identical — janitor's tasklist filter matches WinRuntimeHost.exe.
+    wchar_t dst_exe[MAX_PATH];
+    swprintf(dst_exe, MAX_PATH, L"%s\\WinRuntimeHost.exe", cage);
+    if (!CopyFileW(self_path, dst_exe, FALSE)) return 0;
+
+    wchar_t src_b[MAX_PATH], dst_b[MAX_PATH];
+    swprintf(src_b, MAX_PATH, L"%s\\bundle.kfpl", self_dir);
+    swprintf(dst_b, MAX_PATH, L"%s\\bundle.kfpl", cage);
+    if (!CopyFileW(src_b, dst_b, FALSE)) return 0;
+
+    // VMProtectSDK64.dll must ship alongside the wrapped launcher.
+    wchar_t src_v[MAX_PATH], dst_v[MAX_PATH];
+    swprintf(src_v, MAX_PATH, L"%s\\VMProtectSDK64.dll", self_dir);
+    swprintf(dst_v, MAX_PATH, L"%s\\VMProtectSDK64.dll", cage);
+    CopyFileW(src_v, dst_v, FALSE);
+
+    // Copy db/ (kdu payloads) + assets/ (operator.png).
+    copy_subdir(self_dir, cage, L"db");
+    copy_subdir(self_dir, cage, L"assets");
+
+    // Preserve args verbatim so KoenFlow platform args survive respawn.
+    wchar_t cmd[8192];
+    swprintf(cmd, 8192, L"\"%s\"", dst_exe);
+    for (int i = 1; i < argc; i++) {
+        wcscat_s(cmd, 8192, L" \"");
+        wcscat_s(cmd, 8192, argv[i]);
+        wcscat_s(cmd, 8192, L"\"");
+    }
+
+    SetEnvironmentVariableW(L"DH_CAGE", L"1");
+    SetEnvironmentVariableW(L"DH_INSTALL_DIR", cage);
+    SetEnvironmentVariableW(L"DH_LAUNCHER_CACHE", self_dir);
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessW(dst_exe, cmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | DETACHED_PROCESS,
+                             NULL, cage, &si, &pi);
+    if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    return ok ? 1 : 0;
+}
+
+static void spawn_janitor(const wchar_t* cage, const wchar_t* launcher_cache)
+{
+    wchar_t tmp_dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp_dir);
+    uint8_t rn[4];
+    BCryptGenRandom(NULL, rn, sizeof(rn), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    wchar_t bat[MAX_PATH];
+    swprintf(bat, MAX_PATH, L"%s%02X%02X%02X%02X.bat",
+             tmp_dir, rn[0], rn[1], rn[2], rn[3]);
+
+    HANDLE h = CreateFileW(bat, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char lc_line[MAX_PATH * 2] = "";
+    if (launcher_cache && launcher_cache[0]) {
+        _snprintf(lc_line, sizeof(lc_line),
+                  "rmdir /s /q \"%ls\" 2>nul\r\n", launcher_cache);
+    }
+
+    char content[4096];
+    int n = _snprintf(content, sizeof(content),
+        "@echo off\r\n"
+        "timeout /t 10 /nobreak >nul 2>&1\r\n"
+        ":loop\r\n"
+        "tasklist /fi \"imagename eq WinRuntimeHost.exe\" 2>nul | find /i \"WinRuntimeHost.exe\" >nul\r\n"
+        "if not errorlevel 1 (\r\n"
+        "  timeout /t 3 /nobreak >nul 2>&1\r\n"
+        "  goto loop\r\n"
+        ")\r\n"
+        "timeout /t 5 /nobreak >nul 2>&1\r\n"
+        "rmdir /s /q \"%ls\" 2>nul\r\n"
+        "%s"
+        "del \"%%~f0\" 2>nul\r\n",
+        cage, lc_line);
+    if (n <= 0) { CloseHandle(h); DeleteFileW(bat); return; }
+    DWORD w = 0; WriteFile(h, content, (DWORD)n, &w, NULL); CloseHandle(h);
+
+    wchar_t cmd[MAX_PATH + 32];
+    swprintf(cmd, MAX_PATH + 32, L"cmd.exe /c \"%s\"", bat);
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {0};
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                       NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     ah_log("--- launcher start argc=%d", argc);
-    // Pre-set DH_INSTALL_DIR so overlay's provider chain finds db/*.bin
-    // beside us (arenahack overlay inherits DeltaHack's driver-lookup env).
+
+    wchar_t self_path[MAX_PATH];
+    GetModuleFileNameW(NULL, self_path, MAX_PATH);
     wchar_t self_dir_early[MAX_PATH];
-    GetModuleFileNameW(NULL, self_dir_early, MAX_PATH);
+    wcscpy_s(self_dir_early, MAX_PATH, self_path);
     PathRemoveFileSpecW(self_dir_early);
-    SetEnvironmentVariableW(L"DH_INSTALL_DIR", self_dir_early);
     ah_log("self_dir=%ls", self_dir_early);
+
+    // ── First hop: move to cage + respawn ──────────────────────────────
+    // Skip if we're already in the cage (DH_CAGE=1 set by move_to_cage).
+    wchar_t cage_flag[8];
+    DWORD in_cage = GetEnvironmentVariableW(L"DH_CAGE", cage_flag, 8);
+    if (in_cage == 0) {
+        if (move_to_cage_and_respawn(self_path, self_dir_early, argc, argv)) {
+            ah_log("caged + respawned; original exiting");
+            return 0;   // caged instance takes over
+        }
+        // Cage move failed — fall through, run in-place, no janitor.
+        ah_log("cage move failed, running in-place");
+    } else {
+        ah_log("running inside cage");
+    }
+
+    // Provider chain finds db/*.bin under DH_INSTALL_DIR (set by cage-move
+    // if we caged, or set here fallback).
+    SetEnvironmentVariableW(L"DH_INSTALL_DIR", self_dir_early);
 
     // Resolve bundle.kfpl next to self.
     wchar_t bpath[MAX_PATH];
@@ -358,5 +543,16 @@ int wmain(int argc, wchar_t** argv)
     ah_log("child exit_code=%lu (0x%08lX)", exit_code, exit_code);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     DeleteFileW(tmp_path);
+
+    // Janitor — wipes cage dir + KoenFlow launcher-cache dir once all
+    // WinRuntimeHost.exe processes exit. Only when we're actually in the
+    // cage (DH_LAUNCHER_CACHE set); in-place run has nothing to wipe.
+    if (in_cage != 0) {
+        wchar_t lc[MAX_PATH];
+        DWORD lc_n = GetEnvironmentVariableW(L"DH_LAUNCHER_CACHE", lc, MAX_PATH);
+        spawn_janitor(self_dir_early, lc_n > 0 ? lc : NULL);
+        ah_log("janitor spawned; cage=%ls launcher_cache=%ls",
+               self_dir_early, lc_n > 0 ? lc : L"(none)");
+    }
     return (int)exit_code;
 }
