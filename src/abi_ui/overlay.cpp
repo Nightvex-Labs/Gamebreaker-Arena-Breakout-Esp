@@ -598,13 +598,48 @@ void Overlay::run(const std::function<void()>& frame_fn) {
         }
         if (!running_) break;
 
-        (void)game_hwnd; (void)game_probe_ctr; (void)fg_poll_ctr;
-        (void)overlay_visible;
-
-        // v0.9.410 Alt+Tab hide DISABLED again — cam.yaw stall approach
-        // had false positives (walker 150Hz vs game 60fps + player holding
-        // aim still). Overlay stays permanent-visible. Alt+Tab hide moved
-        // to backlog — needs UE4 focus flag offset (task #12 territory).
+        // ── Overlay visibility gate + game-death auto-exit ────────────────
+        // Re-locate game HWND every ~1s (60 frames @60fps). Between probes
+        // reuse cached handle. If game not foreground → hide overlay window.
+        // If game process gone for 3 consecutive probes (~3s) → break loop
+        // → self-exit → cage janitor wipes all artifacts.
+        if (++game_probe_ctr >= 60) {
+            game_probe_ctr = 0;
+            HWND fresh = find_game_hwnd();
+            if (fresh) { game_hwnd = fresh; }
+            else if (game_hwnd && !IsWindow(game_hwnd)) game_hwnd = nullptr;
+        }
+        if (++fg_poll_ctr >= 6) {
+            fg_poll_ctr = 0;
+            bool should_show = game_owns_foreground(game_hwnd, hwnd_);
+            if (should_show != overlay_visible) {
+                overlay_visible = should_show;
+                ShowWindowAsync(hwnd_, should_show ? SW_SHOWNOACTIVATE : SW_HIDE);
+            }
+        }
+        // Game process gone check — poll every ~60 frames. Only ARM the
+        // death detector after we've seen the game HWND at least once
+        // (user often opens overlay before launching game). 3 consecutive
+        // misses → exit → cage janitor wipes payload.
+        static bool game_seen_once = false;
+        static int  game_miss_streak = 0;
+        static int  game_death_ctr = 0;
+        if (game_hwnd && IsWindow(game_hwnd)) game_seen_once = true;
+        if (game_seen_once && ++game_death_ctr >= 60) {
+            game_death_ctr = 0;
+            bool alive = (game_hwnd && IsWindow(game_hwnd));
+            if (!alive) {
+                HWND probe = find_game_hwnd();
+                alive = (probe && IsWindow(probe));
+            }
+            if (!alive) { game_miss_streak++; }
+            else { game_miss_streak = 0; }
+            if (game_miss_streak >= 3) {
+                LOG("overlay::run: game window gone for 3 probes — self-exit");
+                running_ = false;
+                break;
+            }
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
