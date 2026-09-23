@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+release_staging/
+releases/*.zip
+launcher/build/
+launcher/embed/*.kfpl
+
+# Session/backup dirs
+_backup_*/
+
+# Editor / VS
+.vs/
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.lib
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
+build_log.txt
+
+# VMProtect artifacts
+*.vmp
+*.vmp.exe
+*.vmp_out.exe
