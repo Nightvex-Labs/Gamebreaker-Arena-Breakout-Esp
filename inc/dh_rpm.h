@@ -4,6 +4,10 @@
 // Discovered EPROCESS.Peb offset for the running OS build.
 // Auto-initialized on first RpmFindProcess() call. See dh_rpm.c.
 extern u32 g_eproc_peb_off;
+extern u32 g_eproc_dtb;
+extern u32 g_eproc_pid;
+extern u32 g_eproc_links;
+extern u32 g_eproc_imgname;
 extern u64 g_rpm_psisp;
 
 // CR3 discovery via low-stub scan (first 1MB physical).

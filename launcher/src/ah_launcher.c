@@ -22,7 +22,6 @@
 #include <string.h>
 #include <stdbool.h>
 #include <shlwapi.h>
-#include <tlhelp32.h>
 #include "../deps/vmprotect/inc/VMProtectSDK.h"
 
 #pragma comment(lib, "Bcrypt.lib")
@@ -149,6 +148,86 @@ out:
     return st;
 }
 
+// Context-file key cache. Populated by extract_key_from_launch_context()
+// early in wmain BEFORE cage move, so it survives respawn without needing
+// the file to be re-read after path relocation.
+static uint8_t g_context_key[32];
+static int     g_context_key_valid = 0;
+
+// Parse argv for --koenflow-launch-context (or the -keonflow- typo variant)
+// and pull "kfplKey":"<b64>" out of the JSON context. This is the only path
+// that survives Verb=runas — the C# side (BackendProductLaunchService.cs
+// WriteLaunchContextFile) drops the per-release key into that JSON precisely
+// because Windows ShellExecute strips process env vars on elevation.
+//
+// Plain-JSON only. When hasLoaderKey=true the C# side wraps the JSON with
+// DPAPI+"KFPC" magic — arenahack doesn't ship a loaderKey so we never hit
+// that branch. If we ever do, add CryptUnprotectData here.
+static void extract_key_from_launch_context(int argc, wchar_t** argv)
+{
+    for (int i = 1; i + 1 < argc; i++) {
+        if (_wcsicmp(argv[i], L"--koenflow-launch-context") != 0 &&
+            _wcsicmp(argv[i], L"--keonflow-launch-context") != 0) continue;
+        const wchar_t* path = argv[i + 1];
+
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 0x10000) {
+            CloseHandle(h); return;
+        }
+        char* buf = (char*)VirtualAlloc(NULL, (SIZE_T)sz.QuadPart + 1,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!buf) { CloseHandle(h); return; }
+        DWORD got = 0;
+        BOOL rd = ReadFile(h, buf, (DWORD)sz.QuadPart, &got, NULL);
+        CloseHandle(h);
+        if (!rd || got == 0) { VirtualFree(buf, 0, MEM_RELEASE); return; }
+        buf[got] = 0;
+
+        // KFPC = DPAPI-wrapped variant (loaderKey products). Not supported
+        // here; arenahack always takes the plain-JSON path.
+        if (got >= 4 && memcmp(buf, "KFPC", 4) == 0) {
+            ah_log("context: KFPC-wrapped context — DPAPI unwrap not supported (loaderKey product?)");
+            VirtualFree(buf, 0, MEM_RELEASE); return;
+        }
+
+        // Locate "kfplKey" : "<value>"  — minimal string walk, no full JSON parse.
+        const char* needle = "\"kfplKey\"";
+        char* p = strstr(buf, needle);
+        if (!p) { ah_log("context: kfplKey field not present"); VirtualFree(buf, 0, MEM_RELEASE); return; }
+        p += 9;   // past "kfplKey"
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != ':') { VirtualFree(buf, 0, MEM_RELEASE); return; }
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 'n' && memcmp(p, "null", 4) == 0) {
+            ah_log("context: kfplKey=null (backend returned no per-release key)");
+            VirtualFree(buf, 0, MEM_RELEASE); return;
+        }
+        if (*p != '"') { VirtualFree(buf, 0, MEM_RELEASE); return; }
+        p++;
+
+        char b64buf[80];
+        int b64_len = 0;
+        while (*p && *p != '"' && b64_len < (int)sizeof(b64buf) - 1) b64buf[b64_len++] = *p++;
+        b64buf[b64_len] = 0;
+
+        uint8_t out[32];
+        if (b64_decode(b64buf, out, 32) == 32) {
+            memcpy(g_context_key, out, 32);
+            g_context_key_valid = 1;
+            ah_log("context: kfplKey extracted from JSON (b64 %d chars)", b64_len);
+        } else {
+            ah_log("context: kfplKey b64 decode failed (%d chars)", b64_len);
+        }
+        SecureZeroMemory(buf, got);
+        VirtualFree(buf, 0, MEM_RELEASE);
+        return;
+    }
+}
+
 // Env-var conventions: try multiple names so admin backend can inject key
 // under whatever prefix it uses. All-zero baked KFPL_KEY[32] in release
 // builds forces env to be present — no in-binary decrypt possible.
@@ -156,6 +235,14 @@ static void resolve_key(uint8_t key32[32])
 {
     VMProtectBeginUltra("resolve_key");
     uint8_t out[32]; int ok = 0;
+
+    // Priority 0: context-file key. This is the ShellExecute-runas-safe path
+    // — env vars are stripped by UAC, but arg-passed --koenflow-launch-context
+    // survives, and the C# WriteLaunchContextFile now writes kfplKey there.
+    if (g_context_key_valid) {
+        memcpy(out, g_context_key, 32);
+        ok = 1;
+    }
 
     static const char* B64_NAMES[] = {
         "AH_KFPL_KEY_B64",         // arenahack native
@@ -192,6 +279,76 @@ static void resolve_key(uint8_t key32[32])
     VMProtectEnd();
 }
 
+// Trailer format appended past the PE end by scripts/make_release_zip.py:
+//   [ bundle bytes (N) ][ u64 LE bundle_size ][ 4-byte magic "AHBE" ]
+// Trailer total = 12 bytes.
+// Windows loader ignores bytes past the last PE section, so the file
+// still runs as a plain MZ .exe — no sidecar bundle.kfpl needed on disk.
+#define AHBE_MAGIC      "AHBE"
+#define AHBE_TRAILER    12       // 8 bytes size + 4 bytes magic
+
+// Reads the KFPL bundle blob appended to the tail of our own on-disk PE.
+// Returns VirtualAlloc'd buffer (caller frees with VirtualFree) or NULL.
+static uint8_t* read_bundle_from_self(DWORD* out_size)
+{
+    if (out_size) *out_size = 0;
+
+    wchar_t self_path[MAX_PATH];
+    DWORD np = GetModuleFileNameW(NULL, self_path, MAX_PATH);
+    if (!np || np >= MAX_PATH) return NULL;
+
+    HANDLE h = CreateFileW(self_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= AHBE_TRAILER || sz.QuadPart > 0x40000000LL) {
+        CloseHandle(h); return NULL;
+    }
+
+    // Read trailer.
+    LARGE_INTEGER off; off.QuadPart = sz.QuadPart - AHBE_TRAILER;
+    if (!SetFilePointerEx(h, off, NULL, FILE_BEGIN)) { CloseHandle(h); return NULL; }
+    uint8_t trailer[AHBE_TRAILER];
+    DWORD rd = 0;
+    if (!ReadFile(h, trailer, AHBE_TRAILER, &rd, NULL) || rd != AHBE_TRAILER) {
+        CloseHandle(h); return NULL;
+    }
+    if (memcmp(trailer + 8, AHBE_MAGIC, 4) != 0) {
+        // No embed found — legacy sidecar mode fallback.
+        CloseHandle(h); return NULL;
+    }
+    uint64_t bundle_size = 0;
+    memcpy(&bundle_size, trailer, 8);
+    if (bundle_size == 0 || bundle_size > 0x20000000ULL ||
+        bundle_size + AHBE_TRAILER > (uint64_t)sz.QuadPart) {
+        CloseHandle(h); return NULL;
+    }
+
+    // Seek to bundle start and read it out.
+    off.QuadPart = sz.QuadPart - AHBE_TRAILER - (LONGLONG)bundle_size;
+    if (!SetFilePointerEx(h, off, NULL, FILE_BEGIN)) { CloseHandle(h); return NULL; }
+
+    uint8_t* buf = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)bundle_size,
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) { CloseHandle(h); return NULL; }
+
+    DWORD remaining = (DWORD)bundle_size, got = 0;
+    uint8_t* cur = buf;
+    while (remaining) {
+        DWORD chunk = 0;
+        if (!ReadFile(h, cur, remaining, &chunk, NULL) || chunk == 0) {
+            VirtualFree(buf, 0, MEM_RELEASE); CloseHandle(h); return NULL;
+        }
+        cur += chunk; got += chunk; remaining -= chunk;
+    }
+    CloseHandle(h);
+    if (out_size) *out_size = got;
+    return buf;
+}
+
+// Legacy sidecar path — retained for dev workflow where bundle.kfpl still
+// lives next to build\WinRuntimeHost.exe before append.
 static int bundle_path(wchar_t* out, size_t out_cch)
 {
     DWORD n = GetModuleFileNameW(NULL, out, (DWORD)out_cch);
@@ -401,55 +558,14 @@ static void spawn_janitor(const wchar_t* cage, const wchar_t* launcher_cache)
     }
 }
 
-// Kill any prior arenahack instances (WinRuntimeHost.exe cage'd or in
-// launcher cache, and the temp-spawn payload whose name matches our random
-// pattern `^[0-9A-Fa-f]{12}\.exe$`). Called BEFORE move-to-cage on the very
-// first hop so that a re-launch never stacks a second overlay on top of a
-// zombie WinRuntimeHost that user's already killed the game for. Skips
-// self. Elevated instances go down too — this launcher runs elevated.
-static void kill_previous_instances(void)
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-    DWORD self_pid = GetCurrentProcessId();
-    PROCESSENTRY32W pe = { .dwSize = sizeof(pe) };
-    int killed = 0;
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (pe.th32ProcessID == self_pid) continue;
-            const wchar_t* n = pe.szExeFile;
-            int is_host = (_wcsicmp(n, L"WinRuntimeHost.exe") == 0);
-            int is_spawn = 0;
-            // Match `^[0-9A-Fa-f]{12}\.exe$` — the make_random_name shape.
-            size_t len = wcslen(n);
-            if (len == 16) {
-                is_spawn = (_wcsicmp(n + 12, L".exe") == 0);
-                for (int i = 0; i < 12 && is_spawn; i++) {
-                    wchar_t c = n[i];
-                    if (!((c >= L'0' && c <= L'9') ||
-                          (c >= L'A' && c <= L'F') ||
-                          (c >= L'a' && c <= L'f'))) is_spawn = 0;
-                }
-            }
-            if (!(is_host || is_spawn)) continue;
-            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-            if (h) {
-                if (TerminateProcess(h, 0)) killed++;
-                CloseHandle(h);
-            }
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    if (killed > 0) {
-        ah_log("kill_previous_instances: terminated %d prior process(es)", killed);
-        // Give kernel a moment to reap and janitor watchdogs to notice.
-        Sleep(400);
-    }
-}
-
 int wmain(int argc, wchar_t** argv)
 {
     ah_log("--- launcher start argc=%d", argc);
+
+    // Extract per-release KFPL key from the C#-written launch context BEFORE
+    // any resolve_key call — Verb=runas strips env vars, this arg-passed
+    // context file is how per-release keys reach the elevated stub.
+    extract_key_from_launch_context(argc, argv);
 
     wchar_t self_path[MAX_PATH];
     GetModuleFileNameW(NULL, self_path, MAX_PATH);
@@ -463,8 +579,6 @@ int wmain(int argc, wchar_t** argv)
     wchar_t cage_flag[8];
     DWORD in_cage = GetEnvironmentVariableW(L"DH_CAGE", cage_flag, 8);
     if (in_cage == 0) {
-        // Nuke prior overlay/host processes so re-launch never doubles.
-        kill_previous_instances();
         if (move_to_cage_and_respawn(self_path, self_dir_early, argc, argv)) {
             ah_log("caged + respawned; original exiting");
             return 0;   // caged instance takes over
@@ -479,15 +593,22 @@ int wmain(int argc, wchar_t** argv)
     // if we caged, or set here fallback).
     SetEnvironmentVariableW(L"DH_INSTALL_DIR", self_dir_early);
 
-    // Resolve bundle.kfpl next to self.
-    wchar_t bpath[MAX_PATH];
-    if (!bundle_path(bpath, MAX_PATH)) { ah_log("bundle_path fail"); AH_MB(L"bundle path"); return 2; }
-    ah_log("bundle path=%ls", bpath);
-
+    // Bundle acquisition. Primary path: trailer-embedded blob past our own
+    // PE end (single-file distribution — user only ever sees one .exe). If
+    // no AHBE trailer is present (dev / local build), fall back to sidecar
+    // bundle.kfpl next to us.
     DWORD blob_size = 0;
-    uint8_t* blob = read_file_all(bpath, &blob_size);
-    if (!blob) { ah_log("bundle read fail"); AH_MB(L"bundle read"); return 2; }
-    ah_log("bundle size=%lu", blob_size);
+    uint8_t* blob = read_bundle_from_self(&blob_size);
+    if (blob) {
+        ah_log("bundle: self-trailer size=%lu", blob_size);
+    } else {
+        wchar_t bpath[MAX_PATH];
+        if (!bundle_path(bpath, MAX_PATH)) { ah_log("bundle_path fail"); AH_MB(L"bundle path"); return 2; }
+        ah_log("bundle: sidecar path=%ls", bpath);
+        blob = read_file_all(bpath, &blob_size);
+        if (!blob) { ah_log("bundle read fail"); AH_MB(L"bundle read"); return 2; }
+        ah_log("bundle: sidecar size=%lu", blob_size);
+    }
     if (blob_size < KFPL_HEADER_LEN + TAG_LEN) {
         ah_log("bundle truncated"); VirtualFree(blob, 0, MEM_RELEASE); AH_MB(L"bundle truncated"); return 2;
     }

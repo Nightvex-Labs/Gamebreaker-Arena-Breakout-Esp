@@ -1,6 +1,9 @@
 // arenahack — Arena Breakout Infinite (UAGame.exe) offsets.
 // Copied from C:\ABIFINAL\src\offsets.hpp on 2026-09-23.
-// Global RVAs verified Sep-18/20 patch. Struct offsets Sep-17 SDK re-audit.
+// Global RVAs updated 2026-09-24 for micro-patch (Dumper-7 fresh dump,
+// GameVersion 4.26.1-0+++UE4+Release-4.26). ACE_CACHE + FNAME_MASK_KEY
+// kept as-is until live-verified; sig-rescan pending if reader reads
+// garbage after this update.
 
 #pragma once
 #include <stdint.h>
@@ -16,12 +19,16 @@
 // ============================================================================
 // GLOBAL RVAs — Sep-18/20 live-verified
 // ============================================================================
-#define AH_RVA_GWORLD           0xB29A608ULL   // PLAIN pointer
-#define AH_RVA_GWORLD_MIRROR    0xB29C608ULL   // encrypted tamper mirror (swap+XOR 0x36)
-#define AH_RVA_GOBJECTS         0xB52C798ULL   // Sep-17
-#define AH_RVA_FNAMEPOOL        0xBB2C780ULL   // Sep-16
-#define AH_RVA_FNAME_MASK_KEY   0xBADE76CULL   // byte source for FName derived mask
-#define AH_RVA_ACE_CACHE        0xB5C0400ULL   // Sep-20 corrected -0x20
+#define AH_RVA_GWORLD           0xB2BEE48ULL   // 2026-09-24 dump (PLAIN pointer)
+#define AH_RVA_GWORLD_MIRROR    0xB2C0E48ULL   // GWorld + 0x2000 (tamper mirror)
+#define AH_RVA_GOBJECTS         0xB5510D8ULL   // 2026-09-24 dump
+#define AH_RVA_FNAMEPOOL        0xBB58F80ULL   // 2026-09-24 dump (Dumpspace OFFSET_GNAMES)
+// 2026-09-24: delta-shifted from GWorld micro-patch move (+0x24840).
+// GWorld moved 0xB29A608 → 0xB2BEE48; assume ACE/FName tables followed
+// the same section shift. If ACE decrypt returns garbage after this,
+// port sig_scanner ACE_CACHE hunt from ABIFINAL.
+#define AH_RVA_FNAME_MASK_KEY   0xBB02FACULL
+#define AH_RVA_ACE_CACHE        0xB5E4D40ULL   // 2026-09-24 try2: GObjects-section delta (+0x24940)
 
 #define AH_FNAME_POOL_OFF       0x7D000        // pool base -> entry 0 offset (Tencent-fork)
 #define AH_FNAME_MASK_LITERAL   0x4A           // literal in mask_eff derive

@@ -556,7 +556,15 @@ static HWND find_game_hwnd() {
 // Borderless UE4 windows don't reliably flip IsIconic/SW_SHOWMINIMIZED, so
 // tracking foreground ownership is what actually works.
 static bool game_owns_foreground(HWND game_hw, HWND self_hw) {
-    if (!game_hw || !IsWindow(game_hw)) return true;   // no game found — leave overlay up
+    // No UAGame window discovered → hide overlay. Player should never see the
+    // overlay while the game is not running (or minimized); the reader thread
+    // stays alive underneath so first frame after game foreground is instant.
+    if (!game_hw || !IsWindow(game_hw)) {
+        // Keep the control panel visible if the operator explicitly focused it
+        // (rare cold-config path). Otherwise hide.
+        HWND fg = GetForegroundWindow();
+        return (fg && fg == self_hw);
+    }
     if (IsIconic(game_hw)) return false;
 
     HWND fg = GetForegroundWindow();
@@ -591,7 +599,11 @@ namespace abi {
 void Overlay::run(const std::function<void()>& frame_fn) {
     MSG msg{};
     HWND game_hwnd = nullptr;
-    bool overlay_visible = true;
+    // Start hidden — init() showed the window for DirectComposition setup,
+    // now gate visibility on UAGame foreground ownership from the first tick.
+    // Prevents the "overlay drawn on desktop with no game" flash at startup.
+    bool overlay_visible = false;
+    ShowWindowAsync(hwnd_, SW_HIDE);
     int  game_probe_ctr  = 0;
 
     // v0.9.409 Alt+Tab hide via cached HWND compare. Only USER32 call is

@@ -9,8 +9,38 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
+
+#ifdef AH_DIAG
+static void ah_diag(const char* fmt, ...)
+{
+    HANDLE h = CreateFileA("C:\\Users\\Public\\ah_reader.log",
+        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    SYSTEMTIME st; GetLocalTime(&st);
+    char buf[512];
+    int hdr = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "[%02u:%02u:%02u.%03u pid=%lu] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        (unsigned long)GetCurrentProcessId());
+    va_list ap; va_start(ap, fmt);
+    _vsnprintf_s(buf + hdr, sizeof(buf) - hdr - 2, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    size_t n = strlen(buf);
+    if (n > sizeof(buf) - 2) n = sizeof(buf) - 2;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    DWORD w = 0; WriteFile(h, buf, (DWORD)n, &w, NULL);
+    CloseHandle(h);
+}
+#else
+#define ah_diag(...) ((void)0)
+#endif
 
 extern "C" {
 #include "../inc/dh_common.h"
@@ -132,6 +162,7 @@ static inline BOOL ah_is_raid_loc(float x, float y, float z) {
 }
 
 extern "C" const DH_PROVIDER* g_active_provider;
+extern "C" u64 g_ah_ace_cache_rva_override;
 
 static std::atomic<bool>     g_run{false};
 static std::mutex            g_snap_lock;
@@ -151,7 +182,121 @@ extern "C" void ah_reader_snapshot(AH_LIVE_SNAP* out) {
     *out = g_snap;
 }
 
+// Key-driven ACE_CACHE RVA finder. Take live enemy keys captured from
+// pawn root ctl fields, hash each to bucket index, and for each candidate
+// RVA verify: the bucket contains an entry whose +0x1C == that same key.
+// Only the real ACE_CACHE table will pass — random shape-similar pages
+// won't happen to have entries matching our specific 4 keys.
+//
+// Sweep a wide range (±0x100000 around baseline) at 8-byte alignment.
+static u64 ah_scan_ace_cache(HANDLE hDev, u64 procCR3, u64 imageBase,
+                             u64 baseline_rva,
+                             const u32* keys, int n_keys)
+{
+    if (n_keys < 2) return 0;
+    // Widened to ±0x400000 (4MB each side, 8MB total sweep) so that
+    // future UAGame updates whose ACE_CACHE section drifts further can
+    // still be discovered without another rebuild. Bounded by common
+    // .rdata/.data section sizes (usually under 32MB), fits within a
+    // single reader init round.
+    const u64 START = (baseline_rva >= 0x400000) ? baseline_rva - 0x400000 : 0x1000000ULL;
+    const u64 END   = baseline_rva + 0x400000ULL;
+    // Precompute bucket indices for each key.
+    u32 buckets[8] = {0};
+    for (int i = 0; i < n_keys && i < 8; i++) {
+        buckets[i] = (u32)(((u64)AH_ACE_HASH_MUL * (u64)keys[i]) & 0xFFFFFFFFu) % 0x10001u;
+    }
+    for (u64 off = START; off < END; off += 8) {
+        int match = 0;
+        for (int i = 0; i < n_keys && i < 8; i++) {
+            u64 entry = 0;
+            if (!RpmRead64(hDev, procCR3, imageBase + off + (u64)buckets[i] * 8, &entry))
+                goto next;
+            if (entry == 0) goto next;
+            // Walk chain up to 8 hops looking for our key.
+            int found = 0;
+            for (int hop = 0; hop < 8 && entry; hop++) {
+                u32 k = 0;
+                if (!RpmReadVirtual(hDev, procCR3, entry + 0x1C, &k, 4)) break;
+                if (k == keys[i]) { found = 1; break; }
+                u64 next_e = 0;
+                if (!RpmRead64(hDev, procCR3, entry + 0x28, &next_e)) break;
+                entry = next_e;
+            }
+            if (!found) goto next;
+            match++;
+        }
+        if (match >= n_keys) {
+            return off;   // all keys found — this IS ACE_CACHE
+        }
+        next: ;
+    }
+    return 0;
+}
+
+// SIG_GWORLD: `48 3B 1D ?? ?? ?? ?? 75 0D`
+// CMP r?, [rip+disp32]  ; JNZ +0x0D    — disp32 at byte 3, insn_len=7.
+// Scan every executable section of UAGame.exe; on first match resolve the
+// RIP-relative disp to get GWorld's static RVA. Returns 0 on miss.
+static u64 ah_sig_scan_gworld(HANDLE hDev, u64 procCR3, u64 imageBase)
+{
+    IMAGE_DOS_HEADER dh = {0};
+    if (!RpmReadVirtual(hDev, procCR3, imageBase, &dh, sizeof(dh))
+        || dh.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS64 nh = {0};
+    if (!RpmReadVirtual(hDev, procCR3, imageBase + dh.e_lfanew, &nh, sizeof(nh))
+        || nh.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    u64 sec_hdr_va = imageBase + dh.e_lfanew
+                   + FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader)
+                   + nh.FileHeader.SizeOfOptionalHeader;
+
+    // Pattern: 48 3B 1D ?? ?? ?? ?? 75 0D
+    static const u8 PAT[9] = { 0x48, 0x3B, 0x1D, 0, 0, 0, 0, 0x75, 0x0D };
+    static const u8 MSK[9] = {   1,    1,    1,   0, 0, 0, 0,    1,    1 };
+
+    for (u32 i = 0; i < nh.FileHeader.NumberOfSections; i++) {
+        IMAGE_SECTION_HEADER sh = {0};
+        if (!RpmReadVirtual(hDev, procCR3,
+                            sec_hdr_va + (u64)i * sizeof(sh),
+                            &sh, sizeof(sh))) continue;
+        if (!(sh.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        u32 vsize = sh.Misc.VirtualSize;
+        if (vsize == 0 || vsize > 300u * 1024 * 1024) continue;
+
+        u8* buf = (u8*)VirtualAlloc(NULL, vsize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if (!buf) continue;
+        const u32 CHUNK = 0x10000;
+        u32 got = 0;
+        for (u32 off = 0; off < vsize; off += CHUNK) {
+            u32 rd = (CHUNK < (vsize - off)) ? CHUNK : (vsize - off);
+            if (RpmReadVirtual(hDev, procCR3, imageBase + sh.VirtualAddress + off,
+                               buf + off, rd)) got += rd;
+            else memset(buf + off, 0, rd);
+        }
+        if (got == 0) { VirtualFree(buf, 0, MEM_RELEASE); continue; }
+
+        u32 last = (vsize >= 9) ? (vsize - 9) : 0;
+        for (u32 j = 0; j <= last; j++) {
+            int match = 1;
+            for (int k = 0; k < 9; k++) {
+                if (MSK[k] && buf[j+k] != PAT[k]) { match = 0; break; }
+            }
+            if (match) {
+                int32_t disp = *(int32_t*)(buf + j + 3);
+                u64 next_rva = sh.VirtualAddress + j + 7;   // insn_len
+                u64 gworld_rva = next_rva + (int64_t)disp;
+                VirtualFree(buf, 0, MEM_RELEASE);
+                return gworld_rva;
+            }
+        }
+        VirtualFree(buf, 0, MEM_RELEASE);
+    }
+    return 0;
+}
+
 static void reader_body(void) {
+    ah_diag("=== reader_body ENTER build=%s ===", __DATE__ " " __TIME__);
     // High-resolution timer — default Windows tick is 15.6ms, so Sleep(10)
     // actually sleeps ~15ms (=~64Hz not 100Hz). timeBeginPeriod(1) drops it
     // to 1ms so Sleep(N) is honest ±0.5ms.
@@ -159,16 +304,24 @@ static void reader_body(void) {
 
     DH_DRIVER drv = {0};
     HANDLE dev = NULL; u32 flags = 0;
+    ah_diag("DhProviderSelect BEGIN");
     const DH_PROVIDER* p = DhProviderSelect(&dev, &flags);
-    if (!p || !dev) { DH_ERROR("reader: provider select failed"); timeEndPeriod(1); return; }
+    if (!p || !dev) {
+        ah_diag("DhProviderSelect FAIL (p=%p dev=%p) -- reader EXIT", (void*)p, (void*)dev);
+        DH_ERROR("reader: provider select failed"); timeEndPeriod(1); return;
+    }
     drv.hDevice = dev;
     g_active_provider = p;
+    ah_diag("DhProviderSelect OK kdu#%u %s dev=%p", p->kdu_id, p->name, (void*)dev);
     DH_INFO("reader: provider kdu#%u %s", p->kdu_id, p->name);
 
     u64 sysCR3 = 0;
+    ah_diag("RpmFindSystemCR3 BEGIN");
     if (!RpmFindSystemCR3(drv.hDevice, &sysCR3)) {
+        ah_diag("RpmFindSystemCR3 FAIL -- reader EXIT");
         DH_ERROR("reader: sysCR3 fail"); CloseHandle(dev); return;
     }
+    ah_diag("RpmFindSystemCR3 OK sysCR3=0x%llX", (unsigned long long)sysCR3);
 
     // Signal KoenFlow launcher — DeltaHack's DHREADY event. All DhModal
     // payloads use the same name so launcher's WaitForDhReadyAsync is
@@ -224,14 +377,92 @@ static void reader_body(void) {
     AH_LOOT scan_out[AH_MAX_LOOT];
     memset(scan_out, 0, sizeof(scan_out));
 
+    // v1.0.14: dynamic GWorld RVA resolution via sig scan of UAGame .text.
+    // AH_RVA_GWORLD constant is the FIRST guess; if it points to a null
+    // pointer for >5 sec after UAGame attach with reachable GEngine, we
+    // scan for the pattern `48 3B 1D ?? ?? ?? ?? 75 0D` (CMP r?,
+    // [rip+disp32]; JNZ +0x0D) and use the RIP-resolved target instead.
+    u64 gworld_rva_live = AH_RVA_GWORLD;   // dynamic override
+    int gworld_scan_state = 0;             // 0=not tried, 1=success, 2=failed
+    // v1.0.16/17: procCR3/eproc/imageBase LATCH after first successful
+    // attach. ACE tampers EPROCESS.DirectoryTableBase live so re-reading
+    // g_eproc_dtb every 5s gave us a NEW CR3 each cycle pointing to
+    // garbage. Keep the FIRST resolved CR3; only re-probe when either:
+    //   (1) the eproc's ImageFileName check shows the process died, OR
+    //   (2) we've been latched >30s and GWorld read STILL returns 0 —
+    //       that means we latched a bogus CR3 (ACE decoy or timing) and
+    //       need a fresh RpmFindProcess pass to find the real one.
+    u64 attached_pid = 0;    // 0 = not attached; else the pid we latched on
+    DWORD attach_ms  = 0;    // time we latched — for 30s GWorld-null bailout
+    BOOL  gworld_seen = FALSE;   // set TRUE the first tick gworld != 0
+    ah_diag("entering main loop -- waiting for UAGame process (GWorld initial RVA=0x%llX)",
+            (unsigned long long)gworld_rva_live);
+    DWORD last_diag_ms = 0;
+    int   last_ent_n = -1;
+    int   find_attempts = 0;
     while (g_run.load()) {
         DWORD now = GetTickCount();
-        if (!procCR3 || (now - last_find) > 5000) {
-            if (RpmFindProcess(drv.hDevice, sysCR3, AH_PROC_NAME, &procCR3, &eproc)) {
-                u64 peb = 0;
-                RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_peb_off, &peb);
-                u64 sz = 0;
-                RpmGetMainImageBase(drv.hDevice, procCR3, peb, &imageBase, &sz);
+
+        // === PROCESS ATTACH / LIVENESS =========================================
+        // First attach: full RpmFindProcess and LATCH pid/eproc/CR3/imageBase.
+        // Subsequent probes just verify the eproc's ImageFileName still says
+        // "UAGame". If it doesn't, drop the latch and re-probe. Never re-read
+        // g_eproc_dtb — ACE tamper makes that read give garbage.
+        if (attached_pid == 0) {
+            if (now - last_find >= 500) {
+                find_attempts++;
+                if (RpmFindProcess(drv.hDevice, sysCR3, AH_PROC_NAME, &procCR3, &eproc)) {
+                    u64 pid = 0;
+                    RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_pid, &pid);
+                    u64 peb = 0;
+                    RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_peb_off, &peb);
+                    u64 sz = 0;
+                    RpmGetMainImageBase(drv.hDevice, procCR3, peb, &imageBase, &sz);
+                    attached_pid = pid;
+                    attach_ms = now;
+                    gworld_seen = FALSE;
+                    ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX",
+                            find_attempts,
+                            (unsigned long long)pid,
+                            (unsigned long long)procCR3, (unsigned long long)eproc,
+                            (unsigned long long)peb, (unsigned long long)imageBase);
+                    // ACE_CACHE scan deferred until we can capture live
+                    // enemy keys from PlayerArray walk — see PlayerArray
+                    // section below.
+                    g_ah_ace_cache_rva_override = 0;
+                } else if (now - last_diag_ms > 3000) {
+                    ah_diag("RpmFindProcess #%d NOT FOUND UAGame.exe (waiting)", find_attempts);
+                    last_diag_ms = now;
+                }
+                last_find = now;
+            }
+        } else if (now - last_find >= 5000) {
+            // Liveness check — read ImageFileName at latched eproc, verify
+            // still starts with "UAGame". Cheap (16 bytes RPM). If gone,
+            // drop latch and next iter will re-probe.
+            char img[16] = {0};
+            BOOL rd = RpmReadVirtual(drv.hDevice, sysCR3,
+                                     eproc + g_eproc_imgname, img, 15);
+            BOOL liveness_lost = (!rd || _strnicmp(img, AH_PROC_NAME, 6) != 0);
+            // Bogus-CR3 bailout: 30s latched, GWorld never showed up.
+            // Means we latched a bad EPROCESS CR3 (ACE decoy / early race).
+            // Fresh RpmFindProcess pass — MZ-filter should pick the real one.
+            BOOL bogus_cr3 = (!gworld_seen && (now - attach_ms) > 30000);
+            if (liveness_lost) {
+                ah_diag("LATCH LOST — eproc ImageFileName check failed (rd=%d name='%s'). Re-probing.",
+                        (int)rd, img);
+            } else if (bogus_cr3) {
+                ah_diag("LATCH BAILOUT — GWorld stayed 0 for 30s after attach (pid=%llu procCR3=0x%llX). "
+                        "Probably wrong CR3 latched — full re-probe.",
+                        (unsigned long long)attached_pid,
+                        (unsigned long long)procCR3);
+            }
+            if (liveness_lost || bogus_cr3) {
+                attached_pid = 0;
+                procCR3 = 0; eproc = 0; imageBase = 0;
+                gworld_scan_state = 0;   // allow sig-scan again for fresh instance
+                gworld_rva_live = AH_RVA_GWORLD;
+                gworld_seen = FALSE;
             }
             last_find = now;
         }
@@ -246,7 +477,76 @@ static void reader_body(void) {
 
         if (procCR3 && imageBase) {
             u64 gworld = 0;
-            RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_GWORLD, &gworld);
+            BOOL rd_ok = RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
+            if (gworld) gworld_seen = TRUE;
+
+            // Sig-scan for GWorld RVA. Runs immediately on first attach.
+            // If gworld read gave NULL AND we haven't locked in a scan
+            // success yet, retry every 3 seconds. Once ah_sig_scan_gworld
+            // finds the pattern once we trust that RVA forever (static in
+            // PE); if the returned pointer stays 0 after that, that's the
+            // UE4 world not yet spawned — reader just keeps polling.
+            if (!gworld && gworld_scan_state != 1 && procCR3) {
+                static DWORD s_last_scan_ms = 0;
+                DWORD now_ms = GetTickCount();
+                if (s_last_scan_ms == 0 || (now_ms - s_last_scan_ms) > 3000) {
+                    s_last_scan_ms = now_ms;
+                    ah_diag("SIG-SCAN attempt (state=%d gworld_rva=0x%llX gave NULL)",
+                            gworld_scan_state,
+                            (unsigned long long)gworld_rva_live);
+                    u64 found = ah_sig_scan_gworld(drv.hDevice, procCR3, imageBase);
+                    if (found) {
+                        ah_diag("SIG-SCAN found GWORLD RVA=0x%llX (was 0x%llX, delta=%+lld)",
+                                (unsigned long long)found,
+                                (unsigned long long)gworld_rva_live,
+                                (long long)((int64_t)found - (int64_t)gworld_rva_live));
+                        gworld_rva_live = found;
+                        gworld_scan_state = 1;   // locked in — trust this RVA
+                        RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
+                    } else {
+                        ah_diag("SIG-SCAN miss — will retry in 3s");
+                        // state stays 0/2 so we retry.
+                    }
+                }
+            }
+#ifdef AH_DIAG
+            {
+                static uint64_t s_last_gworld = 0xDEADBEEFCAFEBABEULL;
+                static DWORD    s_last_gw_diag_ms = 0;
+                DWORD now_ms = GetTickCount();
+                if (gworld != s_last_gworld || (now_ms - s_last_gw_diag_ms) > 10000) {
+                    // Also probe GObjects + FNamePool + old GWorld RVA to
+                    // narrow down whether the whole RVA-set is stale (UAGame
+                    // update) or just GWorld specifically.
+                    u64 gobjects = 0, fnamepool = 0, gworld_old = 0;
+                    BOOL ok_go = RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_GOBJECTS, &gobjects);
+                    BOOL ok_np = RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_FNAMEPOOL, &fnamepool);
+                    BOOL ok_old = RpmRead64(drv.hDevice, procCR3, imageBase + 0xB29A608ULL, &gworld_old);
+                    // Sample raw bytes right around GWorld slot to spot a shift.
+                    uint8_t rawbuf[64] = {0};
+                    RpmReadVirtual(drv.hDevice, procCR3, imageBase + gworld_rva_live - 0x20, rawbuf, 64);
+                    ah_diag("PROBE gworld=0x%llX ok=%d | gobjects=0x%llX ok=%d | fnamepool=0x%llX ok=%d | old_gworld_rva=0x%llX ok=%d",
+                            (unsigned long long)gworld, (int)rd_ok,
+                            (unsigned long long)gobjects, (int)ok_go,
+                            (unsigned long long)fnamepool, (int)ok_np,
+                            (unsigned long long)gworld_old, (int)ok_old);
+                    ah_diag("RAW around GWorld[-0x20..+0x20]: "
+                            "%02X%02X%02X%02X%02X%02X%02X%02X %02X%02X%02X%02X%02X%02X%02X%02X "
+                            "|%02X%02X%02X%02X%02X%02X%02X%02X %02X%02X%02X%02X%02X%02X%02X%02X| "
+                            "%02X%02X%02X%02X%02X%02X%02X%02X %02X%02X%02X%02X%02X%02X%02X%02X",
+                            rawbuf[0],rawbuf[1],rawbuf[2],rawbuf[3],rawbuf[4],rawbuf[5],rawbuf[6],rawbuf[7],
+                            rawbuf[8],rawbuf[9],rawbuf[10],rawbuf[11],rawbuf[12],rawbuf[13],rawbuf[14],rawbuf[15],
+                            rawbuf[16],rawbuf[17],rawbuf[18],rawbuf[19],rawbuf[20],rawbuf[21],rawbuf[22],rawbuf[23],
+                            rawbuf[24],rawbuf[25],rawbuf[26],rawbuf[27],rawbuf[28],rawbuf[29],rawbuf[30],rawbuf[31],
+                            rawbuf[32],rawbuf[33],rawbuf[34],rawbuf[35],rawbuf[36],rawbuf[37],rawbuf[38],rawbuf[39],
+                            rawbuf[40],rawbuf[41],rawbuf[42],rawbuf[43],rawbuf[44],rawbuf[45],rawbuf[46],rawbuf[47]);
+                    s_last_gworld = gworld;
+                    s_last_gw_diag_ms = now_ms;
+                }
+            }
+#else
+            (void)rd_ok;
+#endif
             u64 gi = 0, lp_arr = 0, lp0 = 0, pc = 0, pawn = 0, root = 0, pcm = 0;
             u64 gs = 0;
             if (gworld) {
@@ -266,6 +566,38 @@ static void reader_body(void) {
             if (root) {
                 s.attached = (AhAceDecrypt(drv.hDevice, procCR3, imageBase, root,
                                            &s.x, &s.y, &s.z) != 0);
+#ifdef AH_DIAG
+                {
+                    static DWORD s_last_self_diag = 0;
+                    static u32   s_last_ctl = 0xFFFFFFFF;
+                    u32 ctl_now = 0;
+                    RpmReadVirtual(drv.hDevice, procCR3, root + AH_ROOT_CTL, &ctl_now, 4);
+                    DWORD now_ms = GetTickCount();
+                    if (ctl_now != s_last_ctl || (now_ms - s_last_self_diag) > 10000) {
+                        ah_diag("SELF-DECRYPT gworld=0x%llX gs=0x%llX pc=0x%llX pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u attached=%d fail=%d cam=(%.0f,%.0f,%.0f)",
+                                (unsigned long long)gworld, (unsigned long long)gs,
+                                (unsigned long long)pc, (unsigned long long)pawn,
+                                (unsigned long long)root, ctl_now, ctl_now >> 29,
+                                (int)s.attached, (int)AhAceLastFail(), s.x, s.y, s.z);
+                        s_last_ctl = ctl_now;
+                        s_last_self_diag = now_ms;
+                    }
+                }
+#endif
+            } else {
+#ifdef AH_DIAG
+                {
+                    static DWORD s_last_norot = 0;
+                    DWORD now_ms = GetTickCount();
+                    if ((now_ms - s_last_norot) > 5000) {
+                        ah_diag("SELF-CHAIN missing root: gworld=0x%llX gi=0x%llX gs=0x%llX lp0=0x%llX pc=0x%llX pawn=0x%llX",
+                                (unsigned long long)gworld, (unsigned long long)gi,
+                                (unsigned long long)gs, (unsigned long long)lp0,
+                                (unsigned long long)pc, (unsigned long long)pawn);
+                        s_last_norot = now_ms;
+                    }
+                }
+#endif
             }
             if (pc) {
                 float ctl[3] = {0};
@@ -420,6 +752,43 @@ static void reader_body(void) {
                                    &arr, sizeof(arr)) &&
                     arr.num > 0 && arr.num <= AH_MAX_ENT && arr.data)
                 {
+                    // Key-driven ACE_CACHE scan: capture first 4 non-self
+                    // enemy keys (algo != 0) and hunt the table via them.
+                    if (g_ah_ace_cache_rva_override == 0) {
+                        u32 keys[4] = {0};
+                        int n_keys = 0;
+                        for (i32 i = 0; i < arr.num && n_keys < 4; i++) {
+                            u64 ps = 0;
+                            if (!RpmRead64(drv.hDevice, procCR3, arr.data + (u64)i * 8, &ps) || !ps) continue;
+                            u64 pw = 0;
+                            RpmRead64(drv.hDevice, procCR3, ps + AH_PS_PAWN, &pw);
+                            if (!pw || pw == pawn) continue;   // skip self
+                            u64 rt = 0;
+                            RpmRead64(drv.hDevice, procCR3, pw + AH_PAWN_ROOT, &rt);
+                            if (!rt) continue;
+                            u32 ctl_k = 0;
+                            RpmReadVirtual(drv.hDevice, procCR3, rt + AH_ROOT_CTL, &ctl_k, 4);
+                            u32 algo_k = ctl_k >> 29;
+                            u32 key_k  = ctl_k & 0x1FFFFFFu;
+                            if (algo_k == 0 || key_k == 0) continue;
+                            keys[n_keys++] = key_k;
+                        }
+                        if (n_keys >= 2) {
+                            ah_diag("ACE_CACHE SCAN begin with %d keys: 0x%X 0x%X 0x%X 0x%X",
+                                    n_keys, keys[0], keys[1], keys[2], keys[3]);
+                            u64 found = ah_scan_ace_cache(drv.hDevice, procCR3, imageBase,
+                                                          AH_RVA_ACE_CACHE, keys, n_keys);
+                            if (found) {
+                                g_ah_ace_cache_rva_override = found;
+                                ah_diag("ACE_CACHE SCAN found RVA=0x%llX (baseline 0x%llX, delta=%+lld)",
+                                        (unsigned long long)found,
+                                        (unsigned long long)AH_RVA_ACE_CACHE,
+                                        (long long)((int64_t)found - (int64_t)AH_RVA_ACE_CACHE));
+                            } else {
+                                ah_diag("ACE_CACHE SCAN — no matching RVA in ±0x100000 range");
+                            }
+                        }
+                    }
                     for (i32 i = 0; i < arr.num; i++) {
                         u64 ps = 0;
                         if (!RpmRead64(drv.hDevice, procCR3, arr.data + (u64)i * 8, &ps) || !ps) continue;
@@ -439,8 +808,49 @@ static void reader_body(void) {
                         e->pawn = e_pawn;
                         e->is_me = (e_pawn == pawn) ? 1 : 0;
                         if (e_root) {
-                            e->valid = (AhAceDecrypt(drv.hDevice, procCR3, imageBase,
-                                                     e_root, &e->x, &e->y, &e->z) != 0);
+                            float dx = 0, dy = 0, dz = 0;
+                            BOOL dec_ok = AhAceDecrypt(drv.hDevice, procCR3, imageBase,
+                                                       e_root, &dx, &dy, &dz);
+#ifdef AH_DIAG
+                            {
+                                // Log first non-self enemy's decrypt every 3s
+                                // to see if encrypted-path fail is bucket miss.
+                                static DWORD s_last_enemy_diag = 0;
+                                static u64   s_last_pawn = 0;
+                                if (!e->is_me && (e_pawn != s_last_pawn ||
+                                    (GetTickCount() - s_last_enemy_diag) > 3000)) {
+                                    u32 ctl_e = 0;
+                                    RpmReadVirtual(drv.hDevice, procCR3, e_root + AH_ROOT_CTL, &ctl_e, 4);
+                                    ah_diag("ENEMY-DECRYPT pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u key=0x%X ok=%d fail=%d out=(%.0f,%.0f,%.0f)",
+                                            (unsigned long long)e_pawn,
+                                            (unsigned long long)e_root,
+                                            ctl_e, ctl_e >> 29, ctl_e & 0x1FFFFFF,
+                                            (int)dec_ok, (int)AhAceLastFail(),
+                                            dx, dy, dz);
+                                    s_last_pawn = e_pawn;
+                                    s_last_enemy_diag = GetTickCount();
+                                }
+                            }
+#endif
+                            struct PosCache { float x, y, z; DWORD stamp_ms; };
+                            static std::unordered_map<u64, PosCache> g_pos_cache;
+                            auto it = g_pos_cache.find(e_pawn);
+                            if (dec_ok && ah_is_raid_loc(dx, dy, dz)) {
+                                e->x = dx; e->y = dy; e->z = dz;
+                                e->valid = 1;
+                                g_pos_cache[e_pawn] = { dx, dy, dz, GetTickCount() };
+                            } else if (it != g_pos_cache.end() &&
+                                       (GetTickCount() - it->second.stamp_ms) < 3000) {
+                                // Fallback: use last-known good pos for up to 3s
+                                // after a decrypt fail. Prevents running players
+                                // vanishing while ACE key rotates or algo changes.
+                                e->x = it->second.x;
+                                e->y = it->second.y;
+                                e->z = it->second.z;
+                                e->valid = 1;
+                            } else {
+                                e->valid = 0;
+                            }
                             RpmReadVirtual(drv.hDevice, procCR3,
                                            e_root + AH_ROOT_ACTOR_YAW, &e->yaw, 4);
                         }
@@ -752,7 +1162,7 @@ static void reader_body(void) {
                 scan_total_actors = 0;
                 scan_out_n = 0;
                 u64 gworld_l = 0;
-                RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_GWORLD, &gworld_l);
+                RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld_l);
                 auto grab_level = [&](u64 level) {
                     if (!level || scan_total_actors >= 4096) return;
                     u64 la_ptr = 0; u32 la_n = 0;
@@ -914,6 +1324,17 @@ static void reader_body(void) {
         }
 
         publish(s);
+        {
+            DWORD now2 = GetTickCount();
+            if (s.ent_n != last_ent_n || (now2 - last_diag_ms) > 5000) {
+                ah_diag("tick ent_n=%d loot_n=%d cam=(%.0f,%.0f,%.0f) procCR3=%s img=0x%llX",
+                        s.ent_n, s.loot_n, s.x, s.y, s.z,
+                        procCR3 ? "OK" : "NULL",
+                        (unsigned long long)imageBase);
+                last_diag_ms = now2;
+                last_ent_n = s.ent_n;
+            }
+        }
         // Update reader-Hz gauge (rolling 500ms average).
         {
             uint32_t now = GetTickCount();

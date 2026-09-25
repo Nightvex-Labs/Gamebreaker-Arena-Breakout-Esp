@@ -52,9 +52,15 @@ for %%A in (%OUT_SELF%) do echo   ah_self size: %%~zA bytes
 
 echo [build 3/3] compiling ah_overlay.exe (full ABIFINAL interface)
 set OUT2=build\ah_overlay.exe
-set OVFLAGS=/nologo /W1 /O2 /GS- /MD /EHsc /std:c++20 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /DDH_RELEASE /DABI_NO_RUNLOG /Iinc /Ideps\imgui /Ideps\imgui\backends /Ithird_party
+set OVFLAGS=/nologo /W1 /O2 /GS- /MD /EHsc /std:c++20 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /DDH_RELEASE /DABI_NO_RUNLOG /DAH_DIAG /Iinc /Ideps\imgui /Ideps\imgui\backends /Ithird_party
 set ABI_UI=src\abi_ui\overlay.cpp src\abi_ui\control_panel.cpp src\abi_ui\overlay_hud.cpp src\abi_ui\render.cpp src\abi_ui\icons.cpp src\abi_ui\image_loader.cpp
-set LFLAGS2=/link /SUBSYSTEM:CONSOLE /ENTRY:wmainCRTStartup /OPT:REF /OPT:ICF /DEBUG:NONE /PDBALTPATH:%%_PDB%% Advapi32.lib User32.lib Gdi32.lib d3d11.lib dxgi.lib dwmapi.lib dcomp.lib psapi.lib ole32.lib windowscodecs.lib Shlwapi.lib
+REM Overlay uses SUBSYSTEM:WINDOWS so no conhost/cmd window ever pops up when
+REM spawned directly (schtasks / RunUserActive / dev-mode). wmainCRTStartup is
+REM valid with WINDOWS subsystem (CRT dispatches to wmain the same way). The
+REM production path (WinRuntimeHost.exe → CreateProcessW DETACHED_PROCESS |
+REM CREATE_NO_WINDOW) already suppressed the console; this makes standalone
+REM invocations behave the same.
+set LFLAGS2=/link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OPT:REF /OPT:ICF /DEBUG:NONE /PDBALTPATH:%%_PDB%% Advapi32.lib User32.lib Gdi32.lib d3d11.lib dxgi.lib dwmapi.lib dcomp.lib psapi.lib ole32.lib windowscodecs.lib Shlwapi.lib
 cl %OVFLAGS% src\overlay_main.c src\overlay_boot.cpp src\ah_reader_thread.cpp src\ah_stubs.c src\ah_ace.c src\ah_w2s.c src\db\dh_dbunpack.c src\svc\dh_scm.c src\winio\dh_phys.c src\winio\dh_prov_registry.c src\winio\dh_prov_impl.c src\mem\dh_rpm.c src\hardening\dh_amsi_etw.c src\abi_ui_stubs.cpp %ABI_UI% src\log.c build\imgui.obj build\imgui_draw.obj build\imgui_tables.obj build\imgui_widgets.obj build\imgui_impl_win32.obj build\imgui_impl_dx11.obj /Fe:%OUT2% /Fo:build\ %LFLAGS2%
 if errorlevel 1 ( echo [build] overlay FAILED & popd & exit /b 4 )
 for %%A in (%OUT2%) do echo   size: %%~zA bytes

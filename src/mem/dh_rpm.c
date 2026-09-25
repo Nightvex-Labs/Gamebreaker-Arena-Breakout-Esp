@@ -1,6 +1,34 @@
 #include "../../inc/dh_rpm.h"
 #include "../../inc/dh_phys.h"
 #include <windows.h>
+#include <stdio.h>
+
+// v1.0.22 diag override — DH_INFO/DH_ERROR usually compile to nothing in
+// DH_RELEASE. Under AH_DIAG we want early-exit visibility in RpmFindProcess,
+// so redirect them to append to the public procs log.
+#ifdef AH_DIAG
+static void ah_procs_log(const char* fmt, ...) {
+    HANDLE h = CreateFileA("C:\\Users\\Public\\ah_procs.log",
+        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    char buf[256];
+    va_list ap; va_start(ap, fmt);
+    int n = _vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) n = (int)sizeof(buf) - 2;
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    DWORD w = 0;
+    WriteFile(h, buf, (DWORD)n, &w, NULL);
+    CloseHandle(h);
+}
+#undef DH_ERROR
+#undef DH_INFO
+#define DH_ERROR(fmt, ...) ah_procs_log("[ERR] " fmt, ##__VA_ARGS__)
+#define DH_INFO(fmt, ...)  ah_procs_log("[INF] " fmt, ##__VA_ARGS__)
+#endif
 // VMProtect SDK not needed here — hide functions have multi-return, wrapped
 // at project level via VMProtect_Con.exe function-address list instead.
 
@@ -235,20 +263,38 @@ typedef struct {
 } DhEprocLayout;
 
 static const DhEprocLayout kEprocLayouts[] = {
-    // Cobalt / Nickel — pre-Germanium layout
+    // Cobalt / Nickel / Vibranium — pre-Germanium layout. Range covers common
+    // LTSC / preview / SAC releases inside each named version so a patched
+    // build like 22000.4123 doesn't kick the operator into "not in known-good
+    // table" error even though the EPROCESS layout hasn't drifted.
+    // Win10 20H1..22H2 (19041..19045) share the exact same EPROCESS layout
+    // as Win11 21H2 (22000) — the kernel body was only realigned in Germanium
+    // (24H2+), so the same DTB/PID/LINKS/IMGNAME/PEB offsets work verbatim.
+    { 19041, 19045, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win10 20H1-22H2" },
     { 22000, 22000, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 21H2" },
     { 22621, 22621, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 22H2" },
     { 22631, 22631, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 23H2" },
-    // Germanium — realigned layout (Win11 24H2 / 25H2)
-    { 26100, 26100, 0x28, 0x1D0, 0x1D8, 0x338, 0x550, "Win11 24H2" },
-    { 26200, 26200, 0x28, 0x1D0, 0x1D8, 0x338, 0x550, "Win11 25H2" },
+    // Germanium — realigned layout (Win11 24H2 / 25H2 / 26H2 / future).
+    // Range 26100..30000 covers every current + upcoming Germanium-family
+    // build:
+    //   26100  = 24H2 initial
+    //   26200  = 25H2 (verified live, client)
+    //   ~2760x = 26H2 Insider preview (expected 2026)
+    //   catch-all up to 30000 for KB updates & Insider drift.
+    // DiscoverPebOffset()'s runtime PEB scan handles peb_off shifts inside
+    // the family (24H2=0x550, 25H2=0x2E0 seen live). DTB/PID/LINKS/IMGNAME
+    // stay at these Germanium values — the layout-probe sanity check
+    // (System DTB @+0x28 matches sysCR3) validates them at boot; if a
+    // future Windows realigns the KPROCESS/EPROCESS body past 30000,
+    // add a new row here with fresh offsets from Vergilius / live PDB.
+    { 26100, 30000, 0x28, 0x1D0, 0x1D8, 0x338, 0x550, "Win11 24H2/25H2/26H2" },
 };
 
 // Populated by EprocInit() on first RpmFindProcess. Zero = uninitialised.
-static u32 g_eproc_dtb     = 0;
-static u32 g_eproc_pid     = 0;
-static u32 g_eproc_links   = 0;
-static u32 g_eproc_imgname = 0;
+u32 g_eproc_dtb     = 0;   // non-static: reader thread needs liveness poll
+u32 g_eproc_pid     = 0;
+u32 g_eproc_links   = 0;
+u32 g_eproc_imgname = 0;
 
 // EPROCESS.Peb offset varies per build (26100=0x550, 26200 may differ, 22H2
 // nominally 0x550 as well). Starting guess is set by EprocInit(), then
@@ -355,8 +401,9 @@ static BOOL EprocInit(void) {
         }
     }
     DH_ERROR("EprocInit: Windows build %u not in known-good table. "
-             "Supported: Win11 21H2/22H2/23H2/24H2/25H2 "
-             "(builds 22000, 22621, 22631, 26100, 26200). "
+             "Supported: Win10 20H1-22H2 (19041..19045), "
+             "Win11 21H2/22H2/23H2 (22000, 22621, 22631), "
+             "Win11 24H2/25H2/26H1 (26100..30000). "
              "Add a row to kEprocLayouts for other builds.",
              build);
     return FALSE;
@@ -367,7 +414,38 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
 {
     *procCR3 = 0;
     if (eprocessOut) *eprocessOut = 0;
-    if (!EprocInit()) return FALSE;
+#ifdef AH_DIAG
+    {
+        HANDLE lh = CreateFileA("C:\\Users\\Public\\ah_procs.log",
+            FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (lh != INVALID_HANDLE_VALUE) {
+            SetFilePointer(lh, 0, NULL, FILE_END);
+            char line[128];
+            int n = _snprintf(line, sizeof(line),
+                "== RpmFindProcess CALL sysCR3=0x%llX target='%s' ==\r\n",
+                (unsigned long long)sysCR3, procName);
+            DWORD w = 0;
+            WriteFile(lh, line, (DWORD)n, &w, NULL);
+            CloseHandle(lh);
+        }
+    }
+#endif
+    if (!EprocInit()) {
+#ifdef AH_DIAG
+        HANDLE lh = CreateFileA("C:\\Users\\Public\\ah_procs.log",
+            FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (lh != INVALID_HANDLE_VALUE) {
+            SetFilePointer(lh, 0, NULL, FILE_END);
+            const char* m = "EprocInit FAILED -- unsupported Windows build?\r\n";
+            DWORD w = 0;
+            WriteFile(lh, m, (DWORD)strlen(m), &w, NULL);
+            CloseHandle(lh);
+        }
+#endif
+        return FALSE;
+    }
 
     // Step 1: find PsInitialSystemProcess via ntoskrnl export
     // Simpler approach: use NtQuerySystemInformation to get ntoskrnl base,
@@ -407,6 +485,31 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         return FALSE;
     }
 
+    // v1.0.22: on Win11 25H2 with VBS/HVCI, NtQuerySystemInformation(11)
+    // returns Module.Base=0 unless the caller holds SeDebugPrivilege
+    // (KASLR-base disclosure mitigation). Enable it here — overlay is
+    // elevated, so AdjustTokenPrivileges succeeds.
+    {
+        HANDLE hTok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(),
+                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok))
+        {
+            LUID luid;
+            if (LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &luid)) {
+                TOKEN_PRIVILEGES tp = {0};
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Luid = luid;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), NULL, NULL);
+#ifdef AH_DIAG
+                DWORD gle = GetLastError();
+                DH_INFO("SeDebugPrivilege enable gle=%lu", gle);
+#endif
+            }
+            CloseHandle(hTok);
+        }
+    }
+
     ULONG needed = 0;
     pNtQSI(11 /*SystemModuleInformation*/, NULL, 0, &needed);
     if (!needed) return FALSE;
@@ -422,7 +525,29 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         return FALSE;
     }
 
-    u64 ntBase = (u64)mods->Modules[0].Base;
+    // v1.0.22: on Win11 25H2 with VBS/HVCI, Modules[0] is hvix64.sys /
+    // Secure Kernel — NOT ntoskrnl. Walk all modules and pick the one
+    // whose filename starts with "ntoskrnl", "ntkrnl", "ntkrpamp", or
+    // "ntkrla57" (any x64 kernel variant).
+    u64 ntBase = 0;
+    for (ULONG mi = 0; mi < mods->Count; mi++) {
+        const char* fname = mods->Modules[mi].Name + mods->Modules[mi].NameOffset;
+        if (_strnicmp(fname, "ntoskrnl", 8) == 0 ||
+            _strnicmp(fname, "ntkrnl",    6) == 0 ||
+            _strnicmp(fname, "ntkrla",    6) == 0 ||
+            _strnicmp(fname, "ntkrpamp",  8) == 0)
+        {
+            ntBase = (u64)mods->Modules[mi].Base;
+            DH_INFO("ntoskrnl match at Modules[%lu] '%s' base=0x%llX",
+                    (unsigned long)mi, fname, ntBase);
+            break;
+        }
+    }
+    if (!ntBase) {
+        DH_INFO("ntoskrnl NOT FOUND in %lu modules — fallback to Modules[0]",
+                (unsigned long)mods->Count);
+        ntBase = (u64)mods->Modules[0].Base;
+    }
     DH_INFO("ntoskrnl base: 0x%llX", ntBase);
     HeapFree(GetProcessHeap(), 0, mods);
 
@@ -533,38 +658,146 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         return FALSE;
 
     cur = flink;
+    // v1.0.22 diag: dump every walked ImageFileName to ah_procs.log so
+    // we can see what UAGame is really called in EPROCESS on Win11 25H2.
+#ifdef AH_DIAG
+    u32 diag_read_fail = 0;
+    u32 diag_read_ok   = 0;
+#endif
     while (cur != head && count < 1024) {
         u64 eproc = cur - g_eproc_links;
 
         char imgName[16] = {0};
-        if (!RpmReadVirtual(hDev, sysCR3, eproc + g_eproc_imgname, imgName, 15))
+        BOOL name_ok = RpmReadVirtual(hDev, sysCR3, eproc + g_eproc_imgname, imgName, 15);
+        if (!name_ok) {
+#ifdef AH_DIAG
+            diag_read_fail++;
+#endif
             goto next;
+        }
+#ifdef AH_DIAG
+        diag_read_ok++;
+        // Dump every walked name — even garbage; helps see what walker sees.
+        {
+            u64 pid_dbg = 0;
+            RpmRead64(hDev, sysCR3, eproc + g_eproc_pid, &pid_dbg);
+            HANDLE lh = CreateFileA("C:\\Users\\Public\\ah_procs.log",
+                FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (lh != INVALID_HANDLE_VALUE) {
+                SetFilePointer(lh, 0, NULL, FILE_END);
+                // Sanitize non-printables in name to '.' so log stays readable.
+                char safe[16] = {0};
+                for (int q = 0; q < 15; q++) {
+                    unsigned char c = (unsigned char)imgName[q];
+                    safe[q] = (c >= 32 && c < 127) ? (char)c : '.';
+                }
+                char line[128];
+                int n = _snprintf(line, sizeof(line),
+                    "walk#%u eproc=0x%llX pid=%llu name='%s'\r\n",
+                    count, (unsigned long long)eproc,
+                    (unsigned long long)pid_dbg, safe);
+                if (n > 0) {
+                    DWORD w = 0;
+                    WriteFile(lh, line, (DWORD)n, &w, NULL);
+                }
+                CloseHandle(lh);
+            }
+        }
+#endif
 
-        if (_strnicmp(imgName, procName, strlen(procName)) == 0) {
+        // Multi-name prefix match. Tencent ships several completely different
+        // process names across channels (verified from live EPROCESS walks):
+        //   UAGame.exe            — Global retail Tencent launcher
+        //   arena_breakout.exe    — Steam distribution (truncated to
+        //                           'arena_breakout.' in EPROCESS.ImageFileName)
+        //   UAGameShipping.exe    — some CN/dev builds
+        // We match on caller's procName primary (prefix-capped at 6 so
+        // "UAGame.exe" -> "UAGame" covers all UAGame* variants), plus a
+        // hard-coded list of KNOWN alternate base names so a single overlay
+        // build works across Retail + Steam.
+        static const char* AH_ALT_NAMES[] = {
+            "arena_breakout",   // Steam
+            "UAGameShipping",   // dev/test/CN
+            NULL
+        };
+        size_t _match_n = strlen(procName);
+        if (_match_n > 6) _match_n = 6;
+        int _matched = (_strnicmp(imgName, procName, _match_n) == 0);
+        for (int _ai = 0; !_matched && AH_ALT_NAMES[_ai]; _ai++) {
+            size_t _al = strlen(AH_ALT_NAMES[_ai]);
+            if (_al > 14) _al = 14;   // ImageFileName cap - trailing NUL
+            if (_strnicmp(imgName, AH_ALT_NAMES[_ai], _al) == 0) _matched = 1;
+        }
+        if (_matched) {
             u64 dtb = 0;
             RpmRead64(hDev, sysCR3, eproc + g_eproc_dtb, &dtb);
             if (dtb) {
                 u64 pid = 0;
                 RpmRead64(hDev, sysCR3, eproc + g_eproc_pid, &pid);
-                // ACE spawns 6-7 decoy DeltaForceClie processes whose user
-                // page tables translate to zero via manual walk (defense
-                // against external readers). The REAL game process is the
-                // one whose 0x140000000 has "MZ". Pick that one; ignore
-                // decoys that read as all-zeros.
-                u16 mz140 = 0;
-                BOOL is_real = RpmReadVirtual(hDev, dtb, 0x140000000ULL,
-                                              &mz140, 2)
-                               && mz140 == 0x5A4D;
+                // Decoy filter — ACE sometimes spawns duplicate processes
+                // whose DTB translates to garbage / all-zeros to defeat
+                // external walkers. Real game: the one whose PE header
+                // is readable through its own DTB. We accept ANY canonical
+                // ImageBase (PEB.ImageBaseAddress varies with ASLR on
+                // Win11 25H2), not the hardcoded 0x140000000 — fetch PEB
+                // + ImageBase to sanity-check, and if the value looks
+                // canonical, verify MZ magic through DTB there.
+                //
+                // Fallback: if PEB probe fails, still allow through as a
+                // last-resort (better than never finding UAGame on 25H2).
+                BOOL is_real = FALSE;
+                u64  probe_base = 0;
+                {
+                    u64 peb = 0;
+                    if (RpmRead64(hDev, sysCR3, eproc + g_eproc_peb_off, &peb)
+                        && peb && (peb >> 48) == 0)
+                    {
+                        u64 image_base = 0;
+                        if (RpmRead64(hDev, dtb, peb + 0x10, &image_base)
+                            && image_base && (image_base >> 48) == 0)
+                        {
+                            probe_base = image_base;
+                            u16 mz = 0;
+                            if (RpmReadVirtual(hDev, dtb, image_base, &mz, 2)
+                                && mz == 0x5A4D)
+                                is_real = TRUE;
+                        }
+                    }
+                }
+                if (!is_real) {
+                    // Legacy path — try hardcoded 0x140000000 too.
+                    u16 mz140 = 0;
+                    if (RpmReadVirtual(hDev, dtb, 0x140000000ULL, &mz140, 2)
+                        && mz140 == 0x5A4D)
+                    {
+                        probe_base = 0x140000000ULL;
+                        is_real = TRUE;
+                    }
+                }
+                // Wrapper filter: Steam ships arena_breakout.exe as a small
+                // bootstrap PE with ASLR ImageBase in low VA (~0x570000).
+                // Real UE4 shipping build (UAGame.exe) links at 0x140000000
+                // and stays high even with ASLR — always >= 4 GB. Reject
+                // anything below that threshold so a wrapper never wins over
+                // the real game when both are alive.
+                if (is_real && probe_base && probe_base < 0x100000000ULL) {
+#ifdef AH_DIAG
+                    ah_procs_log("REJECT wrapper: PID=%llu ImageBase=0x%llX (too low, not UE4 game)",
+                                 (unsigned long long)pid, (unsigned long long)probe_base);
+#endif
+                    is_real = FALSE;
+                }
                 if (is_real) {
                     DH_INFO("found REAL '%s' PID=%llu EPROCESS=0x%llX CR3=0x%llX "
-                            "(MZ@0x140000000 OK, past ACE decoy filter)",
-                            imgName, pid, eproc, dtb);
+                            "ImageBase=0x%llX (past decoy filter)",
+                            imgName, pid, eproc, dtb, probe_base);
                     *procCR3 = dtb;
                     if (eprocessOut) *eprocessOut = eproc;
                     return TRUE;
                 }
                 DH_INFO("skip decoy '%s' PID=%llu CR3=0x%llX "
-                        "(no MZ@0x140000000 — ACE-obfuscated DTB)",
+                        "(no MZ at PEB.ImageBase nor 0x140000000)",
                         imgName, pid, dtb);
             }
         }
@@ -575,11 +808,260 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         cur = flink;
         count++;
     }
+#ifdef AH_DIAG
+    {
+        HANDLE lh = CreateFileA("C:\\Users\\Public\\ah_procs.log",
+            FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (lh != INVALID_HANDLE_VALUE) {
+            SetFilePointer(lh, 0, NULL, FILE_END);
+            char line[160];
+            int n = _snprintf(line, sizeof(line),
+                "== WALK END: count=%u reads_ok=%u reads_fail=%u exit_via=%s ==\r\n",
+                count, diag_read_ok, diag_read_fail,
+                (cur == head) ? "head-loop" : (count >= 1024 ? "cap" : "flink-fail"));
+            DWORD w = 0;
+            WriteFile(lh, line, (DWORD)n, &w, NULL);
+            CloseHandle(lh);
+        }
+    }
+#endif
 
     DH_ERROR("process '%s' not found in EPROCESS list (%u scanned) — "
              "all candidates were ACE decoys",
              procName, count);
-    return FALSE;
+
+    // v1.0.22 fallback for Win11 25H2 where ACE DKOM-unlinks UAGame from
+    // ActiveProcessLinks. Path:
+    //   1. NtQuerySystemInformation(5) enum in user mode — DKOM can't hide
+    //      from this API since it reads a different list (PspCidTable).
+    //   2. For each hit whose name matches procName, take PID.
+    //   3. NtQuerySystemInformation(64 = SystemExtendedHandleInformation)
+    //      returns every handle in the system with its kernel Object ptr.
+    //   4. Find any Process handle where the target EPROCESS's UniqueProcessId
+    //      (RPM at Object + g_eproc_pid) matches our PID. Object IS the EPROCESS.
+    //   5. Read DTB from that EPROCESS via sysCR3 → done.
+    typedef struct _SYS_PROC {
+        ULONG NextEntryOffset;
+        ULONG NumberOfThreads;
+        BYTE Reserved1[48];
+        UNICODE_STRING ImageName;
+        LONG BasePriority;
+        HANDLE UniqueProcessId;
+    } SYS_PROC;
+    typedef NTSTATUS (NTAPI *pNtQSI2)(ULONG, PVOID, ULONG, PULONG);
+    pNtQSI2 nqsi = (pNtQSI2)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                            "NtQuerySystemInformation");
+    if (!nqsi) return FALSE;
+
+    // ---- Step 1-2: find UAGame PID via SystemProcessInformation. ----
+    ULONG need_p = 0;
+    nqsi(5, NULL, 0, &need_p);
+    if (!need_p) return FALSE;
+    need_p += 0x10000;
+    PVOID pbuf = VirtualAlloc(NULL, need_p, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!pbuf) return FALSE;
+    NTSTATUS st_p = nqsi(5, pbuf, need_p, &need_p);
+    u64 uagame_pid = 0;
+    if (st_p >= 0) {
+        SYS_PROC* pi = (SYS_PROC*)pbuf;
+        while (1) {
+            if (pi->ImageName.Buffer && pi->ImageName.Length) {
+                size_t nchars = pi->ImageName.Length / sizeof(WCHAR);
+                // Multi-name substring match. See EPROCESS-walk matcher above
+                // for why we probe several base names — Steam distribution
+                // ships arena_breakout.exe, retail ships UAGame.exe. Same
+                // fallback path serves both by scanning for either.
+                static const char* AH_ALT_NAMES2[] = {
+                    "arena_breakout",
+                    "UAGameShipping",
+                    NULL
+                };
+                size_t nlen = strlen(procName);
+                if (nlen > 6) nlen = 6;
+                // Store all names + their lengths in a small array for the
+                // substring loop below.
+                const char* _cands[4]  = { procName, NULL, NULL, NULL };
+                size_t      _clens[4]  = { nlen,     0,    0,    0    };
+                int _cn = 1;
+                for (int _ci = 0; AH_ALT_NAMES2[_ci] && _cn < 4; _ci++) {
+                    _cands[_cn] = AH_ALT_NAMES2[_ci];
+                    _clens[_cn] = strlen(AH_ALT_NAMES2[_ci]);
+                    if (_clens[_cn] > 14) _clens[_cn] = 14;
+                    _cn++;
+                }
+                // Loop over every candidate; first hit wins.
+                for (int _ci = 0; !uagame_pid && _ci < _cn; _ci++) {
+                    const char* _cand = _cands[_ci];
+                    size_t      _clen = _clens[_ci];
+                    if (nchars < _clen) continue;
+                    for (size_t i = 0; !uagame_pid && i + _clen <= nchars; i++) {
+                        int ok = 1;
+                        for (size_t k = 0; k < _clen; k++) {
+                            wchar_t w = pi->ImageName.Buffer[i + k];
+                            char c = _cand[k];
+                            if (w >= L'A' && w <= L'Z') w += 32;
+                            if (c >= 'A' && c <= 'Z') c += 32;
+                            if ((int)w != (int)(unsigned char)c) { ok = 0; break; }
+                        }
+                        if (ok) {
+                            uagame_pid = (u64)(uintptr_t)pi->UniqueProcessId;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (uagame_pid || !pi->NextEntryOffset) break;
+            pi = (SYS_PROC*)((BYTE*)pi + pi->NextEntryOffset);
+        }
+    }
+    VirtualFree(pbuf, 0, MEM_RELEASE);
+#ifdef AH_DIAG
+    ah_procs_log("FALLBACK: NtQSI(5) UAGame PID=%llu (st=0x%lX)",
+                 (unsigned long long)uagame_pid, (unsigned long)st_p);
+#endif
+    if (!uagame_pid) return FALSE;
+
+    // ---- Step 2.5: EPROCESS retry, match by PID.
+    // First walk (line 655+) matches by ImageFileName. Anti-cheats (Vanguard
+    // on Steam-ABInfinite in particular) sometimes zero / mangle ImageFileName
+    // in the game's EPROCESS so a name-based scan misses it, but leave the
+    // EPROCESS in ActiveProcessLinks with everything else intact. Since we now
+    // know the real PID (from NtQSI(5) above), redo the walk matching pid_check
+    // == uagame_pid instead. If the EPROCESS is still linked, we find it here
+    // and skip the handle-table fallback entirely — which is important because
+    // NtQSI(64) is one of the first calls Vanguard tears down at userland.
+    {
+        u64 psisp_cache = g_rpm_psisp;
+        if (psisp_cache) {
+            u64 head2 = psisp_cache + g_eproc_links;
+            u64 cur2 = 0;
+            if (RpmRead64(hDev, sysCR3, head2, &cur2)) {
+                int scan2 = 0;
+                while (cur2 && cur2 != head2 && scan2 < 4096) {
+                    u64 eproc2 = cur2 - g_eproc_links;
+                    u64 pid2 = 0;
+                    if (RpmRead64(hDev, sysCR3, eproc2 + g_eproc_pid, &pid2)
+                        && pid2 == uagame_pid) {
+                        u64 dtb2 = 0;
+                        if (RpmRead64(hDev, sysCR3, eproc2 + g_eproc_dtb, &dtb2)
+                            && dtb2) {
+                            // Wrapper filter (same reasoning as primary walk):
+                            // Steam ships arena_breakout.exe as a small bootstrap
+                            // PE at ImageBase ~0x570000. NtQSI(5) substring match
+                            // returns its PID for "arena_breakout" alt-name, and
+                            // this walk would happily hand back its DTB. Reject
+                            // if ImageBase < 4 GB — real UAGame is always at
+                            // 0x140000000+.
+                            u64 peb_p = 0, ib_p = 0;
+                            RpmRead64(hDev, sysCR3, eproc2 + g_eproc_peb_off, &peb_p);
+                            if (peb_p && (peb_p >> 48) == 0)
+                                RpmRead64(hDev, dtb2, peb_p + 0x10, &ib_p);
+                            if (ib_p && ib_p < 0x100000000ULL) {
+#ifdef AH_DIAG
+                                ah_procs_log("FALLBACK-C REJECT wrapper: pid=%llu ImageBase=0x%llX (too low)",
+                                             (unsigned long long)uagame_pid,
+                                             (unsigned long long)ib_p);
+#endif
+                            } else {
+#ifdef AH_DIAG
+                                ah_procs_log("FALLBACK-C: EPROCESS by PID hit pid=%llu eproc=0x%llX DTB=0x%llX ImgBase=0x%llX",
+                                             (unsigned long long)uagame_pid,
+                                             (unsigned long long)eproc2,
+                                             (unsigned long long)dtb2,
+                                             (unsigned long long)ib_p);
+#endif
+                                *procCR3 = dtb2;
+                                if (eprocessOut) *eprocessOut = eproc2;
+                                return TRUE;
+                            }
+                        }
+                    }
+                    u64 flink2 = 0;
+                    if (!RpmRead64(hDev, sysCR3, cur2, &flink2) || flink2 == cur2) break;
+                    cur2 = flink2;
+                    scan2++;
+                }
+#ifdef AH_DIAG
+                ah_procs_log("FALLBACK-C: EPROCESS-by-PID scan exhausted pid=%llu scanned=%d",
+                             (unsigned long long)uagame_pid, scan2);
+#endif
+            }
+        }
+    }
+
+    // ---- Step 3-4: enum handles, find one whose Object.UniqueProcessId == PID. ----
+    typedef struct _SYS_HANDLE_EX {
+        PVOID    Object;
+        ULONG_PTR UniqueProcessId;
+        ULONG_PTR HandleValue;
+        ULONG    GrantedAccess;
+        USHORT   CreatorBackTraceIndex;
+        USHORT   ObjectTypeIndex;
+        ULONG    HandleAttributes;
+        ULONG    Reserved;
+    } SYS_HANDLE_EX;
+    typedef struct _SYS_HANDLE_INFO_EX {
+        ULONG_PTR NumberOfHandles;
+        ULONG_PTR Reserved;
+        SYS_HANDLE_EX Handles[1];
+    } SYS_HANDLE_INFO_EX;
+
+    ULONG need_h = 0;
+    NTSTATUS st_probe = nqsi(64 /*SystemExtendedHandleInformation*/, NULL, 0, &need_h);
+#ifdef AH_DIAG
+    ah_procs_log("FALLBACK: NtQSI(64) size-probe st=0x%lX need_h=%lu",
+                 (unsigned long)st_probe, (unsigned long)need_h);
+#endif
+    if (!need_h) return FALSE;
+    need_h += 0x100000;   // handle table can grow between probes
+    PVOID hbuf = VirtualAlloc(NULL, need_h, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!hbuf) return FALSE;
+    NTSTATUS st_h = nqsi(64, hbuf, need_h, &need_h);
+    BOOL ok = FALSE;
+    if (st_h >= 0) {
+        SYS_HANDLE_INFO_EX* hi = (SYS_HANDLE_INFO_EX*)hbuf;
+#ifdef AH_DIAG
+        ah_procs_log("FALLBACK: NtQSI(64) numHandles=%llu",
+                     (unsigned long long)hi->NumberOfHandles);
+#endif
+        u64 last_object = 0;
+        for (ULONG_PTR i = 0; i < hi->NumberOfHandles; i++) {
+            SYS_HANDLE_EX* h = &hi->Handles[i];
+            if (!h->Object) continue;
+            if ((u64)h->Object == last_object) continue;   // handle-dupe skip
+            last_object = (u64)h->Object;
+            // Probe the Object as if it were an EPROCESS. Read its
+            // UniqueProcessId at g_eproc_pid. If it equals our target,
+            // read DTB from g_eproc_dtb — that IS the game's CR3.
+            u64 pid_check = 0;
+            if (!RpmRead64(hDev, sysCR3, (u64)h->Object + g_eproc_pid, &pid_check))
+                continue;
+            if (pid_check != uagame_pid) continue;
+            u64 dtb = 0;
+            if (!RpmRead64(hDev, sysCR3, (u64)h->Object + g_eproc_dtb, &dtb)
+                || !dtb) continue;
+            // Sanity — try MZ at PEB.ImageBase.
+            u64 peb2 = 0;
+            u64 image_base2 = 0;
+            RpmRead64(hDev, sysCR3, (u64)h->Object + g_eproc_peb_off, &peb2);
+            if (peb2 && (peb2 >> 48) == 0)
+                RpmRead64(hDev, dtb, peb2 + 0x10, &image_base2);
+#ifdef AH_DIAG
+            ah_procs_log("FALLBACK: found EPROCESS=0x%llX PID=%llu DTB=0x%llX ImgBase=0x%llX",
+                         (unsigned long long)h->Object,
+                         (unsigned long long)pid_check,
+                         (unsigned long long)dtb,
+                         (unsigned long long)image_base2);
+#endif
+            *procCR3 = dtb;
+            if (eprocessOut) *eprocessOut = (u64)h->Object;
+            ok = TRUE;
+            break;
+        }
+    }
+    VirtualFree(hbuf, 0, MEM_RELEASE);
+    return ok;
 }
 
 // ---- Userspace PEB.Ldr walking ----

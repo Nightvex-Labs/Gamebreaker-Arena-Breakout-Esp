@@ -1,0 +1,243 @@
+================================================================================
+  arenahack — release packaging cookbook
+================================================================================
+
+Единственная команда: python scripts\make_release_zip.py --zero-key
+Всё остальное — что перед этим и что после.
+
+
+================================================================================
+  0. ЧТО НА ВЫХОДЕ
+================================================================================
+
+C:\arenaREmake\arenahack\releases\WinRuntimeHost.zip
+
+Внутри zip:
+  WinRuntimeHost.exe   VMProtected stub + embedded bundle + AHBE trailer
+  db\EneIo64.bin       kdu vulnerable driver #6
+  db\inpoutx64.bin     kdu #26 (REDFOX) — first-line provider
+  db\MsIo64.bin        kdu fallback
+  db\rtkio64.bin       kdu fallback
+
+Один exe (всё внутри) + четыре драйвер-блоба под db\.
+Никаких bundle.kfpl / VMProtectSDK64.dll / assets\operator.png сбоку.
+
+
+================================================================================
+  1. PRE-FLIGHT — что должно быть готово ПЕРЕД паковкой
+================================================================================
+
+  [1.1] Актуальные оффсеты в inc\ah_offsets.h
+        Значения обновляются каждый раз, когда Tencent катит патч ABI.
+        См. коммент в шапке файла: там записана дата последнего дампа
+        (Sep-24 сейчас — GWORLD=0xB2BEE48).
+
+        Обновить = прогнать abidumper и сверить с текущим:
+          C:\abidumper\RUN.bat    (см. C:\abidumper\README.md)
+
+  [1.2] AH_DIAG — ВНИМАНИЕ, ship-toggle
+        Сейчас в build.bat строка 55, флаг /DAH_DIAG.
+        При включённом флаге overlay пишет диагностику в:
+          C:\Users\Public\ah_reader.log     (throttled ~3s)
+          C:\Users\Public\ah_procs.log      (EPROCESS walk — раздувается быстро)
+
+        Для WIDE-релиза убрать из OVFLAGS:
+          в build.bat найти:
+            set OVFLAGS=... /DAH_DIAG ...
+          заменить на:
+            set OVFLAGS=... (без /DAH_DIAG)
+
+        Для internal test / первого шеринга — оставить, лог помогает отладке.
+        Юзер вопрос об этом уже поднимал 2026-09-25.
+
+  [1.3] Свежий Overlay build
+        Если правил src\* — надо пересобрать:
+          .\build.bat
+        Даёт build\ah_overlay.exe (свежий с изменениями).
+
+        Если пакетишь готовый (без правок) — можно скипнуть, передав
+        --no-overlay-build в make_release_zip.py.
+
+  [1.4] VMProtect должен быть распакован
+        Требуется:
+          C:\vmp\notVmpFull\notVmp\VMProtect_Con.exe  (первый в путях поиска)
+             или
+          C:\vmp\notVmp\VMProtect_Con.exe             (fallback)
+
+        Пароль на notVmp.zip: 1231
+        Если ещё не распакован — распаковать zip из
+        C:\Users\Lucy_Kusinada\Downloads\notVmp.zip в C:\vmp\
+
+  [1.5] Python + cryptography
+        python -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM"
+        Если import fail: pip install cryptography
+
+
+================================================================================
+  2. РЕЖИМЫ ПАКОВКИ
+================================================================================
+
+  --zero-key  (SHIP mode, дефолт для wide release)
+        Baked KFPL_KEY[32] = все нули.
+        Launcher декриптит ТОЛЬКО когда backend инжектит env
+        AH_KFPL_KEY_B64 (или _HEX) на Play time.
+        Двойной клик на WinRuntimeHost.exe без env → decrypt fail → exit.
+        Пират не запустит.
+
+  (без --zero-key)  DEV/LOCAL mode
+        Baked KEY = реальный fresh random.
+        Launcher декриптит из baked (env необязателен).
+        Двойной клик работает. Удобно для локального теста, НЕЛЬЗЯ для wide.
+
+
+================================================================================
+  3. КАК ЗАПАКОВАТЬ (правильный ship путь)
+================================================================================
+
+    cd C:\arenaREmake\arenahack
+    python scripts\make_release_zip.py --zero-key --version 1.0.X
+
+  Опции make_release_zip.py:
+    --version 1.0.X          строка версии для формы Upload
+    --channel stable         канал (stable / beta / dev)
+    --no-overlay-build       пропустить пересборку overlay (используем
+                             существующий build\ah_overlay.exe)
+    --zero-key               ship mode (см. п.2)
+
+  Что скрипт делает по шагам:
+    1) Собирает overlay (или пропускает если --no-overlay-build).
+    2) launcher\bake.py:
+       - генерит fresh random 32-byte KFPL key
+       - пакует build\ah_overlay.exe → launcher\embed\bundle.kfpl
+         (AES-256-GCM, magic "AHKF")
+       - в --zero-key режиме прописывает ZEROS в KFPL_KEY[32] launcher\src\ah_launcher.c
+       - печатает KFPL key в stdout — сохранить, это единственное место!
+    3) launcher\build.bat:
+       - собирает stub → launcher\build\WinRuntimeHost.exe (168 KB)
+    4) scripts\vmprotect_wrap.py:
+       - VMProtect_Con.exe wraps launcher stub in-place
+       - virtualize resolve_key + aes_gcm_decrypt (Ultra)
+       - размер после wrap: 13-15 MB
+    5) Embed step (новое):
+       - stub bytes + bundle.kfpl bytes + AHBE trailer(12B) → stage\WinRuntimeHost.exe
+    6) Копирует db\*.bin в stage.
+    7) Zip: releases\WinRuntimeHost.zip
+
+
+================================================================================
+  4. КЛЮЧ (важно — сохранить сразу!)
+================================================================================
+
+  make_release_zip.py печатает 2 строки:
+    hex:    <64 hex>
+    b64:    <44 base64 with padding>
+
+  Сохранить b64 — он идёт в форму Upload release, поле KFPL KEY.
+
+  Каждый прогон make_release_zip.py = fresh random key. Значит:
+    - Собрал → взял key → залил на форму — все три должны быть одной парой.
+    - Если пересобрал → старый key больше не подходит, залей новый zip + новый key.
+
+  Хочешь re-use ключ между сборками — можно, но потребуется править
+  launcher\bake.py передавать --key-hex <старый>. Дефолт — всегда fresh.
+
+
+================================================================================
+  5. ФОРМА UPLOAD RELEASE (админ-панель koenflow)
+================================================================================
+
+    VERSION            1.0.X            (свой)
+    CHANNEL            stable           (или beta/dev)
+    PACKAGE            WinRuntimeHost.zip  (Choose file → releases\)
+    LAUNCH EXECUTABLE  WinRuntimeHost.exe
+    LAUNCH ARGUMENTS   (пусто)
+    CONTENT KEY        (пусто)
+    LOADER KEY         (пусто)
+    KFPL KEY           <b64 из stdout шага 4>
+    RELEASE NOTES      (опционально — на что фиксили)
+    Activate now       ON
+
+
+================================================================================
+  6. КАК ЭТО РАБОТАЕТ У ЮЗЕРА
+================================================================================
+
+  1) юзер жмёт Play в KoenFlow Launcher
+  2) launcher из backend получает kfplKey, скачивает zip, распаковывает в
+     %LOCALAPPDATA%\KoenFlowLauncher\products\arena-breakout-esp\current\
+  3) launcher вызывает CreateProcessAsUser(WinRuntimeHost.exe, ...) elevated
+     с env AH_KFPL_KEY_B64=<этот key>
+  4) WinRuntimeHost.exe:
+       - VMProtect stub стартует
+       - resolve_key читает env → нашёл валидный key
+       - self-read tail: seek к end, читает AHBE trailer, извлекает
+         bundle bytes past PE end
+       - aes_gcm_decrypt(bundle) → plaintext = overlay bytes
+       - drop в %TEMP%\<12hex>.exe
+       - CreateProcessW DETACHED_PROCESS | CREATE_NO_WINDOW
+       - WaitForSingleObject → удаляет tmp при exit
+  5) Overlay сам:
+       - anti-debug + AMSI patch + ETW blind (DhInitHardening)
+       - D3D11 + DirectComposition + ImGui window (WDA_EXCLUDEFROMCAPTURE)
+       - reader thread: kdu#26 → sysCR3 → EPROCESS walk → UAGame proc
+       - waiting loop до появления UAGame → ATTACH LATCH → GWorld → ACE decrypt
+
+  Юзер видит только один exe (18 MB), сам он не запустит его вручную —
+  без env key baked=zeros = decrypt fail = silent exit.
+
+
+================================================================================
+  7. ROLLBACK / ITERATIONS
+================================================================================
+
+  Каждый прогон make_release_zip.py:
+    - перезаписывает releases\WinRuntimeHost.zip
+    - меняет KFPL key (fresh random)
+    - переписывает launcher\src\ah_launcher.c KFPL_KEY[32]
+
+  Если хочется сохранить старый zip:
+    copy releases\WinRuntimeHost.zip releases\WinRuntimeHost-1.0.13.zip
+  перед прогоном следующей сборки.
+
+  Активная версия на бэкенде переключается флагом Activate now в форме.
+
+
+================================================================================
+  8. TROUBLESHOOTING
+================================================================================
+
+  "cryptography module missing"
+    → pip install cryptography
+
+  "VMProtect_Con.exe not found"
+    → распаковать C:\Users\Lucy_Kusinada\Downloads\notVmp.zip в C:\vmp\
+      (пароль 1231)
+
+  "vcvars64.bat not found"
+    → нет Visual Studio 2022 Community или BuildTools. Поставить.
+
+  Юзер запускает — сразу закрывается, ничего не открывается
+    → backend не инжектит env AH_KFPL_KEY_B64.
+      Проверить: форма — KFPL KEY заполнена правильным b64?
+      В логах launcher (если AH_DIAG включён): "key32 first bytes: 00 00 00 00"
+      = key = zeros = backend не пробросил env.
+
+  Юзер запускает, overlay появляется, но пустой (нет противников)
+    → см. отдельные логи ah_reader.log + ah_procs.log.
+      Обычно: неправильные оффсеты (см. 1.1) или ACE_CACHE сдвинулась.
+
+
+================================================================================
+  9. КРАТКО (памятка)
+================================================================================
+
+  cd C:\arenaREmake\arenahack
+  python scripts\make_release_zip.py --zero-key --version 1.0.X
+  скопировать b64 из stdout
+  залить releases\WinRuntimeHost.zip на форму, вставить b64 в KFPL KEY
+  Activate now = ON, Upload
+
+  для WIDE release: перед всем — убрать /DAH_DIAG из OVFLAGS в build.bat
+                    (иначе overlay пишет диагностику в C:\Users\Public\)
+
+================================================================================

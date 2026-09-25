@@ -17,4 +17,11 @@ bool load_png(ID3D11Device* device, const wchar_t* path,
               ID3D11ShaderResourceView** out_srv,
               int* out_w, int* out_h);
 
+// Memory-buffer variant: decodes `data`/`size` (PNG/JPG/BMP — any WIC-
+// supported format). Removes the runtime file dependency so an image can be
+// embedded into the PE and used without a sidecar file on disk.
+bool load_png(ID3D11Device* device, const void* data, size_t size,
+              ID3D11ShaderResourceView** out_srv,
+              int* out_w, int* out_h);
+
 }

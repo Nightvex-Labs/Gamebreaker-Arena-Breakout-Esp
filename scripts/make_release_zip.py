@@ -58,6 +58,11 @@ def main() -> int:
     ap.add_argument("--channel", default="stable")
     ap.add_argument("--no-overlay-build", action="store_true",
                     help="Skip overlay build; use existing build/ah_overlay.exe.")
+    ap.add_argument("--zero-key", action="store_true",
+                    help="Ship-mode: baked KFPL_KEY[32] = all zeros. Launcher "
+                         "CANNOT decrypt bundle without env AH_KFPL_KEY_B64. "
+                         "Standalone double-click of WinRuntimeHost.exe fails. "
+                         "The generated key is printed for the admin panel form.")
     args = ap.parse_args()
 
     # 1. Overlay build.
@@ -67,9 +72,13 @@ def main() -> int:
     if not OVERLAY_EXE.exists():
         print(f"[!] missing {OVERLAY_EXE}", file=sys.stderr); return 1
 
-    # 2. Pack + bake REAL key (--bake mode).
-    print("[step] KFPL wrap + BAKE real key into launcher source")
-    run([sys.executable, str(LAUNCHER_DIR / "bake.py"), "--bake"], cwd=LAUNCHER_DIR)
+    # 2. Pack + key material.
+    if args.zero_key:
+        print("[step] KFPL wrap — ZERO-key mode (baked key = all zeros; env-injected required)")
+        run([sys.executable, str(LAUNCHER_DIR / "bake.py")], cwd=LAUNCHER_DIR)
+    else:
+        print("[step] KFPL wrap + BAKE real key into launcher source (dev / local test)")
+        run([sys.executable, str(LAUNCHER_DIR / "bake.py"), "--bake"], cwd=LAUNCHER_DIR)
 
     # 3. Launcher build.
     print("[step] building launcher stub (WinRuntimeHost.exe)")
@@ -83,24 +92,43 @@ def main() -> int:
     run([sys.executable, str(ROOT / "scripts" / "vmprotect_wrap.py")], cwd=ROOT)
 
     # 5. Assemble ZIP (flat, DeltaHack-shape).
+    # assets/ is intentionally NOT included: operator.png is now embedded
+    # into the overlay binary via inc/operator_png_data.h. Removing the
+    # sidecar reduces the shipped surface (one less thing an AV can flag or
+    # a user can delete/replace).
     stage = ROOT / "release_staging"
     if stage.exists(): shutil.rmtree(stage)
     stage.mkdir(parents=True, exist_ok=True)
-    (stage / "assets").mkdir(exist_ok=True)
     (stage / "db").mkdir(exist_ok=True)
 
-    shutil.copyfile(LAUNCHER_EXE, stage / "WinRuntimeHost.exe")
-    shutil.copyfile(BUNDLE_KFPL,  stage / "bundle.kfpl")
+    # Single-file distribution: append bundle.kfpl to the tail of the VMProtected
+    # WinRuntimeHost.exe under an "AHBE" trailer marker. The launcher reads
+    # itself at runtime (GetModuleFileName + tail seek), extracts the bundle
+    # blob past its own PE end, and decrypts as before — no sidecar file on
+    # disk. Windows loader ignores bytes past the last section so the file
+    # still runs as a normal MZ .exe.
+    #
+    # Trailer format (12 bytes at end of file):
+    #   [ bundle bytes (N)       ]
+    #   [ u64 LE  bundle_size    ]  8 bytes
+    #   [ 4 byte magic "AHBE"    ]  4 bytes
+    stage_exe = stage / "WinRuntimeHost.exe"
+    with open(LAUNCHER_EXE, "rb") as f: stub_bytes = f.read()
+    with open(BUNDLE_KFPL,  "rb") as f: bundle_bytes = f.read()
+    import struct
+    trailer = struct.pack("<Q", len(bundle_bytes)) + b"AHBE"
+    with open(stage_exe, "wb") as f:
+        f.write(stub_bytes)
+        f.write(bundle_bytes)
+        f.write(trailer)
+    print(f"[pack] embedded bundle into WinRuntimeHost.exe "
+          f"(stub={len(stub_bytes):,} + bundle={len(bundle_bytes):,} + trailer=12 = "
+          f"{stage_exe.stat().st_size:,} B)")
 
-    vmp_dll = LAUNCHER_DIR / "deps" / "vmprotect" / "lib" / "VMProtectSDK64.dll"
-    if vmp_dll.exists():
-        shutil.copyfile(vmp_dll, stage / "VMProtectSDK64.dll")
-
-    op = ASSETS_DIR / "operator.png"
-    if op.exists():
-        shutil.copyfile(op, stage / "assets" / "operator.png")
-    else:
-        print(f"[warn] {op} missing")
+    # VMProtectSDK64.dll — NOT shipped. After VMProtect_Con wraps the launcher,
+    # marker calls are replaced by virtualized bytecode; dumpbin /imports on
+    # the wrapped exe shows no VMProtectSDK64.dll entry. Empirical test on
+    # 25H2: launcher runs identically without the DLL present.
 
     n_bins = 0
     for p in DB_DIR.glob("*.bin"):
@@ -128,7 +156,10 @@ def main() -> int:
     print(f"  READY:  {zip_path}")
     print(f"  Size:   {zip_size:,} bytes ({zip_size/1024/1024:.2f} MB)")
     print()
-    print("  Upload form (KFPL KEY can stay empty — key baked into launcher):")
+    if args.zero_key:
+        print("  Upload form — ZERO-KEY ship mode (paste b64 into KFPL KEY):")
+    else:
+        print("  Upload form (KFPL KEY can stay empty — key baked into launcher):")
     print(f"    VERSION            {args.version}")
     print(f"    CHANNEL            {args.channel}")
     print(f"    PACKAGE            {zip_path.name}")
@@ -136,7 +167,10 @@ def main() -> int:
     print(f"    LAUNCH ARGUMENTS   (empty)")
     print(f"    CONTENT KEY        (empty)")
     print(f"    LOADER KEY         (empty)")
-    print(f"    KFPL KEY           (empty — baked)")
+    if args.zero_key:
+        print(f"    KFPL KEY           (paste b64 printed by bake.py above)")
+    else:
+        print(f"    KFPL KEY           (empty — baked)")
     print(f"    Activate now       ON")
     print("=" * 72)
     return 0

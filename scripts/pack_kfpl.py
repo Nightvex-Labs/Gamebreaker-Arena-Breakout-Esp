@@ -67,8 +67,17 @@ def main() -> int:
         print(f"[!] unknown args: {rest}", file=sys.stderr)
         return 2
     else:
-        key = secrets.token_bytes(32)
-        src_desc = "fresh random"
+        # Generate a "safe" base64 — no '+' or '/' so the HTML-escaper in
+        # C# WriteLaunchContextFile (default JsonSerializer options) doesn't
+        # turn them into + / /, which our C-side plain-string
+        # parser in ah_launcher.c does not resolve. 25% probability per try,
+        # ~0.01% failure at 30 tries.
+        for _ in range(200):
+            key = secrets.token_bytes(32)
+            b64 = base64.b64encode(key).decode()
+            if '+' not in b64 and '/' not in b64:
+                break
+        src_desc = "fresh random (safe-b64, no +/)"
 
     if len(key) != 32:
         print(f"[!] KFPL key must be 32 bytes, got {len(key)}", file=sys.stderr)

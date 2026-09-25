@@ -33,12 +33,17 @@ static inline u32 ah_mask(u32 v12, u32 seed, u32 v16, u32 v17) {
     return b0 | b1 | b2 | b3;
 }
 
+// Runtime override for ACE_CACHE RVA — reader thread scans + sets this at
+// attach time. 0 = use compile-time AH_RVA_ACE_CACHE default.
+u64 g_ah_ace_cache_rva_override = 0;
+
 // Walk hash-bucket chain in ACE cache table. base = UAGame image base.
 // Returns TRUE if entry with matching key found; fills data_ptr + seed.
 static BOOL walk_bucket(HANDLE hDev, u64 procCR3, u64 imageBase, u32 key,
                         u64* dataPtrOut, u32* seedOut) {
     u32 bucket = u32c((u64)AH_ACE_HASH_MUL * key) % 0x10001u;
-    u64 bucketVA = imageBase + AH_RVA_ACE_CACHE + (u64)bucket * 8;
+    u64 rva = g_ah_ace_cache_rva_override ? g_ah_ace_cache_rva_override : (u64)AH_RVA_ACE_CACHE;
+    u64 bucketVA = imageBase + rva + (u64)bucket * 8;
     u64 entry = 0;
     if (!RpmRead64(hDev, procCR3, bucketVA, &entry) || entry == 0) return FALSE;
 

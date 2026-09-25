@@ -80,31 +80,44 @@ extern "C" int AhOverlayRun(void) {
     const int sh = GetSystemMetrics(SM_CYSCREEN);
     if (!ov.init(sw, sh)) { DH_ERROR("abi::Overlay::init failed"); return 1; }
 
-    // Load operator.png into ESP-Preview character sprite. Try assets/ next to
-    // exe, then dev sibling paths.
+    // Load operator.png. Primary path: embedded byte array — the overlay is
+    // self-contained, no sidecar file needed. Sidecar fallbacks kept for dev
+    // iteration where the embedded copy might be stale relative to assets/.
     {
-        wchar_t exe_path[MAX_PATH]{};
-        DWORD glen = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-        if (glen > 0 && glen < MAX_PATH) {
-            wchar_t* last_sep = wcsrchr(exe_path, L'\\');
-            if (last_sep) *(last_sep + 1) = 0;
-            const wchar_t* rels[] = {
-                L"assets\\operator.png",
-                L"..\\assets\\operator.png",
-            };
-            ID3D11ShaderResourceView* op_srv = nullptr;
-            int op_w = 0, op_h = 0;
-            wchar_t buf[MAX_PATH * 2]{};
-            for (const wchar_t* rel : rels) {
-                _snwprintf_s(buf, _TRUNCATE, L"%s%s", exe_path, rel);
-                if (abi::image_loader::load_png(ov.device(), buf, &op_srv, &op_w, &op_h)) {
-                    abi::control_panel_set_operator_texture(
-                        reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
-                    DH_INFO("operator.png: loaded %ls (%dx%d)", buf, op_w, op_h);
-                    break;
+        #include "../inc/operator_png_data.h"
+        ID3D11ShaderResourceView* op_srv = nullptr;
+        int op_w = 0, op_h = 0;
+
+        if (abi::image_loader::load_png(ov.device(),
+                                         OPERATOR_PNG_DATA, OPERATOR_PNG_SIZE,
+                                         &op_srv, &op_w, &op_h)) {
+            abi::control_panel_set_operator_texture(
+                reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
+            DH_INFO("operator.png: loaded from embed (%d bytes, %dx%d)",
+                    (int)OPERATOR_PNG_SIZE, op_w, op_h);
+        } else {
+            // Fallback: sidecar assets/operator.png next to the exe (dev only).
+            wchar_t exe_path[MAX_PATH]{};
+            DWORD glen = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+            if (glen > 0 && glen < MAX_PATH) {
+                wchar_t* last_sep = wcsrchr(exe_path, L'\\');
+                if (last_sep) *(last_sep + 1) = 0;
+                const wchar_t* rels[] = {
+                    L"assets\\operator.png",
+                    L"..\\assets\\operator.png",
+                };
+                wchar_t buf[MAX_PATH * 2]{};
+                for (const wchar_t* rel : rels) {
+                    _snwprintf_s(buf, _TRUNCATE, L"%s%s", exe_path, rel);
+                    if (abi::image_loader::load_png(ov.device(), buf, &op_srv, &op_w, &op_h)) {
+                        abi::control_panel_set_operator_texture(
+                            reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
+                        DH_INFO("operator.png: fallback file %ls (%dx%d)", buf, op_w, op_h);
+                        break;
+                    }
                 }
+                if (!op_srv) DH_INFO("operator.png: embed AND sidecar failed — placeholder text will show");
             }
-            if (!op_srv) DH_INFO("operator.png: not found on any candidate — placeholder text will show");
         }
     }
 
