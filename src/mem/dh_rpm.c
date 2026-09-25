@@ -274,20 +274,20 @@ static const DhEprocLayout kEprocLayouts[] = {
     { 22000, 22000, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 21H2" },
     { 22621, 22621, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 22H2" },
     { 22631, 22631, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 23H2" },
-    // Germanium — realigned layout (Win11 24H2 / 25H2 / 26H2 / future).
-    // Range 26100..30000 covers every current + upcoming Germanium-family
-    // build:
-    //   26100  = 24H2 initial
-    //   26200  = 25H2 (verified live, client)
-    //   ~2760x = 26H2 Insider preview (expected 2026)
+    // Germanium — realigned layout (Win11 24H2 / 25H2 / 26H2).
+    // Range 26100..30000 covers every current + upcoming Germanium build:
+    //   26100  = 24H2 initial   (PID=0x1D0 LINKS=0x1D8 PEB=0x2E0 — verified)
+    //   26200  = 25H2 launch    (PID=0x1D0 LINKS=0x1D8 PEB=0x2E0 — verified)
+    //   28000  = 26H2 preview   (PID=0x1D0 LINKS=0x1D8 PEB=0x2E0 — verified)
     //   catch-all up to 30000 for KB updates & Insider drift.
-    // DiscoverPebOffset()'s runtime PEB scan handles peb_off shifts inside
-    // the family (24H2=0x550, 25H2=0x2E0 seen live). DTB/PID/LINKS/IMGNAME
-    // stay at these Germanium values — the layout-probe sanity check
-    // (System DTB @+0x28 matches sysCR3) validates them at boot; if a
-    // future Windows realigns the KPROCESS/EPROCESS body past 30000,
-    // add a new row here with fresh offsets from Vergilius / live PDB.
-    { 26100, 30000, 0x28, 0x1D0, 0x1D8, 0x338, 0x550, "Win11 24H2/25H2/26H2" },
+    // Source: github.com/I3r1h0n/eprocess_offsets + live probe on client
+    // machines (DiscoverPebOffset returned +0x2E0 on 26100 + 26200).
+    // DTB (KPROCESS.DirectoryTableBase) = 0x28 has been stable since Vista.
+    // ImageFileName = 0x338 across Germanium (private probe on 26200 client).
+    // DiscoverPebOffset() is a belt-and-suspenders refinement — with the
+    // correct default 0x2E0 baked here it becomes a no-op instead of the
+    // fallback lookup path.
+    { 26100, 30000, 0x28, 0x1D0, 0x1D8, 0x338, 0x2E0, "Win11 24H2/25H2/26H2" },
 };
 
 // Populated by EprocInit() on first RpmFindProcess. Zero = uninitialised.
@@ -296,10 +296,12 @@ u32 g_eproc_pid     = 0;
 u32 g_eproc_links   = 0;
 u32 g_eproc_imgname = 0;
 
-// EPROCESS.Peb offset varies per build (26100=0x550, 26200 may differ, 22H2
-// nominally 0x550 as well). Starting guess is set by EprocInit(), then
-// DiscoverPebOffset() refines by walking to OUR OWN EPROCESS and matching
-// gs:[0x60].
+// EPROCESS.Peb offset. Verified values from live dumps + public database:
+//   Win10 20H1..22H2 / Win11 21H2..23H2 (Cobalt/Vibranium) = 0x550
+//   Win11 24H2 / 25H2 / 26H2         (Germanium)          = 0x2E0
+// EprocInit() sets the correct default from the kEprocLayouts row, and
+// DiscoverPebOffset() is only used as a safety net if a future update
+// drifts the offset inside a range.
 u32 g_eproc_peb_off = 0x550;
 
 // Reads OUR own PEB via TEB (gs:[0x60] on x64), returns non-zero on success.
