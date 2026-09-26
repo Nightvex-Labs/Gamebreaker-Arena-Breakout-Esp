@@ -38,4 +38,37 @@ void radar_at(const Snapshot* snap, const RenderConfig& cfg,
 // Счётчик патронов «Дуга магазина». Правый низ, 92×92.
 void ammo_counter(const Snapshot* snap, const RenderConfig& cfg);
 
+// Статус-бар в стиле Gamebreaker: [лого] GameBreaker │ 👤 User │ ▂▄▆ PING │ ◠ FPS.
+// Вызывается каждый кадр из overlay_boot после render_frame.
+void status_bar(const RenderConfig& cfg, const char* user, int ping_ms, float fps,
+                ImVec2 pos = ImVec2(18, 18));
+
+
+// ── ESP-карточка цели ─────────────────────────────────────────────────────
+// Одна реализация для игры (render_frame) и для превью в панели. Вызывающий
+// проецирует бокс (и 8 углов 3D-каркаса) и заполняет поля; всё оформление —
+// шрифты, цвета, размеры, уровни детализации — живёт в esp_style.cpp.
+struct EspCard {
+    ImVec2 b0{}, b1{};                 // 2D-бокс на экране
+    bool   box = false, corners = true, has3d = false;
+    int    mode = 2;                   // 2 = 2D, 3 = 3D
+    ImVec2 c3d[8]{};                   // 0..3 низ, 4..7 верх (yaw + 45/135/225/315)
+    bool   c3d_ok[8]{};
+    bool   labels = true;              // cfg.show_hud
+    bool   pmc = true, dead = false, knocked = false, thermal = false;
+    float  dist_m = 0, alpha = 1, ui = 1;   // ui — множитель разрешения
+    bool   preview = false;            // true — превью в меню (компактнее, мягкая тень)
+    const char* name = nullptr;        // nullptr = скрыт
+    int    team = -1;                  // -1 = скрыт
+    bool   s_hp = false;  int hp = -1, hp_max = 445;
+    const char* weapon = nullptr;      // nullptr = скрыт
+    const char* weapon_asset = "";
+    bool   s_ammo = false; int mag_cur = -1, mag_max = -1;
+    bool   s_arm = false;  int armor_display = 1;   // 0 off, 1 текст, 2 полоса
+    int    helm = -1, vest = -1; float helm_dur = -1, vest_dur = -1;
+    bool   s_dist = false;
+    ImU32  c_box = 0, c_name = 0, c_team = 0, c_wpn = 0, c_ammo = 0, c_dist = 0;
+};
+void esp_target(ImDrawList* dl, const EspCard& c);
+
 }  // namespace abi::hud

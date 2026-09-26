@@ -10,9 +10,12 @@
 #include "icons.hpp"
 #include "image_loader.hpp"
 #include "control_panel.hpp"
+#include "misc/freetype/imgui_freetype.h"
 #include <psapi.h>
 #include <d3d11.h>
 #include <chrono>
+#include <vector>
+#include <cstdio>
 #include <thread>
 #include <string>
 #pragma comment(lib, "psapi.lib")
@@ -40,6 +43,18 @@ static HWND find_game_hwnd();
 // v0.9.436: set to true in create_d3d() when WARP is selected.  Read by
 // per-frame fps-cap clamp below to hard-limit renderer to 30fps under WARP.
 static bool g_using_warp = false;
+
+}   // close namespace abi so the getters below live at file scope
+
+// Panel DPI ratio (1.0 at 96 dpi, 1.5 at 144 dpi …). Written once during
+// font atlas build. overlay_boot.cpp (extern "C" AhOverlayRun) reads it
+// through the C-linkage getter so no name-mangling surprises across
+// extern "C" boundaries.
+static float s_panel_dpi = 1.0f;
+extern "C" float ah_get_panel_dpi(void) { return s_panel_dpi; }
+extern "C" void  ah_set_panel_dpi(float v) { s_panel_dpi = v; }
+
+namespace abi {
 
 Overlay* Overlay::s_instance = nullptr;
 
@@ -192,6 +207,21 @@ void Overlay::set_input_capture(bool on) {
 bool Overlay::init(int sw, int sh) {
     sw_ = sw; sh_ = sh;
     LOG("overlay::init enter sw=%d sh=%d", sw, sh);
+
+    // HOST_PATCH.md v5 §2.1 — declare the process DPI-aware BEFORE the
+    // window is created so Windows never bitmap-scales the frame (the
+    // classic "жирный / мутный шрифт" symptom). Per-monitor v2 is the
+    // strictest mode, falls back to older APIs on pre-Win10 1703.
+    using PFN_SetProcessDpiAwarenessContext = BOOL (WINAPI*)(DPI_AWARENESS_CONTEXT);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    bool dpi_set = false;
+    if (user32) {
+        auto p = (PFN_SetProcessDpiAwarenessContext)
+                 GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (p && p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) dpi_set = true;
+    }
+    if (!dpi_set) SetProcessDPIAware();
+
     LOG("overlay::init calling create_window()");
     if (!create_window()) { LOG("overlay::init create_window FAIL"); return false; }
     LOG("overlay::init create_window OK hwnd=%p", hwnd_);
@@ -217,33 +247,150 @@ bool Overlay::init(int sw, int sh) {
     st.Colors[ImGuiCol_WindowBg]  = ImVec4(0,0,0,0);
     st.Colors[ImGuiCol_MenuBarBg] = ImVec4(0,0,0,0);
 
-    // Combined Latin + Cyrillic + Simplified-Chinese range so we can display
-    // any player nickname regardless of alphabet.
+    // Latin + Cyrillic + symbols for the panel and Latin/Cyrillic
+    // gamertags. Chinese-Simplified is intentionally NOT baked here — with
+    // 10 typed faces at 12..52 px each the CJK range (~4700 codepoints)
+    // overflows the default 1024×1024 atlas and silently drops the tail,
+    // producing empty boxes for Cyrillic. A separate CJK atlas would need
+    // its own font slot; not in scope for panel typography.
     ImFontGlyphRangesBuilder builder;
     builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
     builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
-    builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
     // Cover extras common in gamertags — arrows, symbols, extended Latin.
     static const ImWchar extra_range[] = { 0x2000, 0x206F, 0x2100, 0x21FF, 0x2600, 0x26FF, 0 };
     builder.AddRanges(extra_range);
     static ImVector<ImWchar> ranges;
     builder.BuildRanges(&ranges);
 
-    ImFontConfig cfg;
-    cfg.MergeMode = false;
-    cfg.PixelSnapH = true;
-    // Simple single-font loader (baseline pre-bundle).
-    const char* font_candidates[] = {
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\msyh.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
+    // Bigger atlas so 10 Unbounded/JBM faces × Latin+Cyrillic pack cleanly
+    // (default 1024 wraps and starts dropping glyphs quietly).
+    io.Fonts->TexDesiredWidth = 4096;
+
+    // GameBreaker panel font loader (HOST_PATCH.md v5 §2).
+    // 10 typed faces, each keyed by ImFontConfig::Name ("gb:ub700:24" etc)
+    // so control_panel.cpp's find_font() can pick them up. Baked size =
+    // CSS-em × (ascent-descent)/unitsPerEm × DPI so a "14 px" CSS glyph
+    // renders at the same physical size ImGui would draw a 14 px CSS box.
+    auto exists_file = [](const char* p) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, p, "rb") == 0 && f) { fclose(f); return true; }
+        return false;
     };
-    for (const char* p : font_candidates) {
-        if (io.Fonts->AddFontFromFileTTF(p, 15.0f, &cfg, ranges.Data)) break;
+    auto pick_font = [&](const char* primary, const char* fb1, const char* fb2) -> const char* {
+        if (exists_file(primary)) return primary;
+        if (fb1 && exists_file(fb1)) return fb1;
+        return fb2;
+    };
+    // Read the font's own head/hhea tables and return line_height / em.
+    // Uses only a small binary walk — no stbtt_/FreeType dependency here.
+    auto em_to_line = [](const char* path) -> float {
+        FILE* fp = nullptr;
+        if (fopen_s(&fp, path, "rb") != 0 || !fp) return 1.0f;
+        std::fseek(fp, 0, SEEK_END);
+        long n = std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        if (n < 512) { std::fclose(fp); return 1.0f; }
+        std::vector<unsigned char> b((size_t)n);
+        std::fread(b.data(), 1, (size_t)n, fp);
+        std::fclose(fp);
+        auto u16 = [&](size_t o) -> unsigned {
+            if (o + 1 >= b.size()) return 0;
+            return ((unsigned)b[o] << 8) | (unsigned)b[o + 1];
+        };
+        auto u32 = [&](size_t o) -> unsigned {
+            if (o + 3 >= b.size()) return 0;
+            return ((unsigned)b[o] << 24) | ((unsigned)b[o + 1] << 16) |
+                   ((unsigned)b[o + 2] << 8) | (unsigned)b[o + 3];
+        };
+        auto s16 = [&](size_t o) -> int {
+            int v = (int)u16(o);
+            return v < 0x8000 ? v : v - 0x10000;
+        };
+        int num_tables = (int)u16(4);
+        if (num_tables <= 0 || num_tables > 64) return 1.0f;
+        size_t head_off = 0, hhea_off = 0;
+        for (int i = 0; i < num_tables; ++i) {
+            size_t tr = 12 + (size_t)i * 16;
+            unsigned tag = u32(tr);
+            unsigned off = u32(tr + 8);
+            if (tag == 0x68656164u) head_off = off;   // 'head'
+            if (tag == 0x68686561u) hhea_off = off;   // 'hhea'
+        }
+        if (!head_off || !hhea_off) return 1.0f;
+        unsigned unitsPerEm = u16(head_off + 18);
+        int ascent  = s16(hhea_off + 4);
+        int descent = s16(hhea_off + 6);
+        int lineGap = s16(hhea_off + 8);
+        if (unitsPerEm == 0) return 1.0f;
+        int line = ascent - descent + lineGap;
+        if (line <= 0) return 1.0f;
+        return (float)line / (float)unitsPerEm;
+    };
+
+    // System DPI (see SetProcessDpiAwarenessContext up in init()). The same
+    // value is passed into control_panel_set_typography(dpi, dpi) from
+    // overlay_boot so the panel matches the baked font size 1:1.
+    UINT dpi_raw = GetDpiForSystem();
+    float g_dpi = (float)dpi_raw / 96.0f;
+    if (g_dpi < 1.0f) g_dpi = 1.0f;
+    if (g_dpi > 3.0f) g_dpi = 3.0f;
+
+    const char* kBold = pick_font("assets\\fonts\\Unbounded-Bold.ttf",
+                                   "assets\\fonts\\Unbounded-Regular.ttf",
+                                   "C:\\Windows\\Fonts\\seguisb.ttf");
+    const char* kMed  = pick_font("assets\\fonts\\Unbounded-Medium.ttf",
+                                   "assets\\fonts\\Unbounded-Regular.ttf",
+                                   "C:\\Windows\\Fonts\\segoeui.ttf");
+    const char* kReg  = pick_font("assets\\fonts\\Unbounded-Regular.ttf",
+                                   nullptr,
+                                   "C:\\Windows\\Fonts\\segoeui.ttf");
+    const char* kMono = pick_font("assets\\fonts\\JetBrainsMono-Medium.ttf",
+                                   "assets\\fonts\\JetBrainsMono-Regular.ttf",
+                                   "C:\\Windows\\Fonts\\consola.ttf");
+
+    struct GbFont { const char* file; float css; const char* name; };
+    // esp:world:13 (Unbounded Medium 13 CSS px) sits at index 0 so
+    // ImGui::GetFont() — used all over render.cpp for the in-world ESP
+    // text — picks it up as the default. Otherwise render.cpp would pick
+    // gb:ub700:24 (the first named face) and blow up the world overlay
+    // to unreadable size.
+    const GbFont list[] = {
+        { kMed,  13.0f, "esp:world:13" },
+        { kBold, 24.0f, "gb:ub700:24" },
+        { kBold, 20.0f, "gb:ub700:20" },
+        { kBold, 16.0f, "gb:ub700:16" },
+        { kBold, 52.0f, "gb:ub700:52" },
+        { kBold, 14.0f, "gb:ub700:14" },
+        { kBold, 12.0f, "gb:ub700:12" },
+        { kBold,  9.0f, "gb:ub700:9"  },
+        { kMed,  14.0f, "gb:ub500:14" },
+        { kReg,  12.0f, "gb:ub400:12" },
+        { kMono, 14.0f, "gb:jb500:14" },
+        { kMono, 12.0f, "gb:jb500:12" },
+    };
+    for (const GbFont& f : list) {
+        if (!f.file) continue;
+        float k  = em_to_line(f.file);
+        float px = f.css * k * g_dpi;
+        ImFontConfig fcfg;
+        fcfg.MergeMode  = false;
+        fcfg.PixelSnapH = true;
+        fcfg.OversampleH = 2;   // subpixel positioning — sharper than 1
+        fcfg.OversampleV = 1;
+        fcfg.RasterizerMultiply = 1.0f;   // no edge-thickening; 1.1f smudges
+        fcfg.FontBuilderFlags  |= ImGuiFreeTypeBuilderFlags_LightHinting;
+        strncpy(fcfg.Name, f.name, sizeof(fcfg.Name) - 1);
+        fcfg.Name[sizeof(fcfg.Name) - 1] = 0;
+        io.Fonts->AddFontFromFileTTF(f.file, px, &fcfg, ranges.Data);
     }
+    io.Fonts->FontBuilderIO    = ImGuiFreeType::GetBuilderForFreeType();
+    io.Fonts->FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+
     if (io.Fonts->Fonts.Size == 0) io.Fonts->AddFontDefault();
-    LOG("overlay::init font slots loaded: %d", io.Fonts->Fonts.Size);
+    LOG("overlay::init font slots loaded: %d dpi=%.2f", io.Fonts->Fonts.Size, g_dpi);
+
+    // Publish DPI so overlay_boot can pass it into control_panel_set_typography.
+    ::ah_set_panel_dpi(g_dpi);
 
     LOG("overlay::init calling ImGui_ImplWin32_Init");
     ImGui_ImplWin32_Init(hwnd_);

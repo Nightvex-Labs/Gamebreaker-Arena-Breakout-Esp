@@ -35,6 +35,59 @@ constexpr ImU32 alpha(ImU32 c, float a) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+//  GAMEBREAKER control-panel exact palette (HOST_PATCH.md §1).
+//  control_panel.cpp reads ONLY from abi::pal::gb; do not edit numbers here
+//  unless the mock changes.
+// ══════════════════════════════════════════════════════════════════════════
+namespace gb {
+// Тема «Dark · Peach» (фон как у gamebreaker.ru — #1C1E2C)
+// поверхности
+constexpr ImU32 WINDOW      = rgb(0x1C1E2C);        // фон окна
+constexpr ImU32 BAR         = rgb(0x24273A);        // шапка, сайдбар
+constexpr ImU32 CARD        = rgb(0x24273A);        // строки
+constexpr ImU32 PANEL       = rgb(0x2A2D42);        // раскрытые панели, 44px-блоки, hover строк
+constexpr ImU32 CHIP        = rgb(0x33374D);        // радио, поля, активный пункт меню
+constexpr ImU32 CHIP_ON     = rgb(0xF5997C);        // активная пилюля / блок / кольцо радио
+constexpr ImU32 LOGO_TILE   = rgb(0x2F3244);        // = подложка RU/EN поверх BAR
+constexpr ImU32 LINE        = rgb(0x30344A);        // обводка 44px-блоков
+constexpr ImU32 TRACK       = rgb(0x363A50);        // дорожка ползунка, декор-заголовок
+constexpr ImU32 SEG_BG      = rgb(0xFFFFFF, 0.05f); // подложка сегмент-переключателя
+// текст
+constexpr ImU32 TEXT        = rgb(0xEEF0F7);
+constexpr ImU32 TEXT_MUTED  = rgb(0x8E93AB);
+constexpr ImU32 TEXT_DIM    = rgb(0x7D839E);
+constexpr ImU32 TEXT_FAINT  = rgb(0x737995);        // микро-капс HEX
+constexpr ImU32 WHITE       = rgb(0xFFFFFF);
+constexpr ImU32 ON_ACCENT   = rgb(0x1C1E2C);        // текст на персиковой пилюле
+constexpr ImU32 KNOB        = rgb(0xF4F5FA);        // ручки ползунков
+// акцент
+constexpr ImU32 ACCENT      = rgb(0xF5997C);
+constexpr ImU32 SELECTION   = rgb(0xF5997C, 0.22f);
+// мелочи
+constexpr ImU32 SWATCH_LINE = rgb(0xFFFFFF, 0.14f);
+constexpr ImU32 KNOB_SHADOW = rgb(0x000000, 0.35f);
+constexpr ImU32 SCROLL      = rgb(0xFFFFFF, 0.16f);
+constexpr ImU32 SCROLL_HOT  = rgb(0xFFFFFF, 0.32f);
+constexpr ImU32 CH_R        = rgb(0xD4685F);
+constexpr ImU32 CH_G        = rgb(0x5F9E77);
+constexpr ImU32 CH_B        = rgb(0x6F9FE8);
+// ESP по умолчанию
+constexpr ImU32 ESP_BOX     = rgb(0xE5534B);
+constexpr ImU32 ESP_NAME    = rgb(0x45A3D8);
+constexpr ImU32 ESP_TEXT    = rgb(0xE6E2DA);        // weapon / ammo / distance ботов
+constexpr ImU32 ESP_DIST    = rgb(0x4DBD78);
+constexpr ImU32 ESP_CORPSE  = rgb(0x9AA1A7);
+// палитра выбора цвета ESP (24)
+constexpr ImU32 ESP_PAL[24] = {
+    rgb(0xE5534B), rgb(0xE8684A), rgb(0xEB7F45), rgb(0xEE9A3F), rgb(0xE9B23C), rgb(0xE3C940),
+    rgb(0xC4D24A), rgb(0x9BCB52), rgb(0x6FC45E), rgb(0x4DBD78), rgb(0x3FB894), rgb(0x3BB5AC),
+    rgb(0x3BB0C4), rgb(0x45A3D8), rgb(0x5690E0), rgb(0x6A7DE3), rgb(0x7F6CE0), rgb(0x9660D9),
+    rgb(0xAE58CF), rgb(0xC653BE), rgb(0xD6509F), rgb(0xDE5082), rgb(0xE6E2DA), rgb(0x9AA1A7),
+};
+} // namespace gb
+
+
+// ══════════════════════════════════════════════════════════════════════════
 //  БАЗОВЫЕ ТОКЕНЫ Fey — 1:1 с frontend/src/styles/global.css админки.
 //  Это единственный слой, где вообще появляются hex-числа интерфейса.
 //  Всё ниже — только имена ролей поверх этих токенов.

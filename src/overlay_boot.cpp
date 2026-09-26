@@ -25,6 +25,7 @@ namespace abi {
     namespace hud {
         void top_loot(const Snapshot* snap, const RenderConfig& cfg, float y_anchor);
         void ammo_counter(const Snapshot* snap, const RenderConfig& cfg);
+        void status_bar(const RenderConfig& cfg, const char* user, int ping_ms, float fps, ImVec2 pos);
     }
 }
 
@@ -32,6 +33,9 @@ extern "C" {
 #include "../inc/dh_common.h"
 #include "ah_reader_thread.h"
 #include "../inc/item_names.hpp"
+
+// System DPI ratio published by overlay.cpp after the font atlas is baked.
+float ah_get_panel_dpi(void);
 }
 
 static std::atomic<bool> g_home_press{false};
@@ -121,6 +125,16 @@ extern "C" int AhOverlayRun(void) {
         }
     }
 
+    // Feed the DPI ratio (baked into fonts by overlay::init) into the
+    // panel typography knob. control_panel_set_typography(dpi, dpi) tells
+    // the panel to divide baked glyph size by DPI and scale its own
+    // geometry by DPI, keeping the layout 1:1 with the mock.
+    {
+        float dpi = ah_get_panel_dpi();
+        if (dpi < 1.0f) dpi = 1.0f;
+        abi::control_panel_set_typography(dpi, dpi);
+    }
+
     abi::RenderConfig cfg{};
     cfg.screen_w = sw;
     cfg.screen_h = sh;
@@ -129,8 +143,8 @@ extern "C" int AhOverlayRun(void) {
     // and suppress prefire grace so live entities show without extra delay.
     cfg.visible_check_on   = false;
     cfg.prefire_grace_ms   = 0;
-    cfg.min_loot_value     = 25000; // match RenderConfig default — user lowers via menu for junk
-    cfg.show_top_loot      = true;
+    cfg.min_loot_value     = 75000; // мировые маркеры лута от 75к
+    cfg.show_top_loot      = false; // top-loot список удалён из UI
     ov.set_input_capture(cfg.show_control_panel);
 
     std::thread hk(hotkey_thread);
@@ -168,18 +182,19 @@ extern "C" int AhOverlayRun(void) {
             ov.set_input_capture(cfg.show_control_panel);
         }
 
-        // v0.9.454: F10 = soft reattach. Rebuilds the kdu handle, re-scans for
-        // UAGame, re-sig-scans GWorld. Use when the overlay is up but reader
-        // has silently stalled (provider dropped, procCR3 died, EDR rearmed).
-        // No process restart — panel state + configs preserved.
+        // Soft reattach = Numpad * (VK_MULTIPLY). Rebuilds the kdu handle,
+        // re-scans for UAGame, re-sig-scans GWorld. Use when the overlay is
+        // up but reader has silently stalled (provider dropped, procCR3
+        // died, EDR rearmed). No process restart — panel state + configs
+        // preserved.
         {
-            static bool f10_edge = false;
-            bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-            if (f10_down && !f10_edge) {
-                DH_INFO("F10 pressed → ah_reader_reattach()");
+            static bool reattach_edge = false;
+            bool reattach_down = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+            if (reattach_down && !reattach_edge) {
+                DH_INFO("Numpad * pressed → ah_reader_reattach()");
                 ah_reader_reattach();
             }
-            f10_edge = f10_down;
+            reattach_edge = reattach_down;
         }
 
         // Pull live self snapshot from reader thread.
@@ -284,6 +299,13 @@ extern "C" int AhOverlayRun(void) {
         abi::hud::top_loot(&stub_snap, cfg, 0.0f);
         abi::hud::ammo_counter(&stub_snap, cfg);
 
+        // Gamebreaker статус-бар в левом верхнем углу: [лого] GameBreaker │ 👤 User │ ▂▄▆ PING │ ◠ FPS
+        {
+            float fps = ImGui::GetIO().Framerate;
+            int   ping_ms = 0;   // TODO: подцепить реальный ping когда reader начнёт его читать
+            abi::hud::status_bar(cfg, "Operator", ping_ms, fps, ImVec2(18.0f, 18.0f));
+        }
+
         // Top-loot panel drag (menu-only). Panel dims match hud::top_loot
         // (LOOT_W 380 + 2*LOOT_PAD_X 14 = 408; height varies with row count).
         if (cfg.show_top_loot && cfg.show_control_panel) {
@@ -328,14 +350,22 @@ extern "C" int AhOverlayRun(void) {
             abi::render_radar(&stub_snap, cfg);
 
             if (cfg.show_control_panel) {
-                // Compute current center same way render_radar does.
+                // Compute current center same way render_radar does — учитывая
+                // cfg.radar_position, если пользователь ещё не перетаскивал.
                 const float rr = (float)cfg.radar_px_radius;
-                const float cx = (cfg.radar_screen_x > 0.5f)
-                                    ? cfg.radar_screen_x
-                                    : (float)cfg.screen_w - rr - 30.0f;
-                const float cy = (cfg.radar_screen_y > 0.5f)
-                                    ? cfg.radar_screen_y
-                                    : rr + 30.0f;
+                const float pad = 30.0f;
+                float cx, cy;
+                if (cfg.radar_screen_x > 0.5f) {
+                    cx = cfg.radar_screen_x;
+                    cy = cfg.radar_screen_y;
+                } else {
+                    switch (cfg.radar_position) {
+                        case 1:  cx = (float)cfg.screen_w - pad - rr; cy = (float)cfg.screen_h - pad - rr; break; // BR
+                        case 2:  cx =                      pad + rr; cy = (float)cfg.screen_h - pad - rr; break; // BL
+                        case 3:  cx =                      pad + rr; cy =                      pad + rr;  break; // TL
+                        default: cx = (float)cfg.screen_w - pad - rr; cy =                      pad + rr;  break; // TR
+                    }
+                }
                 ImVec2 mp = ImGui::GetIO().MousePos;
                 float dx = mp.x - cx, dy = mp.y - cy;
                 bool inside = (dx*dx + dy*dy) <= (rr * rr);

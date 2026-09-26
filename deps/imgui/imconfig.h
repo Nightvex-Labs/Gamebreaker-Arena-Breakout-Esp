@@ -14,6 +14,12 @@
 
 #pragma once
 
+// Use FreeType as the font rasterizer instead of stb_truetype. Combined
+// with ImGuiFreeTypeBuilderFlags_LightHinting in the font loader, this
+// gives significantly crisper glyph edges — especially on Bold weights
+// and small point sizes (9–14 px) where stb_truetype tends to smudge.
+#define IMGUI_ENABLE_FREETYPE
+
 //---- Define assertion handler. Defaults to calling assert().
 // If your macro uses multiple statements, make sure is enclosed in a 'do { .. } while (0)' block so it can be used as a single statement.
 //#define IM_ASSERT(_EXPR)  MyAssert(_EXPR)
