@@ -45,6 +45,11 @@
 // ============================================================================
 #define AH_GS_PLAYERARRAY       0x330
 #define AH_GS_MATCHSTATE        0x368    // FName — "InProgress" during raid
+// v0.9.454: verified in Dumper-7 dump ABInfinite 4.26.1
+// (C:\Dumper-7\CppSDK\...\SGFramework_classes.hpp:44627). uint64, replicated,
+// 0 in main menu / matchmaking, non-zero once server assigns a room. Cheapest
+// in-raid indicator: one RPM read, no follow-up, no key rotation risk.
+#define AH_GS_ROOMID            0x430
 
 // ============================================================================
 // UGameInstance / ULocalPlayer / APlayerController
@@ -124,13 +129,43 @@
 #define AH_CONTAIN_STACKCOUNT_ITEM 0x08
 #define AH_WEAPON_AMMO_COMP     0xC50
 #define AH_WEAPON_ASSEMBLE      0xBD0
-#define AH_WEAPON_ZOOMCOMP      0xBE8
-#define AH_WEAPON_CAMCOMP       0xC40
+// v0.9.454: verified in Dumper-7 ABInfinite 4.26.1 SDK (SGFramework_classes.hpp:60936).
+// Old 0xBE8 was pre-micropatch; struct shifted +0x20 since 2026-07-25.
+#define AH_WEAPON_ZOOMCOMP      0xC08
+// v0.9.454: WeaponCameraComp on the weapon itself lives on the ASGInventory
+// base class at 0x0850 (SDK: SGFramework_classes.hpp:26054, InventoryCameraComp).
+// Old 0xC40 was pre-micropatch. The variable-scope live magnification does NOT
+// live on the weapon's own CamComp — it lives on the mounted sight-attachment
+// (a separate ASGInventory hanging off ZoomComp::LastSight @0x490). Read from
+// there for CurrentMagnification.
+#define AH_WEAPON_CAMCOMP       0x850   // was 0xC40, base class InventoryCameraComp
+#define AH_ZC_LASTSIGHT         0x490   // USGWeaponZoomComponent::LastSight (ASGInventory*)
 #define AH_CAMCOMP_ADS_SCENE_FOV 0x148   // real scope render FOV
 #define AH_CAMCOMP_MAGNIFICATION 0x14C   // post-process/glass mag (higher than lens)
 #define AH_CAMCOMP_ZOOM_FOV      0x250
 #define AH_CAMCOMP_HOLDBREATH_FOV 0x254
-#define AH_ZC_LIVE_SCOPE_MAG    0x418
+// v0.9.454: variable-zoom scope live magnification step. int32, Net+RepNotify
+// in USGInventoryCameraComponent (SGFramework_classes.hpp:36318). Updates when
+// user cycles 2/4/7x mid-ADS on a variable scope. USGWeaponCameraComponent
+// inherits the field so it's readable from the same weapon+0xC40 CamComp we
+// already dereference. Base mag for that step lives in SubMagnificationInfoList
+// @ +0x110 (TArray<FSubCameraInfo>).
+#define AH_CAMCOMP_CURRENT_MAG   0x1AC
+#define AH_CAMCOMP_SUB_MAG_LIST  0x110
+// v0.9.454c: TWO distinct scope-mag fields in USGWeaponZoomComponent.
+//   +0x578 = ScopeMagnification (SDK-named, Net/RepNotify) — TARGET / max scope
+//            mag for the mounted sight. Constant per weapon build (7.0 for a
+//            2-7x variable scope regardless of live state) → USELESS as live
+//            indicator, "hip shows 7x" symptom traces to reading this.
+//   +0x418 = LIVE current mag (found via memory-diff scanner in ABIFINAL v0.9.387,
+//            documented in C:\ABIFINAL\src\offsets.hpp). Auto 1.0 in hip fire,
+//            2/4/7 in ADS, updates instantly on mid-ADS variable-zoom cycle.
+// ZoomingType/AimScale are Net fields but unreliable for state (AimScale=1.0
+// always, ZoomingType flips to 0 during 7→2 transition glitch).
+#define AH_ZC_ZOOMING_TYPE      0x3F1   // uint8 ESGZoomType (diag only)
+#define AH_ZC_AIM_SCALE         0x3F4   // float (diag only, not the blend I hoped)
+#define AH_ZC_LIVE_SCOPE_MAG    0x418   // ★ live mag (memory-diff, 1.0 hip / N ADS)
+#define AH_ZC_TARGET_SCOPE_MAG  0x578   // SDK ScopeMagnification (static target)
 
 // ============================================================================
 // Mesh + bones

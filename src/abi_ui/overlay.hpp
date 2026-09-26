@@ -47,6 +47,10 @@ public:
     HWND                       hwnd_{nullptr};
     int                        sw_{0}, sh_{0};
     std::atomic<bool>          input_capture_{false};
+    // Foreground before panel opened, restored on close so WM_MOUSEWHEEL
+    // (default routing: focused window) goes back to the game — otherwise
+    // in-game variable-zoom scope 2x/4x/7x scroll stays dead forever.
+    HWND                       prev_fg_hwnd_{nullptr};
     ID3D11Device*              d3d_device_{nullptr};
     ID3D11DeviceContext*       d3d_ctx_{nullptr};
     IDXGISwapChain1*           swapchain_{nullptr};

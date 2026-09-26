@@ -437,12 +437,15 @@ void top_loot(const Snapshot* snap, const RenderConfig& cfg, float y_anchor) {
         if (d_cm > RANGE_CM) continue;
         float dm = d_cm / 100.0f;
         for (const auto& it : lb.items) {
-            // Top-loot имеет СВОЮ сортировку по цене — не режем min_loot_value
-            // фильтром (тот только для точек на карте). Топ-N цен всегда
-            // осмысленный ranking даже в бедных на лут рейдах.
             if (it.price == 0) continue;
-            rows.push_back({ it.name.empty() ? std::string("?") : it.name,
-                             it.price, dm, P::loot::tier_of(it.price) });
+            // v0.9.454: skip unknown-name items — not real loot.
+            if (it.name.empty()) continue;
+            // v0.9.454: honour min_loot_value gate in top-loot too. Operator
+            // uses the slider to hide junk regardless of panel type — the
+            // previous "top-loot has its own ranking" carve-out meant setting
+            // "min 50k" still showed 3k rows if all raid loot was low-value.
+            if ((int)it.price < cfg.min_loot_value) continue;
+            rows.push_back({ it.name, it.price, dm, P::loot::tier_of(it.price) });
         }
     }
     if (rows.empty()) return;

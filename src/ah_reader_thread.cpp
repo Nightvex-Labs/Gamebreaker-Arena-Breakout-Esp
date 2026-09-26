@@ -73,6 +73,21 @@ static std::unordered_map<uint64_t, std::pair<float,float>> g_bot_cap;
 struct AhCorpse { float x,y,z, cap_r, cap_hh; DWORD stamp_ms; };
 static std::unordered_map<uint64_t, AhCorpse> g_bot_corpses;
 
+// v0.9.454: PMC/player death-pos snapshot. Same idea as g_bot_corpses but with
+// full meta (name/team/armor/weapon) frozen at real-death moment so the corpse
+// keeps rendering after the server strips the pawn from GameState.PlayerArray
+// (usually 3-10s post-death). Without this, player corpses vanish instantly.
+struct AhPmcCorpse {
+    float    x, y, z, cap_r, cap_hh;
+    int      team;
+    int      helm, vest;
+    float    helm_dur, vest_dur;
+    uint32_t weapon_id;
+    char     name[32];
+    DWORD    stamp_ms;
+};
+static std::unordered_map<uint64_t, AhPmcCorpse> g_pmc_corpses;
+
 // Locate the 7-limb HealthAttributeSet on a pawn. Walks
 // pawn.ASC.SpawnedAttrs; matches via signature: 7 "max" floats
 // at +0x4C..+0x7C (step 8), each 15..200, summing to 60..1200.
@@ -165,6 +180,11 @@ extern "C" const DH_PROVIDER* g_active_provider;
 extern "C" u64 g_ah_ace_cache_rva_override;
 
 static std::atomic<bool>     g_run{false};
+// v0.9.454: alive flag set to true when reader_body enters, false right before
+// return. ah_reader_reattach() uses it to wait for the previous detached thread
+// to exit before spawning a new one — otherwise F10 spam could stack multiple
+// reader threads hammering the same kdu handle.
+static std::atomic<bool>     g_thread_alive{false};
 static std::mutex            g_snap_lock;
 static AH_LIVE_SNAP          g_snap{};
 static std::atomic<uint32_t> g_reader_ticks{0};
@@ -296,6 +316,7 @@ static u64 ah_sig_scan_gworld(HANDLE hDev, u64 procCR3, u64 imageBase)
 }
 
 static void reader_body(void) {
+    g_thread_alive.store(true);
     ah_diag("=== reader_body ENTER build=%s ===", __DATE__ " " __TIME__);
     // High-resolution timer — default Windows tick is 15.6ms, so Sleep(10)
     // actually sleeps ~15ms (=~64Hz not 100Hz). timeBeginPeriod(1) drops it
@@ -308,7 +329,9 @@ static void reader_body(void) {
     const DH_PROVIDER* p = DhProviderSelect(&dev, &flags);
     if (!p || !dev) {
         ah_diag("DhProviderSelect FAIL (p=%p dev=%p) -- reader EXIT", (void*)p, (void*)dev);
-        DH_ERROR("reader: provider select failed"); timeEndPeriod(1); return;
+        DH_ERROR("reader: provider select failed"); timeEndPeriod(1);
+        g_thread_alive.store(false);
+        return;
     }
     drv.hDevice = dev;
     g_active_provider = p;
@@ -553,6 +576,41 @@ static void reader_body(void) {
                 RpmRead64(drv.hDevice, procCR3, gworld + AH_UW_GAMEINSTANCE, &gi);
                 RpmRead64(drv.hDevice, procCR3, gworld + AH_UW_GAMESTATE, &gs);
             }
+            // v0.9.454: authoritative in-raid flag from ASGGameState+0x430.
+            // Server sets on real raid start, clears on match end / return to
+            // menu. ACE-decrypt-success was false-positive in the lobby (root
+            // pawn = menu preview character, algo=0 = plaintext, decrypt "OK").
+            u64 raid_room = 0;
+            if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_ROOMID, &raid_room, 8);
+            s.roomid = raid_room;
+
+            // v0.9.454: raid → menu transition. `roomid != 0` while in a raid,
+            // 0 in main menu / matchmaking. On the falling edge we wipe every
+            // per-raid cache so the next raid starts clean. 24-tick debounce
+            // (≈1.2 s at 20 Hz) covers momentary read glitches at the actual
+            // exit moment when server tears down the replicated state.
+            {
+                static bool s_was_in_raid    = false;
+                static int  s_out_streak     = 0;
+                static bool s_cleared        = false;
+                bool in_raid_now = (raid_room != 0);
+                if (in_raid_now) {
+                    s_was_in_raid = true;
+                    s_out_streak  = 0;
+                    s_cleared     = false;
+                } else if (s_was_in_raid) {
+                    s_out_streak++;
+                    if (s_out_streak >= 24 && !s_cleared) {
+                        g_pmc_corpses.clear();
+                        g_bot_corpses.clear();
+                        g_known_bots.clear();
+                        g_bot_cap.clear();
+                        g_limb_aset_cache.clear();
+                        s_cleared = true;
+                        ah_diag("RAID-END (roomid=0): cleared PMC+bot corpse caches + bot pool");
+                    }
+                }
+            }
             if (gi)     RpmRead64(drv.hDevice, procCR3, gi + AH_GI_LOCALPLAYERS, &lp_arr);
             if (lp_arr) RpmRead64(drv.hDevice, procCR3, lp_arr, &lp0);
             if (lp0)    RpmRead64(drv.hDevice, procCR3, lp0 + AH_LP_PC, &pc);
@@ -574,11 +632,12 @@ static void reader_body(void) {
                     RpmReadVirtual(drv.hDevice, procCR3, root + AH_ROOT_CTL, &ctl_now, 4);
                     DWORD now_ms = GetTickCount();
                     if (ctl_now != s_last_ctl || (now_ms - s_last_self_diag) > 10000) {
-                        ah_diag("SELF-DECRYPT gworld=0x%llX gs=0x%llX pc=0x%llX pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u attached=%d fail=%d cam=(%.0f,%.0f,%.0f)",
+                        ah_diag("SELF-DECRYPT gworld=0x%llX gs=0x%llX pc=0x%llX pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u attached=%d fail=%d roomid=0x%llX cam=(%.0f,%.0f,%.0f)",
                                 (unsigned long long)gworld, (unsigned long long)gs,
                                 (unsigned long long)pc, (unsigned long long)pawn,
                                 (unsigned long long)root, ctl_now, ctl_now >> 29,
-                                (int)s.attached, (int)AhAceLastFail(), s.x, s.y, s.z);
+                                (int)s.attached, (int)AhAceLastFail(),
+                                (unsigned long long)s.roomid, s.x, s.y, s.z);
                         s_last_ctl = ctl_now;
                         s_last_self_diag = now_ms;
                     }
@@ -670,35 +729,128 @@ static void reader_body(void) {
             s.scope_fov = 0.0f;
 
             // ── Scope magnification + sight FOV for W2S in ADS ─────────────
-            // wm = pawn+0x1970, curWeapon = wm+0x1F8, ZoomComp = weapon+0xBE8
-            // LIVE scope mag @ ZC+0x418. Anim proxy CurrentSightFov path:
+            // wm = pawn+0x1970, curWeapon = wm+0x1F8, ZoomComp = weapon+0xC08
+            // (was +0xBE8 pre-micropatch). LIVE scope mag @ ZC+0x578 (was
+            // +0x418 stale). Anim proxy CurrentSightFov path:
             // mesh+0x778(anim) → +0x740(localProxy) → +0xB34 (float).
             if (pawn) {
                 u64 wm = 0, weapon = 0, zc = 0;
                 RpmRead64(drv.hDevice, procCR3, pawn + AH_PAWN_WM, &wm);
                 if (wm) RpmRead64(drv.hDevice, procCR3, wm + AH_WM_CURWEAPON, &weapon);
                 if (weapon) RpmRead64(drv.hDevice, procCR3, weapon + AH_WEAPON_ZOOMCOMP, &zc);
+                float _dbg_scope_mag_raw = 0.0f, _dbg_aim_scale = 0.0f;
+                uint8_t _dbg_zt = 0;
+                float _dbg_target_scope_raw = 0.0f;
                 if (zc) {
-                    float sm = 0;
-                    RpmReadVirtual(drv.hDevice, procCR3, zc + AH_ZC_LIVE_SCOPE_MAG, &sm, 4);
-                    if (sm > 0.5f && sm < 20.0f) s.scope_mag = sm;
+                    // v0.9.454c: ABIFINAL formula — read the LIVE mag from
+                    // ZC+0x418 (found via memory-diff scanner, auto-1.0 in hip
+                    // and N in ADS). ZC+0x578 (SDK ScopeMagnification) is the
+                    // static target and is NOT usable as a hip/ADS toggle.
+                    RpmReadVirtual(drv.hDevice, procCR3, zc + AH_ZC_ZOOMING_TYPE,      &_dbg_zt, 1);
+                    RpmReadVirtual(drv.hDevice, procCR3, zc + AH_ZC_AIM_SCALE,         &_dbg_aim_scale, 4);
+                    RpmReadVirtual(drv.hDevice, procCR3, zc + AH_ZC_LIVE_SCOPE_MAG,    &_dbg_scope_mag_raw, 4);
+                    RpmReadVirtual(drv.hDevice, procCR3, zc + AH_ZC_TARGET_SCOPE_MAG,  &_dbg_target_scope_raw, 4);
+                    if (_dbg_scope_mag_raw >= 0.9f && _dbg_scope_mag_raw < 30.0f) {
+                        s.scope_mag = _dbg_scope_mag_raw;
+                    } else {
+                        s.scope_mag = 1.0f;
+                    }
                 }
+#ifdef AH_DIAG
+                {
+                    static DWORD s_last_scope = 0;
+                    static uint8_t s_last_zt = 0xFF;
+                    static float s_last_target = -1.0f;
+                    DWORD now = GetTickCount();
+                    if (_dbg_zt != s_last_zt || _dbg_scope_mag_raw != s_last_target
+                        || (now - s_last_scope) > 3000) {
+                        ah_diag("SCOPE-MAG pawn=0x%llX zc=0x%llX zt=%u aim=%.3f live418=%.3f target578=%.3f eff=%.3f",
+                                (unsigned long long)pawn, (unsigned long long)zc,
+                                (unsigned)_dbg_zt, _dbg_aim_scale,
+                                _dbg_scope_mag_raw, _dbg_target_scope_raw, s.scope_mag);
+                        s_last_scope = now;
+                        s_last_zt = _dbg_zt;
+                        s_last_target = _dbg_scope_mag_raw;
+                    }
+                }
+#endif
                 // WeaponCameraComp — ADSSceneFOV (real scope render FOV) +
                 // post-process magnifier (usually > lens mag; scope glass
                 // renders world into smaller viewport → higher effective mag).
                 // Without this the W2S uses lens 4x but game renders at 6x
                 // effective → boxes drift when moving mouse in scope.
+                //
+                // v0.9.454: variable-zoom scope live step from CurrentMagnification
+                // (int32, Net, RepNotify). Cycles as user scrolls 2/4/7x inside
+                // ADS on a variable scope (Vortex Razor, Elcan, etc.). If the
+                // value is > 1 we treat it as the live magnification directly.
+                float _dbg_sight_mag = 0.0f;
+                int32_t _dbg_sight_cur = 0;
+                float _dbg_wpn_cc_mag = 0.0f;
+                int32_t _dbg_wpn_cc_cur = 0;
+                u64 _dbg_sight = 0, _dbg_sight_cc = 0;
+                // Path A — mounted sight (variable-mag lives here):
+                //   weapon.ZoomComp.LastSight -> Sight.InventoryCameraComp
+                //     -> CurrentMagnification (Net, RepNotify int32)
+                //     -> Magnification (float base)
+                if (zc) {
+                    RpmRead64(drv.hDevice, procCR3, zc + AH_ZC_LASTSIGHT, &_dbg_sight);
+                }
+                if (_dbg_sight) {
+                    RpmRead64(drv.hDevice, procCR3, _dbg_sight + AH_WEAPON_CAMCOMP, &_dbg_sight_cc);
+                }
+                // v0.9.454 confirmed: ScopeMagnification @ ZC+0x578 IS the
+                // authoritative live variable-zoom step (2.0 → 7.0 flips when
+                // the user cycles zoom mid-ADS, verified in-raid). CamComp
+                // fields (sight.Magnification, weapon.CamComp.Magnification)
+                // hold the STATIC base (7.0 for a 2-7x scope regardless of
+                // current step) — they must NOT overwrite the live value.
+                // Kept only for scope_fov (ADSSceneFOV) which is still useful
+                // for the equirect W2S path.
+                if (_dbg_sight_cc) {
+                    float adsfov = 0, mag = 0;
+                    int32_t cur_mag = 0;
+                    RpmReadVirtual(drv.hDevice, procCR3, _dbg_sight_cc + AH_CAMCOMP_ADS_SCENE_FOV, &adsfov, 4);
+                    RpmReadVirtual(drv.hDevice, procCR3, _dbg_sight_cc + AH_CAMCOMP_MAGNIFICATION, &mag, 4);
+                    RpmReadVirtual(drv.hDevice, procCR3, _dbg_sight_cc + AH_CAMCOMP_CURRENT_MAG,   &cur_mag, 4);
+                    _dbg_sight_mag = mag;
+                    _dbg_sight_cur = cur_mag;
+                    if (adsfov > 5.0f && adsfov < 180.0f) s.scope_fov = adsfov;
+                }
                 if (weapon) {
                     u64 cc = 0;
                     RpmRead64(drv.hDevice, procCR3, weapon + AH_WEAPON_CAMCOMP, &cc);
                     if (cc) {
                         float adsfov = 0, mag = 0;
+                        int32_t cur_mag = 0;
                         RpmReadVirtual(drv.hDevice, procCR3, cc + AH_CAMCOMP_ADS_SCENE_FOV, &adsfov, 4);
                         RpmReadVirtual(drv.hDevice, procCR3, cc + AH_CAMCOMP_MAGNIFICATION, &mag, 4);
-                        if (adsfov > 5.0f && adsfov < 180.0f) s.scope_fov = adsfov;
-                        if (mag > 0.9f && mag < 30.0f && mag >= s.scope_mag) s.scope_mag = mag;
+                        RpmReadVirtual(drv.hDevice, procCR3, cc + AH_CAMCOMP_CURRENT_MAG,   &cur_mag, 4);
+                        _dbg_wpn_cc_mag = mag;
+                        _dbg_wpn_cc_cur = cur_mag;
+                        if (adsfov > 5.0f && adsfov < 180.0f && s.scope_fov == 0.0f) s.scope_fov = adsfov;
                     }
                 }
+#ifdef AH_DIAG
+                {
+                    static DWORD s_last_camdiag = 0;
+                    static int32_t s_last_sm = -1;
+                    static int32_t s_last_wm = -1;
+                    DWORD now = GetTickCount();
+                    if (_dbg_sight_cur != s_last_sm || _dbg_wpn_cc_cur != s_last_wm
+                        || (now - s_last_camdiag) > 3000) {
+                        ah_diag("SCOPE-CAM sight=0x%llX cc=0x%llX sight[mag=%.3f cur=%d] wpn_cc[mag=%.3f cur=%d] eff=%.3f",
+                                (unsigned long long)_dbg_sight,
+                                (unsigned long long)_dbg_sight_cc,
+                                _dbg_sight_mag, (int)_dbg_sight_cur,
+                                _dbg_wpn_cc_mag, (int)_dbg_wpn_cc_cur,
+                                s.scope_mag);
+                        s_last_camdiag = now;
+                        s_last_sm = _dbg_sight_cur;
+                        s_last_wm = _dbg_wpn_cc_cur;
+                    }
+                }
+#endif
                 u64 mesh = 0, anim = 0;
                 RpmRead64(drv.hDevice, procCR3, pawn + AH_PAWN_MESH, &mesh);
                 if (mesh) RpmRead64(drv.hDevice, procCR3, mesh + AH_MESH_ANIM_INSTANCE, &anim);
@@ -750,8 +902,13 @@ static void reader_body(void) {
                 struct { u64 data; i32 num; i32 max; } arr = {0};
                 if (RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_PLAYERARRAY,
                                    &arr, sizeof(arr)) &&
-                    arr.num > 0 && arr.num <= AH_MAX_ENT && arr.data)
+                    arr.num > 0 && arr.data)
                 {
+                    // v0.9.453: `arr.num <= AH_MAX_ENT` upper gate removed — used
+                    // to fail the whole `if` on 65+ player raids and blank all
+                    // humans. Inner loop already clamps via `s.ent_n >= AH_MAX_ENT`
+                    // break checks, so oversized PlayerArray now yields the first
+                    // AH_MAX_ENT humans instead of zero.
                     // Key-driven ACE_CACHE scan: capture first 4 non-self
                     // enemy keys (algo != 0) and hunt the table via them.
                     if (g_ah_ace_cache_rva_override == 0) {
@@ -909,6 +1066,29 @@ static void reader_body(void) {
                                            e_dc + AH_DEATH_IS_DEAD, &is_dead, 1);
                             e->dead = is_dead ? 1 : 0;
                         }
+                        // v0.9.454: freeze PMC corpse the first time we see it
+                        // dead. Server strips this pawn from PlayerArray a few
+                        // seconds later; without a persistent copy the corpse
+                        // pops out of the snapshot mid-loot. Refresh stamp_ms
+                        // each tick while pawn is still in PlayerArray so TTL
+                        // starts counting from the LAST time we saw it (not the
+                        // death moment) — a long-visible corpse gets a fresh 5
+                        // min after server drop.
+                        if (e->dead && e->valid && !e->is_me) {
+                            AhPmcCorpse pc_frz{};
+                            pc_frz.x = e->x; pc_frz.y = e->y; pc_frz.z = e->z;
+                            pc_frz.cap_r  = e->cap_r;
+                            pc_frz.cap_hh = e->cap_hh;
+                            pc_frz.team   = e->team;
+                            pc_frz.helm   = pc.helm;
+                            pc_frz.vest   = pc.vest;
+                            pc_frz.helm_dur = pc.helm_dur;
+                            pc_frz.vest_dur = pc.vest_dur;
+                            pc_frz.weapon_id = pc.weapon_id;
+                            memcpy(pc_frz.name, e->name, sizeof(pc_frz.name));
+                            pc_frz.stamp_ms = GetTickCount();
+                            g_pmc_corpses[e_pawn] = pc_frz;
+                        }
                         // Live capsule (every tick — pose changes fast).
                         e->cap_r  = 57.8f;
                         e->cap_hh = 88.0f;
@@ -982,6 +1162,52 @@ static void reader_body(void) {
                 }
             }
         }
+
+        // ── PMC corpse persistence (v0.9.454) ──────────────────────────────
+        // For every pawn in g_pmc_corpses that is NOT currently in the live
+        // snapshot (i.e. server has stripped it from PlayerArray), emit the
+        // frozen entry so the corpse keeps rendering. No TTL — corpses persist
+        // until the reader is restarted (F10 reattach) or the raid ends. Between
+        // raids the state gets reset via ah_reader_reset_state(), so PMC corpses
+        // from the previous raid do not leak into the next.
+        if (s.ent_n < AH_MAX_ENT && !g_pmc_corpses.empty()) {
+            std::unordered_set<u64> pmc_present;
+            pmc_present.reserve(s.ent_n);
+            for (int i = 0; i < s.ent_n; i++) pmc_present.insert(s.ents[i].pawn);
+
+            for (auto& kv : g_pmc_corpses) {
+                if (s.ent_n >= AH_MAX_ENT) break;
+                u64 pp = kv.first;
+                const AhPmcCorpse& pcv = kv.second;
+                if (pmc_present.count(pp)) continue;   // still in PlayerArray
+
+                AH_ENT* pe = &s.ents[s.ent_n];
+                memset(pe, 0, sizeof(*pe));
+                pe->pawn   = pp;
+                pe->x      = pcv.x;
+                pe->y      = pcv.y;
+                pe->z      = pcv.z;
+                pe->yaw    = 0.0f;
+                pe->team   = pcv.team;
+                pe->hp     = 0;
+                pe->valid  = 1;
+                pe->is_bot = 0;
+                pe->is_me  = 0;
+                pe->dead   = 1;
+                pe->helm   = pcv.helm;
+                pe->vest   = pcv.vest;
+                pe->helm_dur = pcv.helm_dur;
+                pe->vest_dur = pcv.vest_dur;
+                pe->cap_r  = pcv.cap_r  > 0 ? pcv.cap_r  : 57.8f;
+                pe->cap_hh = pcv.cap_hh > 0 ? pcv.cap_hh : 88.0f;
+                pe->weapon_id = pcv.weapon_id;
+                pe->mag_cur = -1;
+                pe->mag_max = -1;
+                memcpy(pe->name, pcv.name, sizeof(pe->name));
+                s.ent_n++;
+            }
+        }
+
         // ── Bot update — MINIMUM: pos + yaw + cap (cached). No HP/dead/armor.
         // Per-bot per-tick: root ptr + ACE (~4) + yaw + cached-cap = ~6 RPM.
         if (procCR3 && imageBase && s.ent_n < AH_MAX_ENT) {
@@ -1352,6 +1578,7 @@ static void reader_body(void) {
 
     CloseHandle(dev);
     timeEndPeriod(1);
+    g_thread_alive.store(false);
 }
 
 extern "C" void ah_reader_start(void) {
@@ -1363,4 +1590,24 @@ extern "C" float ah_reader_hz(void) { return g_reader_hz.load(); }
 
 extern "C" void ah_reader_stop(void) {
     g_run.store(false);
+}
+
+// v0.9.454: F10 reattach — synchronous restart of the reader thread. Signals
+// stop, waits for the detached thread to actually exit (bounded ~500 ms), then
+// re-launches. Safe to spam: back-to-back calls collapse into a single reboot
+// because the alive-flag guards the join. Does NOT touch corpse caches — the
+// raid-end transition inside reader_body handles that on its own edge.
+extern "C" void ah_reader_reattach(void) {
+    ah_diag("=== reader_reattach requested ===");
+    g_run.store(false);
+    for (int i = 0; i < 100 && g_thread_alive.load(); i++) Sleep(5);
+    if (g_thread_alive.load()) {
+        ah_diag("reader_reattach: thread still alive after 500ms, spawning anyway");
+    }
+    g_reader_hz.store(0.0f);
+    g_reader_ticks.store(0);
+    g_reader_last_ms.store(0);
+    if (!g_run.exchange(true)) {
+        std::thread(reader_body).detach();
+    }
 }

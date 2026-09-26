@@ -141,7 +141,12 @@ extern "C" int AhOverlayRun(void) {
     // Snapshot the overlay hands to render_radar. cam.* filled from live
     // reader each frame; entities empty until enemy walker lands.
     abi::Snapshot stub_snap;
-    stub_snap.in_raid = true;
+    // v0.9.454: in_raid tracks reader.attached — the flag is 1 when ACE
+    // self-decrypt succeeds, which only happens once the player is inside a
+    // raid. In the lobby/menu ACE returns null coords → attached=0 → in_raid
+    // false, HUD/render bail out, and reader clears per-raid corpse caches on
+    // its own transition edge (see ah_reader_thread.cpp RAID-END).
+    stub_snap.in_raid = false;
 
     // Radar drag state — grab anywhere inside the disc, drop = new center.
     bool  radar_dragging = false;
@@ -163,9 +168,28 @@ extern "C" int AhOverlayRun(void) {
             ov.set_input_capture(cfg.show_control_panel);
         }
 
+        // v0.9.454: F10 = soft reattach. Rebuilds the kdu handle, re-scans for
+        // UAGame, re-sig-scans GWorld. Use when the overlay is up but reader
+        // has silently stalled (provider dropped, procCR3 died, EDR rearmed).
+        // No process restart — panel state + configs preserved.
+        {
+            static bool f10_edge = false;
+            bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+            if (f10_down && !f10_edge) {
+                DH_INFO("F10 pressed → ah_reader_reattach()");
+                ah_reader_reattach();
+            }
+            f10_edge = f10_down;
+        }
+
         // Pull live self snapshot from reader thread.
         AH_LIVE_SNAP live;
         ah_reader_snapshot(&live);
+        // v0.9.454: in_raid from ASGGameState::roomid (0 in menu, non-zero in
+        // raid). Was using live.attached (ACE-decrypt-success) — that false-
+        // positived in the lobby because the menu preview character has a valid
+        // root pawn with algo=0, so decrypt "worked" and attached stayed 1.
+        stub_snap.in_raid = (live.roomid != 0);
         stub_snap.cam.x   = live.x;
         stub_snap.cam.y   = live.y;
         stub_snap.cam.z   = live.z;

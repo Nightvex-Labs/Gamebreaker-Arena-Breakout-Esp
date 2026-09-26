@@ -104,6 +104,11 @@ LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static std::atomic<float> g_wheel_accum{0.0f};
 static HHOOK             g_mouse_hook = nullptr;
 
+// v0.9.454: consecutive Present DEVICE_LOST count. Reset on any successful
+// Present so a recovered TDR doesn't count towards the exit gate. Exit only
+// after 3 consecutive lost frames — modern GPU drivers recover within one.
+static std::atomic<int>  g_present_lost_streak{0};
+
 static LRESULT CALLBACK ll_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_MOUSEWHEEL) {
         auto* p = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
@@ -117,6 +122,24 @@ static LRESULT CALLBACK ll_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
+// Force-set foreground even under foreground-lock rules. Attach our input
+// queue to the current foreground's thread, then SetForegroundWindow is
+// treated as sanctioned. Detach immediately. No global hook, no injection.
+static bool force_set_foreground(HWND target) {
+    if (!target || !IsWindow(target)) return false;
+    HWND cur = GetForegroundWindow();
+    if (cur == target) return true;
+    DWORD cur_tid = cur ? GetWindowThreadProcessId(cur, nullptr) : 0;
+    DWORD our_tid = GetCurrentThreadId();
+    BOOL attached = FALSE;
+    if (cur_tid && cur_tid != our_tid) {
+        attached = AttachThreadInput(our_tid, cur_tid, TRUE);
+    }
+    BOOL ok = SetForegroundWindow(target);
+    if (attached) AttachThreadInput(our_tid, cur_tid, FALSE);
+    return ok != FALSE;
+}
+
 void Overlay::set_input_capture(bool on) {
     // v0.9.414: WH_MOUSE_LL system-wide hook REMOVED (ACE aimbot signature).
     // v0.9.418: while panel is open we also clear WS_EX_TRANSPARENT on the
@@ -125,19 +148,25 @@ void Overlay::set_input_capture(bool on) {
     // no global hook). Clicks stop passing through to the game — acceptable
     // while user is configuring the panel; they're not aiming at that moment.
     // On close we restore WS_EX_TRANSPARENT so gameplay clicks pass through.
+    //
+    // v0.9.452 wheel-routing fix: SetForegroundWindow(hwnd_) on open moved
+    // keyboard focus to us. Windows routes WM_MOUSEWHEEL to the focused
+    // window by default (SPI_GETMOUSEWHEELROUTING = MOUSEWHEEL_ROUTING_FOCUS),
+    // so after the panel closed the game NEVER got wheel events back — the
+    // 2x/4x/7x variable-zoom scope scroll was dead the whole session. Now
+    // stash prev foreground on open and restore it on close (with the
+    // AttachThreadInput bypass so foreground-lock can't refuse us).
     input_capture_.store(on);
     ImGuiIO& io = ImGui::GetIO();
     if (on) {
         io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
         io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
         if (hwnd_) {
+            HWND cur_fg = GetForegroundWindow();
+            if (cur_fg && cur_fg != hwnd_) prev_fg_hwnd_ = cur_fg;
             LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
             SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
-            // Force user-mode focus so wheel events route to us, not to whatever
-            // window had focus before (game). SetForegroundWindow can be denied
-            // by foreground-lock rules — a quick AttachThreadInput escape hatch
-            // guarantees the swap. Cheap since panel opens once per session.
-            SetForegroundWindow(hwnd_);
+            force_set_foreground(hwnd_);
         }
     } else {
         io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
@@ -146,6 +175,16 @@ void Overlay::set_input_capture(bool on) {
         if (hwnd_) {
             LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
             SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+            // Give focus back to whoever had it before panel opened (the
+            // game, in practice). Without this the overlay stays focused
+            // even with WS_EX_TRANSPARENT restored, so mouse-wheel goes
+            // to us and gets swallowed — scope zoom scroll dead in game.
+            HWND target = (prev_fg_hwnd_ && IsWindow(prev_fg_hwnd_))
+                            ? prev_fg_hwnd_ : find_game_hwnd();
+            if (target && target != hwnd_) {
+                force_set_foreground(target);
+            }
+            prev_fg_hwnd_ = nullptr;
         }
     }
 }
@@ -658,8 +697,15 @@ void Overlay::run(const std::function<void()>& frame_fn) {
             }
             if (!alive) { game_miss_streak++; }
             else { game_miss_streak = 0; }
-            if (game_miss_streak >= 3) {
-                LOG("overlay::run: game window gone for 3 probes — self-exit");
+            // v0.9.454: raised from 3 → 30 (30 s at 60fps window). ABI window
+            // gets short-lived pseudo-invisibility during: raid load screens,
+            // fullscreen<->borderless swap, resolution change, alt+tab back-
+            // to-desktop. All those trip the old 3-probe gate and kill the
+            // whole process, discarding kdu state — user has to relaunch by
+            // hand. 30 probes tolerates every legit transition; only a truly
+            // gone UAGame (game exited) sticks past that.
+            if (game_miss_streak >= 30) {
+                LOG("overlay::run: game window gone for 30 probes — self-exit");
                 running_ = false;
                 break;
             }
@@ -718,15 +764,24 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                 present_hr == DXGI_ERROR_DEVICE_RESET)
             {
                 HRESULT rr = d3d_device_ ? d3d_device_->GetDeviceRemovedReason() : E_FAIL;
-                LOG("overlay: Present DEVICE_LOST hr=0x%08lx removedReason=0x%08lx — stopping render loop",
-                    present_hr, rr);
-                // Drop the persistent marker so the next-boot postmortem
-                // knows GPU driver crash killed the last session. Stop the
-                // loop cleanly instead of continuing on a dead swapchain
-                // and inviting the driver DLL fast-fail.
-                crash_marker::write(crash_marker::OVERLAY_DEVICE_LOST);
-                running_ = false;
-                break;
+                // v0.9.454: 3-strike gate before pulling the plug. A single TDR
+                // (Timeout Detection Recovery) fires during resolution swap,
+                // fullscreen enter/leave, or heavy combat frames — the driver
+                // recovers within one frame on modern GPUs. Killing the whole
+                // overlay on the first strike loses kdu state and forces a
+                // launcher relaunch. Sleep 100 ms between strikes so the driver
+                // has a chance to reset; only after 3 consecutive lost frames
+                // (~300 ms with no recovery) do we accept the device is dead.
+                int strike = g_present_lost_streak.fetch_add(1) + 1;
+                LOG("overlay: Present DEVICE_LOST hr=0x%08lx removedReason=0x%08lx streak=%d",
+                    present_hr, rr, strike);
+                if (strike >= 3) {
+                    crash_marker::write(crash_marker::OVERLAY_DEVICE_LOST);
+                    running_ = false;
+                    break;
+                }
+                Sleep(100);
+                continue;
             }
             // Non-fatal Present failures (OCCLUDED, STATUS_UNSUCCESSFUL): log
             // once and keep going — usually resolves within a frame.
@@ -735,6 +790,8 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                 LOG("overlay: Present returned 0x%08lx (non-fatal, will retry silently)", present_hr);
                 logged = true;
             }
+        } else {
+            g_present_lost_streak.store(0);
         }
         {
             using namespace std::chrono;

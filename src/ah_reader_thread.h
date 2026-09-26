@@ -6,7 +6,12 @@
 extern "C" {
 #endif
 
-#define AH_MAX_ENT   64
+// v0.9.453: raised from 64 → 512. On >60-AI raids the 64 cap silently dropped
+// live enemies (corpses share the budget), and the all-or-nothing gate at
+// PlayerArray read below fully skipped the walk when Num > 64. 512 covers the
+// worst-case ABI lobby (60 AI + PMCs + corpses + streamed spawns) with headroom
+// and adds ~72 KB per snapshot — trivial vs the CPU/render budget.
+#define AH_MAX_ENT   512
 #define AH_MAX_LOOT  256
 
 typedef struct {
@@ -53,6 +58,12 @@ typedef struct {
     float    zoom_off_z;  //   (LOCAL up)
     short    my_mag_cur;  // self weapon rounds loaded (-1 = unknown)
     short    my_mag_max;  // self weapon mag capacity
+    // v0.9.454: replicated room-id from ASGGameState+0x430. 0 in main menu /
+    // matchmaking screen, non-zero once server assigns a raid room. Overlay
+    // uses this as the authoritative in-raid flag — ACE-decrypt-success alone
+    // false-positives in the lobby (root pawn exists for the menu preview
+    // character, so decrypt returns plaintext coords with algo=0).
+    unsigned long long roomid;
     unsigned long long uagame_base;
     int      ent_n;
     AH_ENT   ents[AH_MAX_ENT];
@@ -63,6 +74,7 @@ typedef struct {
 
 void ah_reader_start(void);
 void ah_reader_stop(void);
+void ah_reader_reattach(void);                // v0.9.454: soft-restart reader
 void ah_reader_snapshot(AH_LIVE_SNAP* out);   // atomic copy
 float ah_reader_hz(void);                     // rolling 500ms reader Hz
 

@@ -1170,11 +1170,12 @@ void render_loot(const Snapshot* snap, const RenderConfig& cfg) {
         for (const auto& it : lb.items) {
             // v0.9.337: value filter restored (see container-gate comment).
             if ((int)it.price < cfg.min_loot_value) continue;
-            // v2026-09-23 arenahack: unknown-name items still get a text row
-            // ("id=… $price") so testers see what's on the ground even when
-            // the item_names table lags behind fresh builds.
+            // v0.9.454: unknown-name items (item_names catalog miss) are NOT
+            // real loot in practice — they're spawned junk / world clutter
+            // that leaked past the price gate.  Skip rather than paint "?".
+            if (it.name.empty()) continue;
             char buf[128];
-            const char* nm = it.name.empty() ? "?" : it.name.c_str();
+            const char* nm = it.name.c_str();
             if (it.price > 0)
                 snprintf(buf, sizeof(buf), "%s  $%u", nm, it.price);
             else
@@ -1221,9 +1222,9 @@ void render_top_loot(const Snapshot* snap, const RenderConfig& cfg) {
         if (lb.corpse_val > 0) continue;
         for (const auto& it : lb.items) {
             if ((int)it.price < cfg.min_loot_value) continue;
-            // v2026-09-23: allow unknown-name items into the list ("?" name).
-            std::string nm = it.name.empty() ? "?" : it.name;
-            rows.push_back({ nm, it.price, it.rarity, dm });
+            // v0.9.454: skip unknown-name items — treat as garbage, not loot.
+            if (it.name.empty()) continue;
+            rows.push_back({ it.name, it.price, it.rarity, dm });
         }
     }
 
