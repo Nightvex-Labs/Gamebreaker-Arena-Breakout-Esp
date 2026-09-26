@@ -63,6 +63,12 @@ def main() -> int:
                          "CANNOT decrypt bundle without env AH_KFPL_KEY_B64. "
                          "Standalone double-click of WinRuntimeHost.exe fails. "
                          "The generated key is printed for the admin panel form.")
+    ap.add_argument("--no-kfpl", action="store_true",
+                    help="Ship-mode: NO KFPL wrap at all. Overlay is shipped raw as "
+                         "WinRuntimeHost.exe (renamed). No launcher stub, no bundle, "
+                         "no VMProtect. Admin-panel KFPL KEY / LOADER KEY must be empty "
+                         "and product must NOT be a loader-product on the backend. "
+                         "Used while the KFPL / DPAPI-context flow is being reworked.")
     args = ap.parse_args()
 
     # 1. Overlay build.
@@ -72,6 +78,80 @@ def main() -> int:
     if not OVERLAY_EXE.exists():
         print(f"[!] missing {OVERLAY_EXE}", file=sys.stderr); return 1
 
+    # ── NO-KFPL ship path (VMProtect kept) ────────────────────────────────
+    # Skips launcher stub, bundle.kfpl, AHBE trailer. Overlay is VMProtect-
+    # wrapped in place, copied as WinRuntimeHost.exe, driver .bin payloads
+    # sit in db/. Overlay has no explicit VMProtectBeginUltra markers today
+    # (those live in the launcher stub), so VMP applies its default packing +
+    # anti-debug / anti-dump only — no per-function virtualization until
+    # markers are added around AhAceDecrypt / RpmReadVirtual / etc.
+    #
+    # Admin panel needs KFPL KEY / LOADER KEY empty AND the product NOT
+    # configured as loader-product (no DPAPI-wrap of context.json), else the
+    # launcher will wrap args and our raw overlay will not pick them up.
+    if args.no_kfpl:
+        stage = ROOT / "release_staging"
+        if stage.exists(): shutil.rmtree(stage)
+        stage.mkdir(parents=True, exist_ok=True)
+        (stage / "db").mkdir(exist_ok=True)
+
+        # VMProtect wrap the overlay in-place at a staged copy so we don't
+        # touch build/ah_overlay.exe (subsequent runs would re-wrap on top).
+        vmp_input = stage / "ah_overlay_prevmp.exe"
+        shutil.copyfile(OVERLAY_EXE, vmp_input)
+        pre_vmp_size = vmp_input.stat().st_size
+
+        print(f"[step] VMProtect wrap overlay in-place ({pre_vmp_size:,} B)")
+        run([sys.executable, str(ROOT / "scripts" / "vmprotect_wrap.py"),
+             "--exe", str(vmp_input)], cwd=ROOT)
+
+        wrapped_exe = stage / "WinRuntimeHost.exe"
+        vmp_input.rename(wrapped_exe)
+        overlay_size = wrapped_exe.stat().st_size
+        overlay_sha  = hashlib.sha256(wrapped_exe.read_bytes()).hexdigest()[:16]
+        print(f"[pack] overlay (VMPed, no KFPL): {overlay_size:>10,} B  "
+              f"sha256 {overlay_sha}...  →  WinRuntimeHost.exe "
+              f"(delta from pre-VMP: {overlay_size - pre_vmp_size:+,d} B)")
+
+        n_bins = 0
+        for p in DB_DIR.glob("*.bin"):
+            shutil.copyfile(p, stage / "db" / p.name)
+            n_bins += 1
+        print(f"[pack] included {n_bins} driver .bin payloads under db/")
+
+        RELEASES.mkdir(exist_ok=True)
+        zip_path = RELEASES / "WinRuntimeHost.zip"
+        if zip_path.exists(): zip_path.unlink()
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for p in stage.rglob("*"):
+                if p.is_file():
+                    z.write(p, p.relative_to(stage))
+        shutil.rmtree(stage)
+        zip_size = zip_path.stat().st_size
+
+        print()
+        print("=" * 72)
+        print(f"  READY:  {zip_path}")
+        print(f"  Size:   {zip_size:,} bytes ({zip_size/1024/1024:.2f} MB)")
+        print()
+        print("  Upload form — NO-KFPL ship mode:")
+        print(f"    VERSION            {args.version}")
+        print(f"    CHANNEL            {args.channel}")
+        print(f"    PACKAGE            {zip_path.name}")
+        print(f"    LAUNCH EXECUTABLE  WinRuntimeHost.exe")
+        print(f"    LAUNCH ARGUMENTS   (empty)")
+        print(f"    CONTENT KEY        (empty)")
+        print(f"    LOADER KEY         (empty)")
+        print(f"    KFPL KEY           (empty)")
+        print(f"    Activate now       ON")
+        print()
+        print("  IMPORTANT: on the backend, ensure the product is NOT flagged as")
+        print("  loader-product / DPAPI-context. Otherwise the launcher wraps")
+        print("  args and the raw overlay does not read them.")
+        print("=" * 72)
+        return 0
+
+    # ── KFPL path (default) ────────────────────────────────────────────────
     # 2. Pack + key material.
     if args.zero_key:
         print("[step] KFPL wrap — ZERO-key mode (baked key = all zeros; env-injected required)")
@@ -135,6 +215,21 @@ def main() -> int:
         shutil.copyfile(p, stage / "db" / p.name)
         n_bins += 1
     print(f"[pack] included {n_bins} driver .bin payloads under db/")
+
+    # v1.0.21: sidecar DLLs required at overlay runtime (dynamic imports the
+    # overlay can't do without). Gamebreaker links freetype.dll for HiDPI
+    # font rasterization. If present in deps/freetype/lib/, ship it next to
+    # WinRuntimeHost.exe — the stub copies it to %TEMP% alongside the
+    # decrypted child so the loader resolves the import at spawn.
+    sidecars = [ROOT / "deps" / "freetype" / "lib" / "freetype.dll"]
+    n_side = 0
+    for sc in sidecars:
+        if sc.exists():
+            shutil.copyfile(sc, stage / sc.name)
+            n_side += 1
+            print(f"[pack] included sidecar DLL: {sc.name} ({sc.stat().st_size:,} B)")
+    if n_side == 0:
+        print(f"[pack] no sidecar DLLs (arenahack-style build)")
 
     payload = OVERLAY_EXE.read_bytes()
     print(f"[pack] overlay:  {len(payload):>10,} B  sha256 {hashlib.sha256(payload).hexdigest()[:16]}...")
