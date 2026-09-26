@@ -411,6 +411,128 @@ static BOOL EprocInit(void) {
     return FALSE;
 }
 
+// ---- Direct-syscall NtQuerySystemInformation (ntdll-hook bypass) ---------
+//
+// ACE (and other AC/EDR products) install user-mode hooks on ntdll's
+// NtQuerySystemInformation. Symptom on this build: NtQSI(64)
+// (SystemExtendedHandleInformation) size-probe returns need_h≈56 instead
+// of the real ~10-100 MB; second call fails; the handle-table fallback path
+// finds nothing. We rebuild a fresh unhooked syscall stub at runtime by:
+//   1. Mapping C:\Windows\System32\ntdll.dll from disk (read-only view).
+//   2. Parsing its export table, resolving NtQuerySystemInformation RVA.
+//   3. Reading the u32 SSN out of the on-disk stub prologue
+//      (4C 8B D1 B8 <SSN u32> ...).
+//   4. Building a 12-byte { mov r10,rcx; mov eax,SSN; syscall; ret } into
+//      a PAGE_EXECUTE_READWRITE page and casting to a function pointer.
+// This gives us an unhooked NtQuerySystemInformation regardless of what
+// ACE patched into the loaded ntdll.
+typedef NTSTATUS (NTAPI *dh_pfnNQSI)(ULONG, PVOID, ULONG, PULONG);
+
+static DWORD dh_rva_to_file_off(const IMAGE_NT_HEADERS64* nt, DWORD rva)
+{
+    const IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION((PIMAGE_NT_HEADERS64)nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        DWORD va = sh[i].VirtualAddress;
+        DWORD sz = sh[i].Misc.VirtualSize;
+        if (rva >= va && rva < va + sz)
+            return rva - va + sh[i].PointerToRawData;
+    }
+    return 0;
+}
+
+static ULONG dh_read_nqsi_ssn_from_disk(void)
+{
+    HANDLE f = CreateFileW(L"C:\\Windows\\System32\\ntdll.dll",
+                           GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!m) { CloseHandle(f); return 0; }
+    const BYTE* base = (const BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(m);
+    CloseHandle(f);
+    if (!base) return 0;
+
+    ULONG ssn = 0;
+    __try {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) goto done;
+        const IMAGE_NT_HEADERS64* nt =
+            (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) goto done;
+
+        DWORD expRVA = nt->OptionalHeader
+                         .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+                         .VirtualAddress;
+        if (!expRVA) goto done;
+        DWORD expOff = dh_rva_to_file_off(nt, expRVA);
+        if (!expOff) goto done;
+        const IMAGE_EXPORT_DIRECTORY* ed =
+            (const IMAGE_EXPORT_DIRECTORY*)(base + expOff);
+        DWORD namesOff = dh_rva_to_file_off(nt, ed->AddressOfNames);
+        DWORD ordsOff  = dh_rva_to_file_off(nt, ed->AddressOfNameOrdinals);
+        DWORD funcsOff = dh_rva_to_file_off(nt, ed->AddressOfFunctions);
+        if (!namesOff || !ordsOff || !funcsOff) goto done;
+
+        const DWORD*  nameRvas = (const DWORD*)(base + namesOff);
+        const USHORT* ords     = (const USHORT*)(base + ordsOff);
+        const DWORD*  funcs    = (const DWORD*)(base + funcsOff);
+
+        for (DWORD i = 0; i < ed->NumberOfNames; i++) {
+            DWORD noff = dh_rva_to_file_off(nt, nameRvas[i]);
+            if (!noff) continue;
+            const char* name = (const char*)(base + noff);
+            if (strcmp(name, "NtQuerySystemInformation") != 0) continue;
+            DWORD foff = dh_rva_to_file_off(nt, funcs[ords[i]]);
+            if (!foff) break;
+            const BYTE* stub = base + foff;
+            // Expect: 4C 8B D1 B8 <ssn u32> ...
+            if (stub[0] == 0x4C && stub[1] == 0x8B &&
+                stub[2] == 0xD1 && stub[3] == 0xB8)
+                ssn = *(const ULONG*)(stub + 4);
+            break;
+        }
+    done:;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ssn = 0;
+    }
+    UnmapViewOfFile((LPCVOID)base);
+    return ssn;
+}
+
+static dh_pfnNQSI dh_get_direct_nqsi(void)
+{
+    static dh_pfnNQSI cached = NULL;
+    static int tried = 0;
+    if (cached) return cached;
+    if (tried) return NULL;
+    tried = 1;
+
+    ULONG ssn = dh_read_nqsi_ssn_from_disk();
+    if (!ssn) return NULL;
+
+    BYTE stub[] = {
+        0x4C, 0x8B, 0xD1,             // mov r10, rcx
+        0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, imm32 (SSN — patched below)
+        0x0F, 0x05,                   // syscall
+        0xC3                          // ret
+    };
+    *(ULONG*)(stub + 4) = ssn;
+
+    void* page = VirtualAlloc(NULL, sizeof(stub),
+                              MEM_COMMIT | MEM_RESERVE,
+                              PAGE_EXECUTE_READWRITE);
+    if (!page) return NULL;
+    memcpy(page, stub, sizeof(stub));
+    FlushInstructionCache(GetCurrentProcess(), page, sizeof(stub));
+    cached = (dh_pfnNQSI)page;
+#ifdef AH_DIAG
+    ah_procs_log("dh_get_direct_nqsi: unhooked stub built at %p SSN=0x%lX",
+                 page, (unsigned long)ssn);
+#endif
+    return cached;
+}
+
 BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
                     const char* procName, u64* procCR3, u64* eprocessOut)
 {
@@ -474,14 +596,17 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
     typedef NTSTATUS (NTAPI *pfnNtQuerySystemInformation)(
         ULONG, PVOID, ULONG, PULONG);
 
-    // Direct syscall stub (SysWhispers2-style) — bypasses ntdll wrapper so any
-    // user-mode hook Defender / EDR installed on ntdll!NtQuerySystemInformation
-    // never sees this call. Falls back to GetProcAddress if syscall # is
-    // unresolved (empty ntdll — shouldn't happen but keep the safety net).
-    pfnNtQuerySystemInformation pNtQSI = g_ssn_NtQSI
-        ? (pfnNtQuerySystemInformation)DhDirectNtQuerySystemInformation
-        : (pfnNtQuerySystemInformation)GetProcAddress(
-              GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    // Direct syscall stub built at runtime from a fresh disk-mapped ntdll.
+    // Bypasses whatever user-mode hook ACE / EDR patched into the loaded
+    // ntdll's NtQuerySystemInformation. Falls back to GetProcAddress only
+    // if the disk-parse-and-build path fails (fresh install without ntdll
+    // on disk — shouldn't happen).
+    pfnNtQuerySystemInformation pNtQSI =
+        (pfnNtQuerySystemInformation)dh_get_direct_nqsi();
+    if (!pNtQSI) {
+        pNtQSI = (pfnNtQuerySystemInformation)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    }
     if (!pNtQSI) {
         DH_ERROR("NtQuerySystemInformation not found");
         return FALSE;
@@ -665,9 +790,35 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
 #ifdef AH_DIAG
     u32 diag_read_fail = 0;
     u32 diag_read_ok   = 0;
+    u32 diag_cycle_at  = 0;   // step at which a FLINK-cycle was detected (0 = none)
 #endif
-    while (cur != head && count < 1024) {
+    // Cycle detection: ACE forges FLINK chains that loop through synthetic
+    // decoy EPROCESS structures (verified on this build via the 4096-step
+    // scan exhausting on all-Acer decoys). Keep a visited-EPROCESS set;
+    // if the walker sees the same eproc twice, we're in a cycle — bail so
+    // we don't burn the whole budget spinning in fake nodes.
+    const u32 VIS_CAP = 8192;
+    u64* visited = (u64*)HeapAlloc(GetProcessHeap(), 0, VIS_CAP * sizeof(u64));
+    u32 visited_n = 0;
+    int cycle_hit = 0;
+    while (cur != head && count < VIS_CAP) {
         u64 eproc = cur - g_eproc_links;
+        // Cycle probe — O(n) linear scan; n <= 8192 so worst-case ~32M ops
+        // ≈ tens of ms one-off per FindProcess call. Fine.
+        {
+            int seen = 0;
+            for (u32 vi = 0; vi < visited_n; vi++) {
+                if (visited[vi] == eproc) { seen = 1; break; }
+            }
+            if (seen) {
+                cycle_hit = 1;
+#ifdef AH_DIAG
+                diag_cycle_at = count;
+#endif
+                break;
+            }
+            if (visited_n < VIS_CAP) visited[visited_n++] = eproc;
+        }
 
         char imgName[16] = {0};
         BOOL name_ok = RpmReadVirtual(hDev, sysCR3, eproc + g_eproc_imgname, imgName, 15);
@@ -796,6 +947,7 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
                             imgName, pid, eproc, dtb, probe_base);
                     *procCR3 = dtb;
                     if (eprocessOut) *eprocessOut = eproc;
+                    HeapFree(GetProcessHeap(), 0, visited);
                     return TRUE;
                 }
                 DH_INFO("skip decoy '%s' PID=%llu CR3=0x%llX "
@@ -810,6 +962,7 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         cur = flink;
         count++;
     }
+    HeapFree(GetProcessHeap(), 0, visited);
 #ifdef AH_DIAG
     {
         HANDLE lh = CreateFileA("C:\\Users\\Public\\ah_procs.log",
@@ -817,11 +970,13 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (lh != INVALID_HANDLE_VALUE) {
             SetFilePointer(lh, 0, NULL, FILE_END);
-            char line[160];
+            char line[192];
             int n = _snprintf(line, sizeof(line),
-                "== WALK END: count=%u reads_ok=%u reads_fail=%u exit_via=%s ==\r\n",
-                count, diag_read_ok, diag_read_fail,
-                (cur == head) ? "head-loop" : (count >= 1024 ? "cap" : "flink-fail"));
+                "== WALK END: count=%u reads_ok=%u reads_fail=%u cycle_at=%u exit_via=%s ==\r\n",
+                count, diag_read_ok, diag_read_fail, diag_cycle_at,
+                cycle_hit ? "cycle"
+                    : (cur == head) ? "head-loop"
+                    : (count >= 8192 ? "cap" : "flink-fail"));
             DWORD w = 0;
             WriteFile(lh, line, (DWORD)n, &w, NULL);
             CloseHandle(lh);
@@ -852,8 +1007,15 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         HANDLE UniqueProcessId;
     } SYS_PROC;
     typedef NTSTATUS (NTAPI *pNtQSI2)(ULONG, PVOID, ULONG, PULONG);
-    pNtQSI2 nqsi = (pNtQSI2)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
-                                            "NtQuerySystemInformation");
+    // Prefer the disk-built direct syscall stub — the loaded ntdll's
+    // NtQuerySystemInformation is hooked by ACE (evidence: NtQSI(64) size
+    // probe returns need_h=56 through the hooked path, but the real handle
+    // table is 10-100 MB). GetProcAddress path stays only as a last resort.
+    pNtQSI2 nqsi = (pNtQSI2)dh_get_direct_nqsi();
+    if (!nqsi) {
+        nqsi = (pNtQSI2)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                        "NtQuerySystemInformation");
+    }
     if (!nqsi) return FALSE;
 
     // ---- Step 1-2: find UAGame PID via SystemProcessInformation. ----
@@ -939,9 +1101,26 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
             u64 head2 = psisp_cache + g_eproc_links;
             u64 cur2 = 0;
             if (RpmRead64(hDev, sysCR3, head2, &cur2)) {
+                // Same forged-FLINK-cycle problem as the primary walker —
+                // ACE loops the chain through decoy EPROCESS nodes so a
+                // naive count-cap scan never reaches the real UAGame. Track
+                // visited pointers, break on a repeat.
+                const int SCAN2_CAP = 8192;
+                u64* visited2 = (u64*)HeapAlloc(GetProcessHeap(), 0,
+                                                SCAN2_CAP * sizeof(u64));
+                int visited2_n = 0;
                 int scan2 = 0;
-                while (cur2 && cur2 != head2 && scan2 < 4096) {
+                int cycle2 = 0;
+                while (cur2 && cur2 != head2 && scan2 < SCAN2_CAP) {
                     u64 eproc2 = cur2 - g_eproc_links;
+                    {
+                        int seen2 = 0;
+                        for (int vi = 0; vi < visited2_n; vi++) {
+                            if (visited2[vi] == eproc2) { seen2 = 1; break; }
+                        }
+                        if (seen2) { cycle2 = 1; break; }
+                        if (visited2_n < SCAN2_CAP) visited2[visited2_n++] = eproc2;
+                    }
                     u64 pid2 = 0;
                     if (RpmRead64(hDev, sysCR3, eproc2 + g_eproc_pid, &pid2)
                         && pid2 == uagame_pid) {
@@ -975,6 +1154,7 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
 #endif
                                 *procCR3 = dtb2;
                                 if (eprocessOut) *eprocessOut = eproc2;
+                                HeapFree(GetProcessHeap(), 0, visited2);
                                 return TRUE;
                             }
                         }
@@ -984,9 +1164,10 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
                     cur2 = flink2;
                     scan2++;
                 }
+                HeapFree(GetProcessHeap(), 0, visited2);
 #ifdef AH_DIAG
-                ah_procs_log("FALLBACK-C: EPROCESS-by-PID scan exhausted pid=%llu scanned=%d",
-                             (unsigned long long)uagame_pid, scan2);
+                ah_procs_log("FALLBACK-C: EPROCESS-by-PID scan exhausted pid=%llu scanned=%d cycle=%d",
+                             (unsigned long long)uagame_pid, scan2, cycle2);
 #endif
             }
         }
