@@ -185,6 +185,11 @@ static std::atomic<bool>     g_run{false};
 // to exit before spawning a new one — otherwise F10 spam could stack multiple
 // reader threads hammering the same kdu handle.
 static std::atomic<bool>     g_thread_alive{false};
+// v0.9.455: reader progress state. Overlay reads via ah_reader_state() and
+// uses it for both status UI ("Waiting for game..." etc.) and self-exit on
+// GAME_GONE (raid ended + game closed — Steam-wrapper HWND is unreliable).
+static std::atomic<int>      g_reader_state{AH_READER_INIT};
+extern "C" int ah_reader_state(void) { return g_reader_state.load(); }
 static std::mutex            g_snap_lock;
 static AH_LIVE_SNAP          g_snap{};
 static std::atomic<uint32_t> g_reader_ticks{0};
@@ -317,6 +322,7 @@ static u64 ah_sig_scan_gworld(HANDLE hDev, u64 procCR3, u64 imageBase)
 
 static void reader_body(void) {
     g_thread_alive.store(true);
+    g_reader_state.store(AH_READER_INIT);
     ah_diag("=== reader_body ENTER build=%s ===", __DATE__ " " __TIME__);
     // High-resolution timer — default Windows tick is 15.6ms, so Sleep(10)
     // actually sleeps ~15ms (=~64Hz not 100Hz). timeBeginPeriod(1) drops it
@@ -330,11 +336,13 @@ static void reader_body(void) {
     if (!p || !dev) {
         ah_diag("DhProviderSelect FAIL (p=%p dev=%p) -- reader EXIT", (void*)p, (void*)dev);
         DH_ERROR("reader: provider select failed"); timeEndPeriod(1);
+        g_reader_state.store(AH_READER_PROVIDER_FAIL);
         g_thread_alive.store(false);
         return;
     }
     drv.hDevice = dev;
     g_active_provider = p;
+    g_reader_state.store(AH_READER_PROVIDER_OK);
     ah_diag("DhProviderSelect OK kdu#%u %s dev=%p", p->kdu_id, p->name, (void*)dev);
     DH_INFO("reader: provider kdu#%u %s", p->kdu_id, p->name);
 
@@ -342,8 +350,12 @@ static void reader_body(void) {
     ah_diag("RpmFindSystemCR3 BEGIN");
     if (!RpmFindSystemCR3(drv.hDevice, &sysCR3)) {
         ah_diag("RpmFindSystemCR3 FAIL -- reader EXIT");
-        DH_ERROR("reader: sysCR3 fail"); CloseHandle(dev); return;
+        DH_ERROR("reader: sysCR3 fail"); CloseHandle(dev);
+        g_reader_state.store(AH_READER_CR3_FAIL);
+        g_thread_alive.store(false);
+        return;
     }
+    g_reader_state.store(AH_READER_CR3_OK);
     ah_diag("RpmFindSystemCR3 OK sysCR3=0x%llX", (unsigned long long)sysCR3);
 
     // Signal KoenFlow launcher — DeltaHack's DHREADY event. All DhModal
@@ -420,6 +432,7 @@ static void reader_body(void) {
     BOOL  gworld_seen = FALSE;   // set TRUE the first tick gworld != 0
     ah_diag("entering main loop -- waiting for UAGame process (GWorld initial RVA=0x%llX)",
             (unsigned long long)gworld_rva_live);
+    g_reader_state.store(AH_READER_WAITING_GAME);
     DWORD last_diag_ms = 0;
     int   last_ent_n = -1;
     int   find_attempts = 0;
@@ -444,6 +457,7 @@ static void reader_body(void) {
                     attached_pid = pid;
                     attach_ms = now;
                     gworld_seen = FALSE;
+                    g_reader_state.store(AH_READER_ATTACHED);
                     ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX",
                             find_attempts,
                             (unsigned long long)pid,
@@ -502,6 +516,41 @@ static void reader_body(void) {
             u64 gworld = 0;
             BOOL rd_ok = RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
             if (gworld) gworld_seen = TRUE;
+
+            // v0.9.455 game-gone watchdog. UAGame HWND is unreliable —
+            // Steam-wrapper holds the window handle for 30-60 s after the game
+            // closes, so game_owns_foreground() keeps returning true and the
+            // overlay hangs empty. gworld dropping to 0 for a sustained window
+            // is the reliable "game gone" signal. Overlay reads g_reader_state
+            // and self-exits cleanly on AH_READER_GAME_GONE.
+            {
+                static int s_gworld_zero_streak = 0;
+                if (gworld_seen) {
+                    if (gworld == 0) {
+                        int cur = ++s_gworld_zero_streak;
+                        // Log every 30 ticks to visualise how long we spin,
+                        // and log the exact tick we transition to GAME_GONE.
+                        if (cur == 30 || cur == 60 || cur == 100) {
+                            ah_diag("GAME-GONE watchdog: gworld=0 streak=%d (attached_pid=%llu)",
+                                    cur, (unsigned long long)attached_pid);
+                        }
+                        if (cur >= 150) {
+                            if (g_reader_state.load() != AH_READER_GAME_GONE) {
+                                ah_diag("GAME-GONE tripped: gworld=0 for 150 ticks — reader signaling overlay exit");
+                                g_reader_state.store(AH_READER_GAME_GONE);
+                            }
+                        }
+                    } else {
+                        if (s_gworld_zero_streak > 0) {
+                            ah_diag("GAME-GONE cleared: gworld=0x%llX after streak=%d",
+                                    (unsigned long long)gworld, s_gworld_zero_streak);
+                            s_gworld_zero_streak = 0;
+                        }
+                        if (g_reader_state.load() == AH_READER_GAME_GONE)
+                            g_reader_state.store(AH_READER_ATTACHED);
+                    }
+                }
+            }
 
             // Sig-scan for GWorld RVA. Runs immediately on first attach.
             // If gworld read gave NULL AND we haven't locked in a scan
@@ -575,6 +624,25 @@ static void reader_body(void) {
             if (gworld) {
                 RpmRead64(drv.hDevice, procCR3, gworld + AH_UW_GAMEINSTANCE, &gi);
                 RpmRead64(drv.hDevice, procCR3, gworld + AH_UW_GAMESTATE, &gs);
+            }
+            // v0.9.455: LIVE transition — snapshot is only meaningful once both
+            // gworld AND gs are non-null. Between ATTACHED (process latched)
+            // and LIVE (world+state ready) we could publish garbage roomid or
+            // NULL pawn — overlay would see "in_raid" briefly and render
+            // empties. Now overlay checks state and gates its own render.
+            {
+                int st = g_reader_state.load();
+                if (gworld && gs) {
+                    if (st == AH_READER_ATTACHED) {
+                        ah_diag("READER-LIVE: gworld=0x%llX gs=0x%llX — publishing real snapshot",
+                                (unsigned long long)gworld, (unsigned long long)gs);
+                        g_reader_state.store(AH_READER_LIVE);
+                    }
+                } else if (st == AH_READER_LIVE) {
+                    ah_diag("READER-LIVE lost: gworld=0x%llX gs=0x%llX — back to ATTACHED",
+                            (unsigned long long)gworld, (unsigned long long)gs);
+                    g_reader_state.store(AH_READER_ATTACHED);
+                }
             }
             // v0.9.454: authoritative in-raid flag from ASGGameState+0x430.
             // Server sets on real raid start, clears on match end / return to
@@ -1593,21 +1661,33 @@ extern "C" void ah_reader_stop(void) {
 }
 
 // v0.9.454: F10 reattach — synchronous restart of the reader thread. Signals
-// stop, waits for the detached thread to actually exit (bounded ~500 ms), then
-// re-launches. Safe to spam: back-to-back calls collapse into a single reboot
-// because the alive-flag guards the join. Does NOT touch corpse caches — the
-// raid-end transition inside reader_body handles that on its own edge.
+// stop, waits for the detached thread to actually exit, then re-launches.
+// v0.9.455: reject re-entry while previous thread still alive. Previous
+// implementation spawned anyway after 500 ms, so F10-spam produced 3+ parallel
+// reader threads racing on the same kdu device handle → DhProviderSelect FAIL.
+// Now waits 3 s and REFUSES to spawn a duplicate if the old thread hasn't
+// unwound. User can press F10 again after the previous attempt finishes.
 extern "C" void ah_reader_reattach(void) {
+    static std::atomic<int> s_in_progress{0};
+    int expected = 0;
+    if (!s_in_progress.compare_exchange_strong(expected, 1)) {
+        ah_diag("=== reader_reattach REJECTED — previous attach still in progress ===");
+        return;
+    }
     ah_diag("=== reader_reattach requested ===");
     g_run.store(false);
-    for (int i = 0; i < 100 && g_thread_alive.load(); i++) Sleep(5);
+    for (int i = 0; i < 600 && g_thread_alive.load(); i++) Sleep(5);   // up to 3s
     if (g_thread_alive.load()) {
-        ah_diag("reader_reattach: thread still alive after 500ms, spawning anyway");
+        ah_diag("reader_reattach: thread STILL alive after 3s — refusing to spawn duplicate");
+        s_in_progress.store(0);
+        return;
     }
     g_reader_hz.store(0.0f);
     g_reader_ticks.store(0);
     g_reader_last_ms.store(0);
+    g_reader_state.store(AH_READER_INIT);
     if (!g_run.exchange(true)) {
         std::thread(reader_body).detach();
     }
+    s_in_progress.store(0);
 }

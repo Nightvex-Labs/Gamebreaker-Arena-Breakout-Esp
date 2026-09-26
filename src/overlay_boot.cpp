@@ -189,7 +189,12 @@ extern "C" int AhOverlayRun(void) {
         // raid). Was using live.attached (ACE-decrypt-success) — that false-
         // positived in the lobby because the menu preview character has a valid
         // root pawn with algo=0, so decrypt "worked" and attached stayed 1.
-        stub_snap.in_raid = (live.roomid != 0);
+        // v0.9.455: additionally gate on reader state = LIVE. Between the
+        // process latch and the first valid gworld+gs, reader may transiently
+        // publish stale/garbage roomid. Without this gate HUD flashes in-raid
+        // for a frame during ABI loading screens.
+        int _reader_st = ah_reader_state();
+        stub_snap.in_raid = (live.roomid != 0) && (_reader_st == AH_READER_LIVE);
         stub_snap.cam.x   = live.x;
         stub_snap.cam.y   = live.y;
         stub_snap.cam.z   = live.z;

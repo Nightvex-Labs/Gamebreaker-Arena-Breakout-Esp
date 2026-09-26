@@ -38,7 +38,7 @@
 #  define AH_MB_F(buf, fmt, ...) ((void)(buf))
 #endif
 
-static void ah_log(const char* fmt, ...)
+void ah_log(const char* fmt, ...)
 {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -711,6 +711,14 @@ int wmain(int argc, wchar_t** argv)
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD exit_code = 0; GetExitCodeProcess(pi.hProcess, &exit_code);
     ah_log("child exit_code=%lu (0x%08lX)", exit_code, exit_code);
+
+    // v1.0.14-debug: auto-upload log tails to koenflow.com telemetry so we can
+    // see what killed the overlay without asking clients to hand over files.
+    // Silent, best-effort, 5s timeouts — never blocks launcher exit.
+    extern void crash_upload_after_child(DWORD child_pid, DWORD exit_code,
+                                         const char* version);
+    crash_upload_after_child(pi.dwProcessId, exit_code, "1.0.14-debug");
+
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     DeleteFileW(tmp_path);
 

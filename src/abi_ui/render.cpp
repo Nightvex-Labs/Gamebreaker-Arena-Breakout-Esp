@@ -75,9 +75,19 @@ struct ScreenPt { float sx, sy, depth; bool ok; };
 static ScreenPt world_to_screen(float wx, float wy, float wz,
                                 const Cam& cam, const Mat3& mat,
                                 int sw, int sh) {
+    // v0.9.455 null-safe: bail on any non-finite coords. A bad ACE decrypt
+    // (out-of-relevance actor, key rotation glitch) can hand us NaN/Inf or
+    // z-coords like 1.8e14 — atan2/tan on those propagates NaN into every
+    // downstream call and can trip an ImGui assertion inside PathLineTo.
+    if (!std::isfinite(cam.x) || !std::isfinite(cam.y) || !std::isfinite(cam.z) ||
+        !std::isfinite(wx)    || !std::isfinite(wy)    || !std::isfinite(wz)) {
+        return {0,0,0,false};
+    }
+    // ABI world fits ±1e6 cm easily; anything bigger is garbage.
+    if (fabsf(cam.z) > 1e7f || fabsf(wz) > 1e7f) return {0,0,0,false};
     float dx = wx - cam.x, dy = wy - cam.y, dz = wz - cam.z;
     float fwd = dx*mat.m[0][0] + dy*mat.m[0][1] + dz*mat.m[0][2];
-    if (fwd < 1.0f) return {0,0,0,false};
+    if (!std::isfinite(fwd) || fwd < 1.0f) return {0,0,0,false};
     float right = dx*mat.m[1][0] + dy*mat.m[1][1] + dz*mat.m[1][2];
     float up    = dx*mat.m[2][0] + dy*mat.m[2][1] + dz*mat.m[2][2];
 

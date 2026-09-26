@@ -56,7 +56,7 @@ for %%A in (%OUT_SELF%) do echo   ah_self size: %%~zA bytes
 
 echo [build 3/3] compiling ah_overlay.exe (full ABIFINAL interface)
 set OUT2=build\ah_overlay.exe
-set OVFLAGS=/nologo /W1 /O2 /GS- /MD /EHsc /std:c++20 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /DDH_RELEASE /DABI_NO_RUNLOG /Iinc /Ideps\imgui /Ideps\imgui\backends /Ithird_party
+set OVFLAGS=/nologo /W1 /O2 /GS- /MD /EHsc /std:c++20 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /DDH_RELEASE /DABI_NO_RUNLOG /DAH_DIAG /Iinc /Ideps\imgui /Ideps\imgui\backends /Ithird_party
 set ABI_UI=src\abi_ui\overlay.cpp src\abi_ui\control_panel.cpp src\abi_ui\overlay_hud.cpp src\abi_ui\render.cpp src\abi_ui\icons.cpp src\abi_ui\image_loader.cpp
 REM Overlay uses SUBSYSTEM:WINDOWS so no conhost/cmd window ever pops up when
 REM spawned directly (schtasks / RunUserActive / dev-mode). wmainCRTStartup is

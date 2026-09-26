@@ -78,6 +78,27 @@ void ah_reader_reattach(void);                // v0.9.454: soft-restart reader
 void ah_reader_snapshot(AH_LIVE_SNAP* out);   // atomic copy
 float ah_reader_hz(void);                     // rolling 500ms reader Hz
 
+// v0.9.455: reader state machine (single atomic). Overlay reads via
+// ah_reader_state() to decide UI status and self-exit on GAME_GONE.
+//   INIT=0 → provider not attempted
+//   PROVIDER_OK=1 → kdu loaded
+//   CR3_OK=2 → system CR3 resolved
+//   WAITING_GAME=3 → looking for UAGame process
+//   ATTACHED=4 → normal 30 Hz snapshot flow
+//   GAME_GONE=5 → gworld = 0 held for ≥N probes (game closed)
+//   PROVIDER_FAIL=-1 → DhProviderSelect failed
+//   CR3_FAIL=-2 → RpmFindSystemCR3 failed
+#define AH_READER_INIT             0
+#define AH_READER_PROVIDER_OK      1
+#define AH_READER_CR3_OK           2
+#define AH_READER_WAITING_GAME     3
+#define AH_READER_ATTACHED         4  // process latched (imageBase resolved)
+#define AH_READER_LIVE             5  // gworld + gs valid — snapshot is real
+#define AH_READER_GAME_GONE        6
+#define AH_READER_PROVIDER_FAIL   -1
+#define AH_READER_CR3_FAIL        -2
+int ah_reader_state(void);
+
 #ifdef __cplusplus
 }
 #endif

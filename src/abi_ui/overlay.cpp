@@ -3,6 +3,7 @@
 #include "api_resolver.hpp"  // v0.9.472 A7
 #include "runlog.hpp"
 #include "crash_marker.hpp"
+#include "../ah_reader_thread.h"   // v0.9.455: ah_reader_state()
 #include <dwmapi.h>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -708,6 +709,47 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                 LOG("overlay::run: game window gone for 30 probes — self-exit");
                 running_ = false;
                 break;
+            }
+        }
+
+        // v0.9.455: reader-driven game-gone watchdog. Steam-wrapper holds the
+        // UAGame window for 30-60s after close (game_owns_foreground stays
+        // true), so game_miss_streak alone never trips and overlay hangs empty.
+        // The reader thread sets AH_READER_GAME_GONE once gworld=0 sustains
+        // for ~15s — much more reliable than HWND polling.
+        if (ah_reader_state() == AH_READER_GAME_GONE) {
+            LOG("overlay::run: reader reports GAME_GONE (gworld=0 held) — self-exit");
+            running_ = false;
+            break;
+        }
+
+        // v0.9.455 reader-freeze watchdog. If reader Hz was > 0 (thread was
+        // ticking) then drops to 0 for 5 s straight — the reader-thread is
+        // wedged on a blocking RPM read (kdu IOCTL hang, procCR3 stale). Auto-
+        // reattach: signals stop, waits for the thread, respawns. Prevents the
+        // "overlay shows frozen snapshot forever" symptom on flaky kdu paths.
+        {
+            using namespace std::chrono;
+            static auto s_last_hz_check   = steady_clock::now();
+            static auto s_first_zero_at   = steady_clock::time_point{};
+            static bool s_ever_ticking    = false;
+            auto now_tp = steady_clock::now();
+            if (duration_cast<milliseconds>(now_tp - s_last_hz_check).count() >= 1000) {
+                s_last_hz_check = now_tp;
+                float hz = ah_reader_hz();
+                if (hz > 0.5f) {
+                    s_ever_ticking  = true;
+                    s_first_zero_at = steady_clock::time_point{};
+                } else if (s_ever_ticking) {
+                    if (s_first_zero_at.time_since_epoch().count() == 0) {
+                        s_first_zero_at = now_tp;
+                    } else if (duration_cast<seconds>(now_tp - s_first_zero_at).count() >= 5) {
+                        LOG("overlay::run: reader Hz=0 for 5s (frozen) — triggering ah_reader_reattach");
+                        ah_reader_reattach();
+                        s_first_zero_at = steady_clock::time_point{};
+                        s_ever_ticking  = false;
+                    }
+                }
             }
         }
 
