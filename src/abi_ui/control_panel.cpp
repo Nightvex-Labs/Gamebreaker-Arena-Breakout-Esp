@@ -90,7 +90,7 @@ struct State {
 
 constexpr EspKey P_KEYS[] = {K_enable, K_box, K_corners, K_name, K_team, K_weapon,
                              K_ammo, K_health, K_armor, K_distance, K_corpses, K_teammates};
-constexpr EspKey B_KEYS[] = {K_enable, K_box, K_corners, K_weapon, K_ammo, K_distance, K_corpses};
+constexpr EspKey B_KEYS[] = {K_enable, K_box, K_corners, K_name, K_weapon, K_ammo, K_distance, K_corpses};
 constexpr int P_N = sizeof(P_KEYS) / sizeof(P_KEYS[0]);
 constexpr int B_N = sizeof(B_KEYS) / sizeof(B_KEYS[0]);
 constexpr int PAL_N = sizeof(G::ESP_PAL) / sizeof(G::ESP_PAL[0]);
@@ -903,6 +903,7 @@ void pull(const RenderConfig& c) {
     Bt[K_box].on = c.show_box_bot && c.box_mode_bot > 0; Bt[K_box].style = c.box_mode_bot == 3 ? 1 : 0;
     Bt[K_box].dist = (int)c.bot_range_m;                 Bt[K_box].c = c.col_box_bot;
     Bt[K_corners].on = c.box_corners_bot;
+    Bt[K_name].on = c.show_bot_name;       Bt[K_name].c = c.col_name_bot;
     Bt[K_weapon].on = c.show_bot_weapon;   Bt[K_weapon].c = c.col_weapon_bot;
     Bt[K_ammo].on = c.show_bot_ammo;       Bt[K_ammo].c = c.col_ammo_bot;
     Bt[K_distance].on = c.show_bot_distance; Bt[K_distance].c = c.col_distance_bot;
@@ -940,6 +941,7 @@ void push(RenderConfig& c) {
     c.show_box_bot = b(K_box); c.box_mode_bot = Bt[K_box].style == 1 ? 3 : 2;
     c.bot_range_m = (float)Bt[K_box].dist; c.col_box_bot = Bt[K_box].c;
     c.box_corners_bot = b(K_corners);
+    c.show_bot_name = b(K_name);       c.col_name_bot = Bt[K_name].c;
     c.show_bot_weapon = b(K_weapon);   c.col_weapon_bot = Bt[K_weapon].c;
     c.show_bot_ammo = b(K_ammo);       c.col_ammo_bot = Bt[K_ammo].c;
     c.show_bot_distance = b(K_distance); c.col_distance_bot = Bt[K_distance].c;

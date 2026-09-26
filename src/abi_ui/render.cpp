@@ -612,7 +612,10 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
         // silhouette. Two stacked segments (top = helm, bottom = vest) with
         // a color per tier so the top labels can stay lean.
         // v0.9.337 semantic: 0=Off, 1=Text, 2=Bar. Off = neither text nor bar.
-        bool armor_bar_on  = cfg.show_armor_master
+        // Armor bar/text — PMC only. Bots не имеют настройки брони в панели,
+        // и рендерить её у них не нужно (нет данных, нет UI, только шум).
+        bool armor_bar_on  = is_pmc
+                          && cfg.show_armor_master
                           && (cfg.armor_display == 2);
         // Distance clamp: drop only if the box is unreadably tiny (~1 px);
         // the old 18 px gate hid armor bar on distant enemies which the user
@@ -929,8 +932,9 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
                 helm_show = e.armor[0];
                 if (e.armor.size() > 1) vest_show = e.armor[1];
             }
-            bool show_arm_class = cfg.show_armor_master
-                                && (is_pmc ? cfg.show_armor : cfg.show_bot_armor);
+            bool show_arm_class = is_pmc
+                                && cfg.show_armor_master
+                                && cfg.show_armor;
             // v0.9.337 semantic: 0=Off, 1=Text, 2=Bar.
             bool armor_text_on  = (cfg.armor_display == 1);
             if (show_arm_class && armor_text_on) {
@@ -978,11 +982,19 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
             (void)armor_color;
             ImU32 c_arm = is_pmc ? cfg.col_armor_pmc : cfg.col_armor_bot;
 
-            // Font scale вЂ” в‰¤100m holds at 100m size, >100m gradually shrinks.
+            // Smart distance-based scaling — close = 1.0 (baseline), then
+            // logarithmic fall-off for distant targets:
+            //   <= 40  m — 1.00x (reference)
+            //   60  m — 0.92x
+            //   80  m — 0.86x
+            //   120 m — 0.78x
+            //   200 m — 0.68x
+            //   300+ m — 0.60x (floor)
             float font_base = ImGui::GetFontSize();      // typically 13-14
-            float lscale = (dist_m > 0.5f) ? (100.0f / dist_m) : 1.0f;
-            if (lscale > 1.0f)  lscale = 1.0f;   // cap close enemies at 100m size
-            if (lscale < 0.85f) lscale = 0.85f;  // floor for far enemies
+            float d = std::max(dist_m, 40.0f);
+            float lscale = 1.0f - 0.20f * std::log(d / 40.0f);
+            if (lscale > 1.0f)  lscale = 1.0f;
+            if (lscale < 0.60f) lscale = 0.60f;
             float font_sz = font_base * lscale;
             float line_h  = font_sz * 1.05f;
 
