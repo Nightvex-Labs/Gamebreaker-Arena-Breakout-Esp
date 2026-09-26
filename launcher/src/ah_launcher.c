@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -25,6 +26,7 @@
 #include "../deps/vmprotect/inc/VMProtectSDK.h"
 
 #pragma comment(lib, "Bcrypt.lib")
+#pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "VMProtectSDK64.lib")
 
@@ -165,6 +167,7 @@ static int     g_context_key_valid = 0;
 // that branch. If we ever do, add CryptUnprotectData here.
 static void extract_key_from_launch_context(int argc, wchar_t** argv)
 {
+    VMProtectBeginUltra("extract_key_from_launch_context");
     for (int i = 1; i + 1 < argc; i++) {
         if (_wcsicmp(argv[i], L"--koenflow-launch-context") != 0 &&
             _wcsicmp(argv[i], L"--keonflow-launch-context") != 0) continue;
@@ -172,60 +175,101 @@ static void extract_key_from_launch_context(int argc, wchar_t** argv)
 
         HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h == INVALID_HANDLE_VALUE) return;
+        if (h == INVALID_HANDLE_VALUE) { VMProtectEnd(); return; }
         LARGE_INTEGER sz;
         if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 0x10000) {
-            CloseHandle(h); return;
+            CloseHandle(h); VMProtectEnd(); return;
         }
         char* buf = (char*)VirtualAlloc(NULL, (SIZE_T)sz.QuadPart + 1,
                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!buf) { CloseHandle(h); return; }
+        if (!buf) { CloseHandle(h); VMProtectEnd(); return; }
         DWORD got = 0;
         BOOL rd = ReadFile(h, buf, (DWORD)sz.QuadPart, &got, NULL);
         CloseHandle(h);
-        if (!rd || got == 0) { VirtualFree(buf, 0, MEM_RELEASE); return; }
+        if (!rd || got == 0) { VirtualFree(buf, 0, MEM_RELEASE); VMProtectEnd(); return; }
         buf[got] = 0;
 
-        // KFPC = DPAPI-wrapped variant (loaderKey products). Not supported
-        // here; arenahack always takes the plain-JSON path.
+        // KFPC = DPAPI-wrapped variant (loaderKey products, v0.9.329+).
+        // Format: 4-byte magic "KFPC" followed by CryptProtectData blob
+        // (DataProtectionScope=CurrentUser, no entropy).
+        //
+        // Anti-theft: DPAPI ties the blob to the LOCAL user profile SID; a
+        // context.json copied to another PC (or another Windows user account)
+        // fails CryptUnprotectData → we silently exit and never touch the key.
+        // Combined with --zero-key baked (all-zero KFPL_KEY[32]), the ONLY
+        // path to a working stub is: valid license → launcher writes context
+        // → same-user elevation → DPAPI unwrap OK → real key extracted.
+        char* json_ptr = buf;
+        DWORD json_len = got;
+        uint8_t* dpapi_pt = NULL;
         if (got >= 4 && memcmp(buf, "KFPC", 4) == 0) {
-            ah_log("context: KFPC-wrapped context — DPAPI unwrap not supported (loaderKey product?)");
-            VirtualFree(buf, 0, MEM_RELEASE); return;
+            DATA_BLOB in_blob  = { got - 4, (BYTE*)(buf + 4) };
+            DATA_BLOB out_blob = { 0, NULL };
+            if (!CryptUnprotectData(&in_blob, NULL, NULL, NULL, NULL, 0, &out_blob) ||
+                out_blob.pbData == NULL || out_blob.cbData == 0) {
+                ah_log("context: DPAPI unwrap FAILED gle=%lu (foreign profile? tampered?)",
+                       GetLastError());
+                SecureZeroMemory(buf, got);
+                VirtualFree(buf, 0, MEM_RELEASE);
+                VMProtectEnd();
+                return;
+            }
+            // LocalFree'd at end. Point JSON parser at the plaintext.
+            dpapi_pt = out_blob.pbData;
+            json_ptr = (char*)out_blob.pbData;
+            json_len = out_blob.cbData;
+            ah_log("context: DPAPI unwrap OK (%u ct → %u pt bytes)",
+                   (unsigned)in_blob.cbData, (unsigned)out_blob.cbData);
         }
 
-        // Locate "kfplKey" : "<value>"  — minimal string walk, no full JSON parse.
-        const char* needle = "\"kfplKey\"";
-        char* p = strstr(buf, needle);
-        if (!p) { ah_log("context: kfplKey field not present"); VirtualFree(buf, 0, MEM_RELEASE); return; }
-        p += 9;   // past "kfplKey"
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p != ':') { VirtualFree(buf, 0, MEM_RELEASE); return; }
-        p++;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == 'n' && memcmp(p, "null", 4) == 0) {
-            ah_log("context: kfplKey=null (backend returned no per-release key)");
-            VirtualFree(buf, 0, MEM_RELEASE); return;
+        // Locate "kfplKey" — bounds-checked scan (unwrapped DPAPI plaintext
+        // isn't NUL-terminated, so strstr/*p walks would run off the end).
+        const char needle[] = "\"kfplKey\"";
+        const DWORD nlen = sizeof(needle) - 1;
+        char* p = NULL;
+        for (DWORD j = 0; j + nlen <= json_len; j++) {
+            if (memcmp(json_ptr + j, needle, nlen) == 0) { p = json_ptr + j; break; }
         }
-        if (*p != '"') { VirtualFree(buf, 0, MEM_RELEASE); return; }
+        char* end = json_ptr + json_len;
+        #define REMAIN() ((DWORD)(end - p))
+        if (!p) { ah_log("context: kfplKey field not present"); goto ctx_cleanup; }
+        p += nlen;
+        while (REMAIN() > 0 && (*p == ' ' || *p == '\t')) p++;
+        if (REMAIN() == 0 || *p != ':') goto ctx_cleanup;
+        p++;
+        while (REMAIN() > 0 && (*p == ' ' || *p == '\t')) p++;
+        if (REMAIN() >= 4 && memcmp(p, "null", 4) == 0) {
+            ah_log("context: kfplKey=null (backend returned no per-release key)");
+            goto ctx_cleanup;
+        }
+        if (REMAIN() == 0 || *p != '"') goto ctx_cleanup;
         p++;
 
         char b64buf[80];
         int b64_len = 0;
-        while (*p && *p != '"' && b64_len < (int)sizeof(b64buf) - 1) b64buf[b64_len++] = *p++;
+        while (REMAIN() > 0 && *p != '"' && b64_len < (int)sizeof(b64buf) - 1) {
+            b64buf[b64_len++] = *p++;
+        }
         b64buf[b64_len] = 0;
+        #undef REMAIN
 
-        uint8_t out[32];
-        if (b64_decode(b64buf, out, 32) == 32) {
-            memcpy(g_context_key, out, 32);
+        uint8_t keyout[32];
+        if (b64_decode(b64buf, keyout, 32) == 32) {
+            memcpy(g_context_key, keyout, 32);
             g_context_key_valid = 1;
-            ah_log("context: kfplKey extracted from JSON (b64 %d chars)", b64_len);
+            ah_log("context: kfplKey extracted (b64 %d chars, DPAPI=%d)", b64_len, dpapi_pt ? 1 : 0);
         } else {
             ah_log("context: kfplKey b64 decode failed (%d chars)", b64_len);
         }
+
+    ctx_cleanup:
+        if (dpapi_pt) { SecureZeroMemory(dpapi_pt, json_len); LocalFree(dpapi_pt); }
         SecureZeroMemory(buf, got);
         VirtualFree(buf, 0, MEM_RELEASE);
+        VMProtectEnd();
         return;
     }
+    VMProtectEnd();
 }
 
 // Env-var conventions: try multiple names so admin backend can inject key
@@ -558,8 +602,73 @@ static void spawn_janitor(const wchar_t* cage, const wchar_t* launcher_cache)
     }
 }
 
+// v0.9.461 anti-theft guard: silent-exit fingerprint for anyone poking the
+// stub with a debugger / VM / attached process. Fires BEFORE decrypt so a
+// reversed key never leaves resolve_key. No logging (helping analysts
+// exit-triage is exactly what we don't want).
+static void antitheft_guard(void)
+{
+    VMProtectBeginUltra("antitheft_guard");
+
+    // 1. Direct debugger present flag (kernel-writable → PEB.BeingDebugged).
+    if (IsDebuggerPresent()) TerminateProcess(GetCurrentProcess(), 0);
+
+    // 2. Kernel-side remote debugger.
+    BOOL rdp = FALSE;
+    if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &rdp) && rdp) {
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+
+    // 3. PEB.NtGlobalFlag heap flags — heap debug bits set only when
+    //    process was started under a debugger or +hpa applied.
+    #ifdef _WIN64
+    DWORD peb_ngf = *(DWORD*)(__readgsqword(0x60) + 0xBC);
+    #else
+    DWORD peb_ngf = *(DWORD*)(__readfsdword(0x30) + 0x68);
+    #endif
+    if (peb_ngf & 0x70) TerminateProcess(GetCurrentProcess(), 0);  // FLG_HEAP_*
+
+    // 4. Hardware breakpoint registers Dr0-Dr3 (x64 debugger sets them for
+    //    HWBP). Non-null on any of them ⇒ debugger active.
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(GetCurrentThread(), &ctx)) {
+        if (ctx.Dr0 | ctx.Dr1 | ctx.Dr2 | ctx.Dr3) {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+
+    // 5. NtQueryInformationProcess(ProcessDebugPort) — kernel-visible
+    //    debug port handle. Anti-attach in one syscall.
+    typedef NTSTATUS (WINAPI *NtQIP_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) {
+        NtQIP_t NtQIP = (NtQIP_t)GetProcAddress(ntdll, "NtQueryInformationProcess");
+        if (NtQIP) {
+            HANDLE dbg_port = (HANDLE)-1;
+            ULONG rlen = 0;
+            if (NtQIP(GetCurrentProcess(), 7 /*ProcessDebugPort*/,
+                      &dbg_port, sizeof(dbg_port), &rlen) == 0 &&
+                dbg_port != NULL) {
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
+            // ProcessDebugObjectHandle (30) — even stealthier attach detect.
+            HANDLE dbg_obj = NULL;
+            if (NtQIP(GetCurrentProcess(), 30, &dbg_obj, sizeof(dbg_obj), &rlen) == 0 &&
+                dbg_obj != NULL) {
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
+        }
+    }
+
+    VMProtectEnd();
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+    // v0.9.461: anti-theft first. Fires before ANY key-touch. Silent kill.
+    antitheft_guard();
+
     ah_log("--- launcher start argc=%d", argc);
 
     // Extract per-release KFPL key from the C#-written launch context BEFORE
@@ -681,6 +790,27 @@ int wmain(int argc, wchar_t** argv)
     PathRemoveFileSpecW(self_dir);
     ah_log("cwd for child=%ls", self_dir);
 
+    // v1.0.21: sidecar DLL staging. Overlay may link dynamic-import DLLs
+    // (Gamebreaker uses freetype.dll for HiDPI font rasterization). CWD is
+    // set to self_dir below, but the loader's DLL search order for a
+    // CreateProcess'd child starts at the CHILD binary's directory
+    // (= %TEMP%\<hex>\), not CWD. Stage those DLLs next to the child.
+    // Deleted after WaitForSingleObject returns.
+    static const wchar_t* kSidecarDlls[] = { L"freetype.dll", NULL };
+    wchar_t sidecar_paths[8][MAX_PATH]; int sidecar_n = 0;
+    for (int i = 0; kSidecarDlls[i] && sidecar_n < 8; i++) {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        swprintf(src, MAX_PATH, L"%s\\%s", self_dir, kSidecarDlls[i]);
+        if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) continue;
+        swprintf(dst, MAX_PATH, L"%s%s", tmp_dir, kSidecarDlls[i]);
+        if (CopyFileW(src, dst, FALSE)) {
+            wcscpy_s(sidecar_paths[sidecar_n++], MAX_PATH, dst);
+            ah_log("staged sidecar %ls -> %ls", kSidecarDlls[i], dst);
+        } else {
+            ah_log("sidecar copy fail %ls gle=%lu", kSidecarDlls[i], GetLastError());
+        }
+    }
+
     wchar_t cmdline[8192];
     swprintf(cmdline, 8192, L"\"%s\"", tmp_path);
     for (int i = 1; i < argc; i++) {
@@ -715,12 +845,18 @@ int wmain(int argc, wchar_t** argv)
     // v1.0.14-debug: auto-upload log tails to koenflow.com telemetry so we can
     // see what killed the overlay without asking clients to hand over files.
     // Silent, best-effort, 5s timeouts — never blocks launcher exit.
+    // Gated on AH_LAUNCHER_TELEMETRY so gamebreaker (which doesn't compile
+    // crash_upload.c) links cleanly.
+#ifdef AH_LAUNCHER_TELEMETRY
     extern void crash_upload_after_child(DWORD child_pid, DWORD exit_code,
                                          const char* version);
     crash_upload_after_child(pi.dwProcessId, exit_code, "1.0.14-debug");
+#endif
 
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     DeleteFileW(tmp_path);
+    // v1.0.21: reap staged sidecar DLLs.
+    for (int i = 0; i < sidecar_n; i++) DeleteFileW(sidecar_paths[i]);
 
     // Janitor — wipes cage dir + KoenFlow launcher-cache dir once all
     // WinRuntimeHost.exe processes exit. Only when we're actually in the

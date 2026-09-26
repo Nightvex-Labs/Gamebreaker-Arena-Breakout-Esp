@@ -88,6 +88,16 @@ struct AhPmcCorpse {
 };
 static std::unordered_map<uint64_t, AhPmcCorpse> g_pmc_corpses;
 
+// v0.9.457: LIVE-human snapshot cache. The PlayerArray walk has 3
+// `continue` paths (PS read fail, Pawn=0, pbuf read fail) that silently
+// dropped a human for that tick. Server relevance flicker (Pawn=0 during
+// respawn/streaming) + transient RPM slot misses caused "1-2 players not
+// loading" reports. We now cache the full AH_ENT per pawn after every
+// successful emit and re-emit stale snapshots for up to HUMAN_TTL_MS
+// (or HUMAN_MISS_LIMIT consecutive misses, whichever is shorter).
+struct AhHumanSnap { AH_ENT ent; DWORD stamp_ms; uint8_t miss; };
+static std::unordered_map<uint64_t, AhHumanSnap> g_human_snap;
+
 // Locate the 7-limb HealthAttributeSet on a pawn. Walks
 // pawn.ASC.SpawnedAttrs; matches via signature: 7 "max" floats
 // at +0x4C..+0x7C (step 8), each 15..200, summing to 60..1200.
@@ -398,19 +408,34 @@ static void reader_body(void) {
     // When the slice completes the full array, cached_loot atomically swaps
     // and generation bumps. This avoids the burst that starved the player
     // walk and made enemies feel like 5fps.
-    const int LOOT_CHUNK = 64;   // actors per tick — tune for driver load
+    // v0.9.458: FULL revert of v0.9.456 chunk bump. 256 was too big (reader
+    // choked, "loot broken" reports), 128 also caused draw regressions —
+    // back to the proven 64. Full-cycle time is ~1.5 s on 3000-actor maps
+    // but reader stays at ~50 Hz and per-tick load matches the pre-v0.9.456
+    // behavior that shipped fine for weeks.
+    const int LOOT_CHUNK = 64;
     int          cached_loot_n = 0;
     unsigned int cached_loot_gen = 0;
     AH_LOOT      cached_loot[AH_MAX_LOOT];
     memset(cached_loot, 0, sizeof(cached_loot));
 
-    // Scan state carried across ticks.
+    // v0.9.458: reverted 8192 → 4096. Doubling buf made loot cycle time
+    // 2× longer at chunk=64 (~3 s full cycle), and combined with the bigger
+    // chunk regression caused visible loot outages. 4096 was the proven
+    // ceiling; if a real raid pushes past it we'll bump surgically then.
     static u64 scan_actor_buf[4096];
     int  scan_total_actors = 0;   // valid entries in scan_actor_buf
     int  scan_cursor = 0;         // next index to process
     int  scan_out_n = 0;          // accumulator for this pass
     AH_LOOT scan_out[AH_MAX_LOOT];
     memset(scan_out, 0, sizeof(scan_out));
+    // v0.9.459: snapshot self.x/self.y at cycle START and use them for the
+    // whole cycle. Chunk=64 makes a full cycle ~1 s; without this, a moving
+    // player sees earlier chunks' loot drop out of the radius gate as new
+    // chunks fire against a shifted self position, so cached_loot lands
+    // near-empty. Freezing the reference point fixes the "loot appears
+    // then vanishes while running" pattern.
+    float scan_self_x = 0.0f, scan_self_y = 0.0f;
 
     // v1.0.14: dynamic GWorld RVA resolution via sig scan of UAGame .text.
     // AH_RVA_GWORLD constant is the FIRST guess; if it points to a null
@@ -674,8 +699,9 @@ static void reader_body(void) {
                         g_known_bots.clear();
                         g_bot_cap.clear();
                         g_limb_aset_cache.clear();
+                        g_human_snap.clear();   // v0.9.457: human live-cache
                         s_cleared = true;
-                        ah_diag("RAID-END (roomid=0): cleared PMC+bot corpse caches + bot pool");
+                        ah_diag("RAID-END (roomid=0): cleared PMC+bot corpse caches + bot pool + human snap");
                     }
                 }
             }
@@ -1224,11 +1250,58 @@ static void reader_body(void) {
                         e->weapon_id = pc.weapon_id;
                         e->mag_cur   = pc.mag_cur;
                         e->mag_max   = pc.mag_max;
+
+                        // v0.9.457: freeze full snapshot for miss-tolerance
+                        // re-emit next tick if PlayerArray flickers. Skip self
+                        // (we always find self via GameInstance chain, no cache
+                        // needed) and dead (that path goes through g_pmc_corpses).
+                        if (!e->is_me && !e->dead && e->valid) {
+                            AhHumanSnap& hs = g_human_snap[e_pawn];
+                            hs.ent      = *e;
+                            hs.stamp_ms = GetTickCount();
+                            hs.miss     = 0;
+                        }
+
                         s.ent_n++;
                         if (s.ent_n >= AH_MAX_ENT) break;
                     }
                 }
             }
+        }
+
+        // ── LIVE-human snapshot re-emit (v0.9.457) ─────────────────────────
+        // For every pawn in g_human_snap not represented in this tick's
+        // snapshot AND within TTL AND under miss threshold: emit cached ent.
+        // Bridges the 1-2 tick relevance-flicker windows that used to blank
+        // 1-2 humans per tick on busy raids.
+        if (s.ent_n < AH_MAX_ENT && !g_human_snap.empty()) {
+            const DWORD   HUMAN_TTL_MS      = 3000;
+            const uint8_t HUMAN_MISS_LIMIT  = 20;   // ~0.7 s at 30 Hz reader
+            const DWORD   hs_now_ms         = GetTickCount();
+
+            std::unordered_set<u64> hs_seen;
+            hs_seen.reserve(s.ent_n);
+            for (int i = 0; i < s.ent_n; i++) hs_seen.insert(s.ents[i].pawn);
+
+            std::vector<u64> hs_evict;
+            for (auto& kv : g_human_snap) {
+                if (s.ent_n >= AH_MAX_ENT) break;
+                u64 pp = kv.first;
+                AhHumanSnap& hs = kv.second;
+                if (hs_seen.count(pp)) { hs.miss = 0; continue; }
+                // Corpses are handled by g_pmc_corpses — don't shadow.
+                if (g_pmc_corpses.count(pp)) continue;
+                hs.miss++;
+                if (hs.miss >= HUMAN_MISS_LIMIT ||
+                    (hs_now_ms - hs.stamp_ms) > HUMAN_TTL_MS) {
+                    hs_evict.push_back(pp);
+                    continue;
+                }
+                AH_ENT* pe = &s.ents[s.ent_n];
+                *pe = hs.ent;
+                s.ent_n++;
+            }
+            for (u64 pp : hs_evict) g_human_snap.erase(pp);
         }
 
         // ── PMC corpse persistence (v0.9.454) ──────────────────────────────
@@ -1282,6 +1355,27 @@ static void reader_body(void) {
             std::unordered_set<u64> present;
             for (int i = 0; i < s.ent_n; i++) present.insert(s.ents[i].pawn);
 
+            // v0.9.456: DeltaHack-style miss-tolerance. Prior code evicted a
+            // bot from g_known_bots on the FIRST transient RPM fail (bad
+            // slot, brief pawn-respawn, sublevel unload). Rediscovery then
+            // waited for the next full Level.Actors chunk cycle (~0.5–1.5 s),
+            // causing visible flicker of "some bots not loading". Now we:
+            //   • cache last-known (x,y,z,yaw) per bot pawn on every success
+            //   • on read fail, increment miss counter; if counter < LIMIT
+            //     AND cached pos is younger than TTL → emit cached, no evict
+            //   • evict only after LIMIT consecutive misses (≈1 s @30 Hz)
+            static std::unordered_map<u64, uint8_t> g_bot_miss;
+            struct BotPosSnap { float x, y, z, yaw; DWORD stamp_ms; };
+            static std::unordered_map<u64, BotPosSnap> g_bot_pos_cache;
+            // v0.9.458: tolerance dialed back. 30 misses + 5s TTL kept the
+            // bot set full of stragglers, ballooning per-tick RPM budget
+            // for the bot walker. 8 misses (~160 ms @50 Hz reader) + 2 s
+            // TTL still bridges brief transient RPM slot conflicts but
+            // evicts dead pawns fast enough to keep g_known_bots lean.
+            const uint8_t BOT_MISS_LIMIT = 8;
+            const DWORD   BOT_POS_TTL_MS = 2000;
+            const DWORD   bot_now_ms = GetTickCount();
+
             std::vector<u64> to_evict;
             for (u64 bp : g_known_bots) {
                 if (s.ent_n >= AH_MAX_ENT) break;
@@ -1310,19 +1404,40 @@ static void reader_body(void) {
                     continue;
                 }
 
+                // v0.9.456: read live pos; on any transient fail fall back to
+                // cached last-known pos (still counts as miss, evicts after
+                // BOT_MISS_LIMIT consecutive fails).
                 u64 broot = 0;
                 RpmRead64(drv.hDevice, procCR3, bp + AH_PAWN_ROOT, &broot);
-                if (!broot) { to_evict.push_back(bp); continue; }
-
-                // Plaintext direct-read — bot Root ACE algo = 0 always, skip
-                // ctl+bucket walk. Saves 1 RPM/bot/tick.
                 float bxyz[3] = {0};
-                if (!RpmReadVirtual(drv.hDevice, procCR3,
-                                    broot + AH_ROOT_LOC, bxyz, 12) ||
-                    !ah_is_raid_loc(bxyz[0], bxyz[1], bxyz[2])) {
-                    to_evict.push_back(bp); continue;
+                bool  live_pos_ok = false;
+                if (broot &&
+                    RpmReadVirtual(drv.hDevice, procCR3,
+                                   broot + AH_ROOT_LOC, bxyz, 12) &&
+                    ah_is_raid_loc(bxyz[0], bxyz[1], bxyz[2])) {
+                    live_pos_ok = true;
                 }
-                float bx = bxyz[0], by = bxyz[1], bz = bxyz[2];
+                float bx, by, bz, byaw = 0.0f;
+                if (live_pos_ok) {
+                    bx = bxyz[0]; by = bxyz[1]; bz = bxyz[2];
+                    RpmReadVirtual(drv.hDevice, procCR3,
+                                   broot + AH_ROOT_ACTOR_YAW, &byaw, 4);
+                    g_bot_miss[bp] = 0;
+                    g_bot_pos_cache[bp] = { bx, by, bz, byaw, bot_now_ms };
+                } else {
+                    // Cache fallback path — keeps bot visible through
+                    // transient RPM misses instead of flicker-vanishing.
+                    uint8_t m = ++g_bot_miss[bp];
+                    auto cit = g_bot_pos_cache.find(bp);
+                    bool cache_fresh = (cit != g_bot_pos_cache.end()) &&
+                                       (bot_now_ms - cit->second.stamp_ms) < BOT_POS_TTL_MS;
+                    if (m >= BOT_MISS_LIMIT || !cache_fresh) {
+                        to_evict.push_back(bp);
+                        continue;
+                    }
+                    bx = cit->second.x; by = cit->second.y;
+                    bz = cit->second.z; byaw = cit->second.yaw;
+                }
 
                 AH_ENT* be = &s.ents[s.ent_n];
                 be->pawn   = bp;
@@ -1333,8 +1448,7 @@ static void reader_body(void) {
                 be->hp     = 0;
                 be->dead   = 0;
                 be->name[0] = 0;
-
-                RpmReadVirtual(drv.hDevice, procCR3, broot + AH_ROOT_ACTOR_YAW, &be->yaw, 4);
+                be->yaw    = byaw;
 
                 // Weapon + ammo (reuse human weapon_tick throttle).
                 // FAKE-BOT FILTER: real bots hold a weapon; fakes/decoys have
@@ -1415,6 +1529,8 @@ static void reader_body(void) {
             }
             for (u64 bp : to_evict) {
                 g_known_bots.erase(bp);
+                g_bot_miss.erase(bp);
+                g_bot_pos_cache.erase(bp);
                 // Keep g_bot_cap so a still-cached corpse renders with correct size.
                 // Only wipe cap when corpse is also gone.
                 if (!g_bot_corpses.count(bp)) g_bot_cap.erase(bp);
@@ -1450,7 +1566,13 @@ static void reader_body(void) {
 
         // ── Loot scan — INTERLEAVED chunks of LOOT_CHUNK actors per tick.
         // When cursor == total, we re-collect actor pointers and start over.
-        if (procCR3 && imageBase) {
+        //
+        // v0.9.460: throttle to every 2nd tick. Chunk work (vt reads, iid
+        // rejects, per-hit decrypt) is the second-biggest RPM consumer after
+        // PlayerArray. Skipping every other tick halves that with no visible
+        // impact — full cycle grows from ~1 s to ~2 s, which is still well
+        // inside the human noticeability floor for static ground loot.
+        if (procCR3 && imageBase && (s_tick_ctr & 1) == 0) {
             // (Re)collect actor pointers when the scan wraps.
             if (scan_cursor >= scan_total_actors) {
                 scan_total_actors = 0;
@@ -1458,7 +1580,7 @@ static void reader_body(void) {
                 u64 gworld_l = 0;
                 RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld_l);
                 auto grab_level = [&](u64 level) {
-                    if (!level || scan_total_actors >= 4096) return;
+                    if (!level || scan_total_actors >= 4096) return;   // v0.9.458: reverted to 4096
                     u64 la_ptr = 0; u32 la_n = 0;
                     RpmRead64(drv.hDevice, procCR3, level + AH_ULEVEL_ACTORS, &la_ptr);
                     RpmReadVirtual(drv.hDevice, procCR3, level + AH_ULEVEL_ACTORS + 8, &la_n, 4);
@@ -1492,15 +1614,21 @@ static void reader_body(void) {
                     }
                 }
                 scan_cursor = 0;
+                // v0.9.459: freeze self position for the whole cycle.
+                scan_self_x = s.x;
+                scan_self_y = s.y;
             }
 
             // Process this tick's slice.
             {
                 int end = scan_cursor + LOOT_CHUNK;
                 if (end > scan_total_actors) end = scan_total_actors;
+                // v0.9.459: 60m radius kept — server-side replication only
+                // reaches ~60m for valuable loot, so a bigger client radius
+                // adds nothing but rejected chunk work.
                 const float RADIUS_CM  = 6000.0f;
                 const float RADIUS_CM2 = RADIUS_CM * RADIUS_CM;
-                float self_x = s.x, self_y = s.y;
+                float self_x = scan_self_x, self_y = scan_self_y;
 
                 // Bot discovery inline with the loot chunk — cheap: 1-2 RPMs
                 // per candidate actor (vtable + shape). Persists into g_known_bots.
@@ -1545,6 +1673,16 @@ static void reader_body(void) {
                 }
 
                 {
+                    // v0.9.460: pos cache for loot actors, TTL 500 ms. Loot
+                    // is stationary in ABI raids (dropped bags don't move),
+                    // so re-decrypting a known actor every full pass is pure
+                    // waste. On a 60-item scene with ~5 hits per chunk this
+                    // trims 25 RPM/tick average from the loot walker without
+                    // any change to visible freshness.
+                    static std::unordered_map<u64, std::tuple<float,float,float,DWORD>> g_loot_pos_cache;
+                    const DWORD LOOT_POS_TTL_MS = 500;
+                    const DWORD loot_now_ms = GetTickCount();
+
                     for (int i = scan_cursor; i < end && scan_out_n < AH_MAX_LOOT; i++) {
                         u64 a = scan_actor_buf[i];
                         if (!a) continue;
@@ -1568,18 +1706,30 @@ static void reader_body(void) {
                         if (price == 0u || price >= 100000000u) continue;
                         i32 rar = -1;
                         RpmReadVirtual(drv.hDevice, procCR3, cd + AH_CD_RARITY, &rar, 4);
-                        u64 root = 0;
-                        RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_ROOT, &root);
-                        if (!root) continue;
+
+                        // v0.9.460: pos cache hit — skip the decrypt entirely.
                         float lx = 0, ly = 0, lz = 0;
-                        BOOL pos_ok = AhAceDecrypt(drv.hDevice, procCR3, imageBase, root,
-                                                   &lx, &ly, &lz);
-                        if (!pos_ok || !ah_is_raid_loc(lx, ly, lz)) {
-                            float raw[3] = {0};
-                            if (RpmReadVirtual(drv.hDevice, procCR3, root + 0x150, raw, 12)
-                                && ah_is_raid_loc(raw[0], raw[1], raw[2])) {
-                                lx = raw[0]; ly = raw[1]; lz = raw[2];
-                            } else continue;
+                        auto lit = g_loot_pos_cache.find(a);
+                        bool cache_hit = (lit != g_loot_pos_cache.end()) &&
+                                         (loot_now_ms - std::get<3>(lit->second)) < LOOT_POS_TTL_MS;
+                        if (cache_hit) {
+                            lx = std::get<0>(lit->second);
+                            ly = std::get<1>(lit->second);
+                            lz = std::get<2>(lit->second);
+                        } else {
+                            u64 root = 0;
+                            RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_ROOT, &root);
+                            if (!root) continue;
+                            BOOL pos_ok = AhAceDecrypt(drv.hDevice, procCR3, imageBase, root,
+                                                       &lx, &ly, &lz);
+                            if (!pos_ok || !ah_is_raid_loc(lx, ly, lz)) {
+                                float raw[3] = {0};
+                                if (RpmReadVirtual(drv.hDevice, procCR3, root + 0x150, raw, 12)
+                                    && ah_is_raid_loc(raw[0], raw[1], raw[2])) {
+                                    lx = raw[0]; ly = raw[1]; lz = raw[2];
+                                } else continue;
+                            }
+                            g_loot_pos_cache[a] = { lx, ly, lz, loot_now_ms };
                         }
                         // Radius gate — drop anything beyond 60m from self.
                         float dxr = lx - self_x, dyr = ly - self_y;
