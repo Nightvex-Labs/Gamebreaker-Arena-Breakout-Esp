@@ -223,6 +223,22 @@ def main() -> int:
     if not sidecars:
         print(f"[pack] no sidecar DLLs (static-link build)")
 
+    # v1.0.22: TTF font assets must ship in the release so overlay::init can
+    # load Unbounded/JBM. Launcher sets CWD to self_dir (= product folder)
+    # for the spawned child, and overlay.cpp's pick_font() reads
+    # `assets\fonts\Unbounded-*.ttf` and `assets\fonts\JetBrainsMono-*.ttf`
+    # relative to CWD. Without these, pick_font falls through to Segoe UI
+    # — the "default font" symptom users report.
+    fonts_src = ROOT / "assets" / "fonts"
+    n_fonts = 0
+    if fonts_src.exists():
+        fonts_dst = stage / "assets" / "fonts"
+        fonts_dst.mkdir(parents=True, exist_ok=True)
+        for ttf in sorted(fonts_src.glob("*.ttf")):
+            shutil.copyfile(ttf, fonts_dst / ttf.name)
+            n_fonts += 1
+    print(f"[pack] included {n_fonts} TTF font(s) under assets/fonts/")
+
     payload = OVERLAY_EXE.read_bytes()
     print(f"[pack] overlay:  {len(payload):>10,} B  sha256 {hashlib.sha256(payload).hexdigest()[:16]}...")
     print(f"[pack] launcher: {LAUNCHER_EXE.stat().st_size:>10,} B  WinRuntimeHost.exe (VMPed)")
