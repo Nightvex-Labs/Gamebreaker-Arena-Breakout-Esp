@@ -49,7 +49,9 @@ void status_bar(const RenderConfig& cfg, const char* user, int ping_ms, float fp
         f_brand = font("gb:ub700:14"); f_label = font("gb:ub500:14");
         f_cap   = font("gb:ub700:9");  f_mono  = font("gb:jb500:12");
     }
-    const float k = ImClamp(std::sqrt(cfg.ui_scale > 0 ? cfg.ui_scale : 1.f), .85f, 1.4f);
+    // 1.35x bump — status bar was too small to read at a glance on desktop res;
+    // clamp adjusted to keep max reasonable on hi-DPI monitors.
+    const float k = ImClamp(std::sqrt(cfg.ui_scale > 0 ? cfg.ui_scale : 1.f), .85f, 1.4f) * 1.35f;
     const float H = 38 * k, pad = 6 * k, seg = 10 * k, ic = 14 * k, gap = 7 * k;
     const float s_brand = 13 * k, s_label = 11 * k, s_cap = 9 * k, s_mono = 12 * k, trk = .12f;
 
@@ -60,12 +62,12 @@ void status_bar(const RenderConfig& cfg, const char* user, int ping_ms, float fp
     const int q = ping_ms <= 60 ? 3 : ping_ms <= 120 ? 2 : 1;
     const ImU32 pc = q == 3 ? P::POS : q == 2 ? P::AMBER : P::NEG;
 
-    // ширины сегментов
+    // ширины сегментов (user-сегмент убран)
+    (void)who;
     const float w_brand = 26 * k + 8 * k + tw(f_brand, s_brand, "GameBreaker") + seg + 2 * k;
-    const float w_user  = seg + ic + gap + tw(f_label, s_label, who) + seg;
     const float w_ping  = seg + ic + gap + tw(f_mono, s_mono, s_ping) + 5 * k + tw_tr(f_cap, s_cap, "PING", trk) + seg;
     const float w_fps   = seg + ic + gap + tw(f_mono, s_mono, s_fps) + 5 * k + tw_tr(f_cap, s_cap, "FPS", trk) + seg;
-    const float W = pad * 2 + w_brand + w_user + w_ping + w_fps + 3 * (1 + 2 * pad);
+    const float W = pad * 2 + w_brand + w_ping + w_fps + 2 * (1 + 2 * pad);
 
     const ImVec2 a(std::floor(pos.x), std::floor(pos.y)), b(a.x + W, a.y + H);
     const float cy = a.y + H * .5f;
@@ -90,18 +92,6 @@ void status_bar(const RenderConfig& cfg, const char* user, int ping_ms, float fp
         }
         txt(dl, f_brand, s_brand, ta.x + t + 8 * k, cy, G::TEXT, "GameBreaker");
         x += w_brand;
-    }
-    divider();
-
-    // пользователь
-    {
-        float ix = x + seg;
-        const ImU32 c = G::TEXT_MUTED; const float lw = 1.6f * k, u = ic / 16.f;
-        dl->AddCircle(ImVec2(ix + 8 * u, cy - 2.5f * u), 2.8f * u, c, 16, lw);
-        dl->PathArcTo(ImVec2(ix + 8 * u, cy + 6 * u + 3.2f * u), 5.2f * u, IM_PI * 1.08f, IM_PI * 1.92f, 16);
-        dl->PathStroke(c, 0, lw);
-        txt(dl, f_label, s_label, ix + ic + gap, cy, G::TEXT, who);
-        x += w_user;
     }
     divider();
 

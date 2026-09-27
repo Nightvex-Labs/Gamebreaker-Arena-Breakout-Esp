@@ -469,6 +469,23 @@ static void reader_body(void) {
         // Subsequent probes just verify the eproc's ImageFileName still says
         // "UAGame". If it doesn't, drop the latch and re-probe. Never re-read
         // g_eproc_dtb — ACE tamper makes that read give garbage.
+        //
+        // Cold-start gate: if the game's UE window doesn't exist yet, don't
+        // even try to attach. Skipping this check causes reader to race with
+        // ACE boot init and latch a half-formed EPROCESS whose CR3 points at
+        // garbage — triggers the 30s BAILOUT loop we've been chasing.
+        // FindWindowW is a lightweight USER32 lookup, safe to hammer every
+        // 250 ms. As soon as UnrealWindow exists, the game's fully up and
+        // EPROCESS is stable enough to scan.
+        if (attached_pid == 0 && !FindWindowW(L"UnrealWindow", NULL)) {
+            if (now - last_diag_ms > 5000) {
+                ah_diag("waiting for UnrealWindow (game not launched yet)");
+                last_diag_ms = now;
+            }
+            Sleep(250);
+            continue;
+        }
+
         if (attached_pid == 0) {
             if (now - last_find >= 500) {
                 find_attempts++;
@@ -506,15 +523,17 @@ static void reader_body(void) {
             BOOL rd = RpmReadVirtual(drv.hDevice, sysCR3,
                                      eproc + g_eproc_imgname, img, 15);
             BOOL liveness_lost = (!rd || _strnicmp(img, AH_PROC_NAME, 6) != 0);
-            // Bogus-CR3 bailout: 30s latched, GWorld never showed up.
-            // Means we latched a bad EPROCESS CR3 (ACE decoy / early race).
-            // Fresh RpmFindProcess pass — MZ-filter should pick the real one.
-            BOOL bogus_cr3 = (!gworld_seen && (now - attach_ms) > 30000);
+            // Bogus-CR3 bailout: 15s latched (down from 30s), GWorld never
+            // showed up. Means we latched a bad EPROCESS CR3 (ACE decoy /
+            // early race). Fresh RpmFindProcess pass — MZ-filter should
+            // pick the real one. Shorter timeout so cold-start recovers
+            // twice as fast when the first latch grabs the wrong process.
+            BOOL bogus_cr3 = (!gworld_seen && (now - attach_ms) > 15000);
             if (liveness_lost) {
                 ah_diag("LATCH LOST — eproc ImageFileName check failed (rd=%d name='%s'). Re-probing.",
                         (int)rd, img);
             } else if (bogus_cr3) {
-                ah_diag("LATCH BAILOUT — GWorld stayed 0 for 30s after attach (pid=%llu procCR3=0x%llX). "
+                ah_diag("LATCH BAILOUT — GWorld stayed 0 for 15s after attach (pid=%llu procCR3=0x%llX). "
                         "Probably wrong CR3 latched — full re-probe.",
                         (unsigned long long)attached_pid,
                         (unsigned long long)procCR3);

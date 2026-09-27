@@ -802,7 +802,7 @@ void draw_header(float x, float y, float w) {
 
 // ── ESP-превью: отдельная панель 420×540 справа от окна, только в «Визуале» ──
 // Цель рисует hud::esp_target — одна функция с игрой, читает тот же RenderConfig.
-constexpr float PV_W = 420, PV_GAP = 16;
+constexpr float PV_W = 340, PV_GAP = 16;   // 420 -> 340: узко под фигуру + запас 30 px по бокам
 
 void draw_preview(float px, float py, const RenderConfig& cfg) {
     const bool pmc = g.st.vt == 0;
