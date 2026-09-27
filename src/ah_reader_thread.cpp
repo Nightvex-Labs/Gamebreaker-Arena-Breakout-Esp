@@ -1849,6 +1849,30 @@ static void reader_body(void) {
                 last_diag_ms = now2;
                 last_ent_n = s.ent_n;
             }
+            // v1.0.24: HEALTH beacon — every 3 seconds, unconditional. Lets
+            // us diagnose "overlay UI alive, reader silently dead / stalled"
+            // reports. The values here are enough to spot:
+            //   * reader loop stuck (Hz=0 or crashed → line stops appearing)
+            //   * provider handle went stale (procCR3 valid but RPMs all
+            //     return 0 → we see it in ent_n=0 with attached_pid non-zero)
+            //   * GAME_GONE (imageBase == 0 for extended period)
+            //   * roomid=0 (out of raid — expected when in menu)
+            static DWORD s_health_last_ms = 0;
+            if ((now2 - s_health_last_ms) >= 3000) {
+                s_health_last_ms = now2;
+                ah_diag("HEALTH state=%d hz=%.1f attached_pid=%llu procCR3=0x%llX "
+                        "img=0x%llX gworld_seen=%d canary_seen=%d "
+                        "ent=%d loot=%d roomid=0x%llX in_raid=%d",
+                        g_reader_state.load(),
+                        g_reader_hz.load(),
+                        (unsigned long long)attached_pid,
+                        (unsigned long long)procCR3,
+                        (unsigned long long)imageBase,
+                        (int)gworld_seen, (int)canary_seen,
+                        s.ent_n, s.loot_n,
+                        (unsigned long long)s.roomid,
+                        s.roomid != 0);
+            }
         }
         // Update reader-Hz gauge (rolling 500ms average).
         {
