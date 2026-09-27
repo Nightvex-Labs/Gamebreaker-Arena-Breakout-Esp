@@ -457,11 +457,12 @@ static void reader_body(void) {
     BOOL  gworld_seen = FALSE;   // set TRUE the first tick gworld != 0
     BOOL  canary_seen = FALSE;   // v0.9.462: TRUE once GObjects OR FNamePool read != 0
 
-    // v0.9.462: recent-fail EPROCESS blacklist. On LATCH BAILOUT push the
-    // eproc+pid here for 60s so next RpmFindProcess pass skips the same
-    // decoy — no ping-pong on the wrong process. Ring of 4 slots.
+    // v0.9.462: recent-fail EPROCESS blacklist. On LATCH BAILOUT we push
+    // the eproc pointer + PID here for 60s so the next RpmFindProcess pass
+    // doesn't re-latch the same decoy. Reader thread only — RpmFindProcess
+    // is called from one place so a local skip-check works.
     struct FailedAttach { u64 eproc; u64 pid; DWORD stamp_ms; };
-    FailedAttach failed_attachments[4] = {};
+    FailedAttach failed_attachments[4] = {};   // ring buffer
     int failed_idx = 0;
     ah_diag("entering main loop -- waiting for UAGame process (GWorld initial RVA=0x%llX)",
             (unsigned long long)gworld_rva_live);
@@ -477,33 +478,16 @@ static void reader_body(void) {
         // Subsequent probes just verify the eproc's ImageFileName still says
         // "UAGame". If it doesn't, drop the latch and re-probe. Never re-read
         // g_eproc_dtb — ACE tamper makes that read give garbage.
-        //
-        // Cold-start gate: if the game's UE window doesn't exist yet, don't
-        // even try to attach. Skipping this check causes reader to race with
-        // ACE boot init and latch a half-formed EPROCESS whose CR3 points at
-        // garbage — triggers the 30s BAILOUT loop we've been chasing.
-        // FindWindowW is a lightweight USER32 lookup, safe to hammer every
-        // 250 ms. As soon as UnrealWindow exists, the game's fully up and
-        // EPROCESS is stable enough to scan.
-        if (attached_pid == 0 && !FindWindowW(L"UnrealWindow", NULL)) {
-            if (now - last_diag_ms > 5000) {
-                ah_diag("waiting for UnrealWindow (game not launched yet)");
-                last_diag_ms = now;
-            }
-            Sleep(250);
-            continue;
-        }
-
         if (attached_pid == 0) {
             if (now - last_find >= 500) {
                 find_attempts++;
                 if (RpmFindProcess(drv.hDevice, sysCR3, AH_PROC_NAME, &procCR3, &eproc)) {
                     // v0.9.462: skip recently-failed eproc/pid combos so the
-                    // second-chance probe doesn't hand us back the same
-                    // decoy. 60s cooldown, 4-slot ring.
+                    // second-chance probe doesn't hand us back the same decoy.
+                    // 60s cooldown per entry, ring of 4 slots.
+                    BOOL blacklisted = FALSE;
                     u64 tmp_pid = 0;
                     RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_pid, &tmp_pid);
-                    BOOL blacklisted = FALSE;
                     for (int fi = 0; fi < 4; fi++) {
                         FailedAttach& fa = failed_attachments[fi];
                         if (!fa.stamp_ms) continue;
@@ -519,7 +503,7 @@ static void reader_body(void) {
                                     (unsigned long long)tmp_pid);
                             last_diag_ms = now;
                         }
-                        procCR3 = 0; eproc = 0;
+                        procCR3 = 0; eproc = 0;   // reset so next iter retries
                         last_find = now;
                         continue;
                     }
@@ -549,10 +533,11 @@ static void reader_body(void) {
                 last_find = now;
             }
         } else {
-            // v0.9.462: canary check — cheap ~4 RPM, catches wrong-CR3
-            // attach in <=3s. GObjects and FNamePool are non-null once
-            // UAGame passes its own init; if both stay 0 for 3s past
-            // attach, we're on a decoy/dead EPROCESS.
+            // v0.9.462: canary check runs every tick — cheap (~4 RPM), and
+            // catches wrong-CR3 attach in ≤3s instead of the old 30s wait.
+            // GObjects and FNamePool are non-null the moment UAGame passes
+            // its own init; if BOTH stay 0 for 3s past attach, we're on a
+            // decoy/dead EPROCESS, not the real process.
             if (!canary_seen && imageBase && (now - attach_ms) > 500) {
                 u64 gob = 0, fnp = 0;
                 RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_GOBJECTS, &gob);
@@ -568,12 +553,16 @@ static void reader_body(void) {
                 BOOL rd = RpmReadVirtual(drv.hDevice, sysCR3,
                                          eproc + g_eproc_imgname, img, 15);
                 BOOL liveness_lost = (!rd || _strnicmp(img, AH_PROC_NAME, 6) != 0);
-                // v0.9.462: 15s → 10s bailout (FindWindow gate + canary
-                // already caught most cases; safety-net timer just tighter).
-                BOOL bogus_gworld = (!gworld_seen && (now - attach_ms) > 10000);
+                // v0.9.462: bogus-CR3 hard bailout tightened 30s → 10s.
+                // GWorld may legitimately be null in main menu (game not
+                // yet loaded), but 10s is more than enough for it to appear
+                // once user hits Play. Users no longer suffer 30s "UI-alive,
+                // ESP-dead" window on wrong-PID attach.
+                BOOL bogus_gworld  = (!gworld_seen && (now - attach_ms) > 10000);
                 // Fast canary bailout: 3s of BOTH GObjects+FNamePool null
-                // means we're not on a real UAGame — bail immediately.
-                BOOL bogus_canary = (!canary_seen && (now - attach_ms) > 3000);
+                // means we're not on a real UAGame — bail immediately,
+                // don't wait for the GWorld window.
+                BOOL bogus_canary  = (!canary_seen && (now - attach_ms) > 3000);
 
                 if (liveness_lost) {
                     ah_diag("LATCH LOST — eproc ImageFileName check failed (rd=%d name='%s'). Re-probing.",
@@ -590,6 +579,10 @@ static void reader_body(void) {
                             (unsigned long long)procCR3);
                 }
                 if (liveness_lost || bogus_canary || bogus_gworld) {
+                    // Push the failed attach into the blacklist ring so the
+                    // next RpmFindProcess pass skips this eproc/pid for 60s.
+                    // Skip liveness_lost — that just means the game exited,
+                    // no reason to blacklist its PID slot.
                     if (bogus_canary || bogus_gworld) {
                         failed_attachments[failed_idx] = { eproc, attached_pid, now };
                         failed_idx = (failed_idx + 1) & 3;
@@ -600,7 +593,7 @@ static void reader_body(void) {
                     gworld_rva_live = AH_RVA_GWORLD;
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
-                    last_find = 0;   // immediate retry, don't wait 5s more
+                    last_find = 0;   // don't wait 5s more — probe immediately
                 } else {
                     last_find = now;
                 }
@@ -1855,6 +1848,30 @@ static void reader_body(void) {
                         (unsigned long long)imageBase);
                 last_diag_ms = now2;
                 last_ent_n = s.ent_n;
+            }
+            // v1.0.24: HEALTH beacon — every 3 seconds, unconditional. Lets
+            // us diagnose "overlay UI alive, reader silently dead / stalled"
+            // reports. The values here are enough to spot:
+            //   * reader loop stuck (Hz=0 or crashed → line stops appearing)
+            //   * provider handle went stale (procCR3 valid but RPMs all
+            //     return 0 → we see it in ent_n=0 with attached_pid non-zero)
+            //   * GAME_GONE (imageBase == 0 for extended period)
+            //   * roomid=0 (out of raid — expected when in menu)
+            static DWORD s_health_last_ms = 0;
+            if ((now2 - s_health_last_ms) >= 3000) {
+                s_health_last_ms = now2;
+                ah_diag("HEALTH state=%d hz=%.1f attached_pid=%llu procCR3=0x%llX "
+                        "img=0x%llX gworld_seen=%d canary_seen=%d "
+                        "ent=%d loot=%d roomid=0x%llX in_raid=%d",
+                        g_reader_state.load(),
+                        g_reader_hz.load(),
+                        (unsigned long long)attached_pid,
+                        (unsigned long long)procCR3,
+                        (unsigned long long)imageBase,
+                        (int)gworld_seen, (int)canary_seen,
+                        s.ent_n, s.loot_n,
+                        (unsigned long long)s.roomid,
+                        s.roomid != 0);
             }
         }
         // Update reader-Hz gauge (rolling 500ms average).

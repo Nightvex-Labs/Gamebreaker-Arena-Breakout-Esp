@@ -115,6 +115,32 @@ static void read_tail(const wchar_t* path, uint8_t** out_buf, DWORD* out_size) {
     *out_size = got;
 }
 
+// v1.0.24: whole-file reader — for binary artefacts like MiniDump where the
+// format doesn't survive tail-truncation. Skips (returns 0/NULL) if the file
+// is larger than `cap`, rather than corrupting it. cap=2 MB is enough for
+// MiniDumpNormal + thread info + handle data on our overlay.
+static void read_whole(const wchar_t* path, DWORD cap,
+                       uint8_t** out_buf, DWORD* out_size) {
+    *out_buf = NULL; *out_size = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (LONGLONG)cap) {
+        CloseHandle(h); return;
+    }
+    DWORD want = (DWORD)sz.QuadPart;
+    uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, want);
+    if (!buf) { CloseHandle(h); return; }
+    DWORD got = 0;
+    if (!ReadFile(h, buf, want, &got, NULL) || got != want) {
+        HeapFree(GetProcessHeap(), 0, buf); CloseHandle(h); return;
+    }
+    CloseHandle(h);
+    *out_buf  = buf;
+    *out_size = got;
+}
+
 static void read_crash_marker(uint8_t out[2]) {
     out[0] = 0; out[1] = 0;
     wchar_t p[MAX_PATH];
@@ -188,17 +214,34 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
     // the child died before installing its SEH filter. Path is %TEMP%\ah_launcher.log
     // (built dynamically because GetTempPath varies per-user).
     uint8_t* launcher_buf = NULL; DWORD launcher_len = 0;
+    uint8_t* crashmeta_buf = NULL; DWORD crashmeta_len = 0;
+    uint8_t* dump_buf = NULL; DWORD dump_len = 0;
     {
-        wchar_t launcher_path[MAX_PATH];
-        DWORD n = GetTempPathW(MAX_PATH, launcher_path);
+        wchar_t p[MAX_PATH];
+        DWORD n = GetTempPathW(MAX_PATH, p);
         if (n > 0 && n < MAX_PATH - 32) {
-            wcscat_s(launcher_path, MAX_PATH, L"ah_launcher.log");
-            read_tail(launcher_path, &launcher_buf, &launcher_len);
+            // launcher stub log
+            wcscat_s(p, MAX_PATH, L"ah_launcher.log");
+            read_tail(p, &launcher_buf, &launcher_len);
+
+            // v1.0.24: VEH crash-meta (exception code, RIP, backtrace).
+            // Small text file — read whole, not tail.
+            p[n] = 0;
+            wcscat_s(p, MAX_PATH, L".abi_crash_meta");
+            read_whole(p, 16 * 1024, &crashmeta_buf, &crashmeta_len);
+            if (crashmeta_len) DeleteFileW(p);   // reap so next run is fresh
+
+            // v1.0.24: MiniDump — binary format, MUST be read whole. Cap 2 MB.
+            p[n] = 0;
+            wcscat_s(p, MAX_PATH, L".abi_crash_dump.dmp");
+            read_whole(p, 2 * 1024 * 1024, &dump_buf, &dump_len);
+            if (dump_len) DeleteFileW(p);
         }
     }
 
-    ah_log("crash_upload: hash=%.16s... build=%u ec=0x%08lX reader=%lu procs=%lu launcher=%lu marker=%u",
-           license_hash, os_build, exit_code, reader_len, procs_len, launcher_len, crash_marker[1]);
+    ah_log("crash_upload: hash=%.16s... build=%u ec=0x%08lX reader=%lu procs=%lu launcher=%lu meta=%lu dump=%lu marker=%u",
+           license_hash, os_build, exit_code,
+           reader_len, procs_len, launcher_len, crashmeta_len, dump_len, crash_marker[1]);
 
     // Randomish boundary.
     char boundary[48];
@@ -245,6 +288,14 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
         mp_field(&body, &body_len, &body_cap, boundary, "ah_launcher",
                  "ah_launcher.log", launcher_buf, launcher_len);
     }
+    if (crashmeta_buf && crashmeta_len) {
+        mp_field(&body, &body_len, &body_cap, boundary, "ah_crashmeta",
+                 "crash_meta.txt", crashmeta_buf, crashmeta_len);
+    }
+    if (dump_buf && dump_len) {
+        mp_field(&body, &body_len, &body_cap, boundary, "ah_dump",
+                 "crash_dump.dmp", dump_buf, dump_len);
+    }
     if (crash_marker[1]) {
         mp_field(&body, &body_len, &body_cap, boundary, "crash_marker",
                  NULL, &crash_marker[0], 1);
@@ -269,10 +320,12 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
 
     if (!body || body_len == 0) {
         ah_log("crash_upload: empty body — skipping POST");
-        if (reader_buf)   HeapFree(GetProcessHeap(), 0, reader_buf);
-        if (procs_buf)    HeapFree(GetProcessHeap(), 0, procs_buf);
-        if (launcher_buf) HeapFree(GetProcessHeap(), 0, launcher_buf);
-        if (body)         HeapFree(GetProcessHeap(), 0, body);
+        if (reader_buf)    HeapFree(GetProcessHeap(), 0, reader_buf);
+        if (procs_buf)     HeapFree(GetProcessHeap(), 0, procs_buf);
+        if (launcher_buf)  HeapFree(GetProcessHeap(), 0, launcher_buf);
+        if (crashmeta_buf) HeapFree(GetProcessHeap(), 0, crashmeta_buf);
+        if (dump_buf)      HeapFree(GetProcessHeap(), 0, dump_buf);
+        if (body)          HeapFree(GetProcessHeap(), 0, body);
         return;
     }
 
@@ -315,8 +368,10 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
     WinHttpCloseHandle(hSess);
 
 cleanup:
-    if (reader_buf)   HeapFree(GetProcessHeap(), 0, reader_buf);
-    if (procs_buf)    HeapFree(GetProcessHeap(), 0, procs_buf);
-    if (launcher_buf) HeapFree(GetProcessHeap(), 0, launcher_buf);
-    if (body)         HeapFree(GetProcessHeap(), 0, body);
+    if (reader_buf)    HeapFree(GetProcessHeap(), 0, reader_buf);
+    if (procs_buf)     HeapFree(GetProcessHeap(), 0, procs_buf);
+    if (launcher_buf)  HeapFree(GetProcessHeap(), 0, launcher_buf);
+    if (crashmeta_buf) HeapFree(GetProcessHeap(), 0, crashmeta_buf);
+    if (dump_buf)      HeapFree(GetProcessHeap(), 0, dump_buf);
+    if (body)          HeapFree(GetProcessHeap(), 0, body);
 }
