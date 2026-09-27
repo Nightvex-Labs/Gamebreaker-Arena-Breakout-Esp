@@ -71,7 +71,7 @@ void status_bar(const RenderConfig& cfg, const char* user, int ping_ms, float fp
 
     const ImVec2 a(std::floor(pos.x), std::floor(pos.y)), b(a.x + W, a.y + H);
     const float cy = a.y + H * .5f;
-    dl->AddRectFilled(a + ImVec2(0, 4 * k), b + ImVec2(0, 8 * k), P::blk(.18f), 14 * k);   // мягкая тень
+    // тень убрана
     dl->AddRectFilled(a, b, (G::WINDOW & ~IM_COL32_A_MASK) | (235u << IM_COL32_A_SHIFT), 12 * k);
     dl->AddRect(a + ImVec2(.5f, .5f), b - ImVec2(.5f, .5f), P::wht(.06f), 12 * k, 0, 1);
 

@@ -90,7 +90,7 @@ struct RenderConfig {
     int   min_loot_value{75000};      // 1..1000000
 
     // === RADAR ===
-    bool  show_radar{true};
+    bool  show_radar{false};   // радар выключен по умолчанию — пользователь включает из UI
     bool  show_radar_bots{true};
     bool  show_radar_pmc{true};
     float radar_range_m{100.0f};      // 50..400 (v0.9.470: 100m standard)

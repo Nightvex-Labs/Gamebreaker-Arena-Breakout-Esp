@@ -259,6 +259,18 @@ inline constexpr SvgEntry kSvgTable[] = {
 </svg>
 )NVX"
   },
+
+  // ─── menu_v3 nav icons (from gb17 design zip). White stroke; panel
+  //     tints via AddImage() modulate. Metadata (C2PA) stripped. ───────
+  { "nav_visual",
+    R"MNV(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"></path><circle cx="12" cy="12" r="3"></circle></svg>)MNV"
+  },
+  { "nav_radar",
+    R"MNR(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><circle cx="12" cy="12" r="4.5"></circle><path d="M12 12l6-6"></path></svg>)MNR"
+  },
+  { "nav_loot",
+    R"MNL(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5l8.5 4.8v9.4L12 21.5l-8.5-4.8V7.3z"></path><path d="M3.5 7.3L12 12l8.5-4.7M12 12v9.5"></path></svg>)MNL"
+  },
 };
 
 }  // namespace abi::icons

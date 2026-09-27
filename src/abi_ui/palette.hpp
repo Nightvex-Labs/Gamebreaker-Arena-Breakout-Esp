@@ -86,6 +86,29 @@ constexpr ImU32 ESP_PAL[24] = {
 };
 } // namespace gb
 
+// ══════════════════════════════════════════════════════════════════════════
+//  menu_v3 tokens (Spectra v3 Dark mockup). Re-uses gb::WINDOW/CARD/PANEL/
+//  CHIP/LOGO_TILE/TRACK/SEG_BG/TEXT*/ON_ACCENT/KNOB/KNOB_SHADOW/ACCENT/
+//  SWATCH_LINE/SCROLL* as the base; adds only the roles the new design
+//  needed on top of the existing palette.
+namespace gb3 {
+constexpr ImU32 OFF_DOT    = rgb(0x4A4F68);   // кольцо выключенной строки
+constexpr ImU32 ESP_BOX    = rgb(0xE5534B);
+constexpr ImU32 NAME_PMC   = rgb(0x45A3D8);
+constexpr ImU32 NAME_BOT   = rgb(0x8B9CFF);
+constexpr ImU32 ESP_TEXT   = rgb(0xE6E2DA);
+constexpr ImU32 ESP_DIST   = rgb(0x4DBD78);
+constexpr ImU32 ESP_CORPSE = rgb(0x8E93AB);
+constexpr ImU32 TEAM       = rgb(0xD4527A);
+constexpr ImU32 HP         = rgb(0x4BBF8A);
+constexpr ImU32 ARMOR_H    = rgb(0xC7A05C);
+constexpr ImU32 ARMOR_V    = rgb(0xB06060);
+constexpr ImU32 SWATCH[12] = {
+    rgb(0xE5534B), rgb(0xF5997C), rgb(0xE6A35A), rgb(0xE6D25A), rgb(0x4DBD78), rgb(0x45A3D8),
+    rgb(0x6F9FE8), rgb(0x8B9CFF), rgb(0xC77DDB), rgb(0xD4527A), rgb(0xE6E2DA), rgb(0x8E93AB),
+};
+} // namespace gb3
+
 
 // ══════════════════════════════════════════════════════════════════════════
 //  БАЗОВЫЕ ТОКЕНЫ Fey — 1:1 с frontend/src/styles/global.css админки.

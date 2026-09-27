@@ -72,7 +72,7 @@ REM Without it, source files without a BOM are read as the system codepage
 REM (CP1251 on Russian Windows), which mangles Cyrillic string literals
 REM into garbage that renders as hieroglyphs at runtime.
 set OVFLAGS=/nologo /W1 /O2 /GS- /MD /EHsc /std:c++20 /utf-8 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /DDH_RELEASE /DABI_NO_RUNLOG /Iinc /Ideps\imgui /Ideps\imgui\backends /Ithird_party
-set ABI_UI=src\abi_ui\overlay.cpp src\abi_ui\control_panel.cpp src\abi_ui\overlay_hud.cpp src\abi_ui\esp_style.cpp src\abi_ui\status_bar.cpp src\abi_ui\render.cpp src\abi_ui\icons.cpp src\abi_ui\image_loader.cpp
+set ABI_UI=src\abi_ui\overlay.cpp src\abi_ui\control_panel.cpp src\abi_ui\menu_v3.cpp src\abi_ui\overlay_hud.cpp src\abi_ui\esp_style.cpp src\abi_ui\status_bar.cpp src\abi_ui\render.cpp src\abi_ui\icons.cpp src\abi_ui\image_loader.cpp
 REM Overlay uses SUBSYSTEM:WINDOWS so no conhost/cmd window ever pops up when
 REM spawned directly (schtasks / RunUserActive / dev-mode). wmainCRTStartup is
 REM valid with WINDOWS subsystem (CRT dispatches to wmain the same way). The

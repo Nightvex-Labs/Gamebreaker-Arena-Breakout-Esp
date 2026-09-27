@@ -13,6 +13,7 @@
 #include <imgui.h>
 #include "abi_ui/overlay.hpp"
 #include "abi_ui/control_panel.hpp"
+#include "abi_ui/menu_v3.hpp"
 #include "abi_ui/render.hpp"
 #include "abi_ui/snapshot.hpp"
 #include "abi_ui/image_loader.hpp"
@@ -97,6 +98,8 @@ extern "C" int AhOverlayRun(void) {
                                          &op_srv, &op_w, &op_h)) {
             abi::control_panel_set_operator_texture(
                 reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
+            abi::menu_v3_set_operator_texture(
+                reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
             DH_INFO("operator.png: loaded from embed (%d bytes, %dx%d)",
                     (int)OPERATOR_PNG_SIZE, op_w, op_h);
         } else {
@@ -116,6 +119,8 @@ extern "C" int AhOverlayRun(void) {
                     if (abi::image_loader::load_png(ov.device(), buf, &op_srv, &op_w, &op_h)) {
                         abi::control_panel_set_operator_texture(
                             reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
+                        abi::menu_v3_set_operator_texture(
+                            reinterpret_cast<ImTextureID>(op_srv), op_w, op_h);
                         DH_INFO("operator.png: fallback file %ls (%dx%d)", buf, op_w, op_h);
                         break;
                     }
@@ -133,6 +138,7 @@ extern "C" int AhOverlayRun(void) {
         float dpi = ah_get_panel_dpi();
         if (dpi < 1.0f) dpi = 1.0f;
         abi::control_panel_set_typography(dpi, dpi);
+        abi::menu_v3_set_scale(dpi);
     }
 
     abi::RenderConfig cfg{};
@@ -394,7 +400,11 @@ extern "C" int AhOverlayRun(void) {
         }
 
         if (cfg.show_control_panel) {
-            abi::render_control_panel(cfg);
+            // menu_v3 replaces the old control_panel. pull() once, render,
+            // push() every frame — same pattern control_panel used before.
+            abi::menu_v3_pull(cfg);
+            abi::render_menu_v3();
+            abi::menu_v3_push(cfg);
         }
     });
 
