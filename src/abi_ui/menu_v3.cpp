@@ -161,13 +161,13 @@ void dot(float cx, float cy, bool on, ImGuiID id) {
 }
 // сегмент-переключатель; opts — подписи; icons — опц. имена иконок; возвращает новый индекс
 int segmented(float x, float y, float w, float h, const char* const* opts, int n, int cur, bool fill, ImGuiID id) {
-    rect(x, y, w, h, G::SEG_BG, 9);
+    rect(x, y, w, h, G::SEG_BG, 6);
     float iw = (w - 6 - 2 * (n - 1)) / n;
     int res = cur;
     for (int i = 0; i < n; i++) {
         float bx = x + 3 + i * (iw + 2);
         float t = anim(id + i, i == cur ? 1.f : 0.f, 18.f);
-        if (t > 0) rect(bx, y + 3, iw, h - 6, A(G::ACCENT, t), 7);
+        if (t > 0) rect(bx, y + 3, iw, h - 6, A(G::ACCENT, t), 5);
         ImU32 tc = mix(G::TEXT_MUTED, G::ON_ACCENT, t);
         text_c(F.ub700_12, 11, bx + iw * .5f, y + h * .5f, tc, opts[i]);
         if (click(bx, y, iw, h)) res = i;
@@ -210,8 +210,9 @@ void group_title(float x, float y, const char* t) { text(F.ub700_9, 9, x + 4, y 
 bool side_btn(float x, float y, bool active, ImGuiID id) {
     bool h = hot(x, y, BTN, ROW_H);
     float t = anim(id, h || active ? 1.f : 0.f, 18.f);
-    rect(x, y, BTN, ROW_H, mix(G::CARD, G::PANEL, t), 10);
-    if (active) ring(x, y, BTN, ROW_H, A(G::ACCENT, .5f), 10);
+    rect(x, y, BTN, ROW_H, mix(V::GLASS, V::GLASS_HOT, t), 7);
+    ring(x, y, BTN, ROW_H, V::GLASS_LINE, 7);
+    if (active) ring(x, y, BTN, ROW_H, A(G::ACCENT, .5f), 7);
     return click(x, y, BTN, ROW_H);
 }
 
@@ -227,7 +228,8 @@ float esp_row(float x, float y, float w, int k) {
     ImGuiID rid = hid("row", s.vt * 100 + k);
     bool h = hot(x, y, rw, ROW_H);
     float ht = anim(rid, h ? 1.f : 0.f, 18.f);
-    rect(x, y, rw, ROW_H, A(mix(G::CARD, G::PANEL, ht), dim), 10);
+    rect(x, y, rw, ROW_H, A(mix(V::GLASS, V::GLASS_HOT, ht), dim), 7);
+    ring(x, y, rw, ROW_H, V::GLASS_LINE, 7);
     dot(x + 12 + 7, y + ROW_H * .5f, it.on, rid + 1);
     float tt = anim(rid + 2, it.on ? 1.f : 0.f, 18.f);
     text_fit(F.ub500_14, 12.5f, x + 12 + 14 + 11, y + ROW_H * .5f, rw - 12 - 14 - 11 - 12, A(mix(G::TEXT_FAINT, G::TEXT, tt), dim), label_of(k));
@@ -236,8 +238,11 @@ float esp_row(float x, float y, float w, int k) {
     float bx = x + rw + ROW_GAP;
     if (it.has_c) {
         if (side_btn(bx, y, oc, rid + 3)) s.open = oc ? -1 : idc;
-        circle(bx + BTN * .5f, y + ROW_H * .5f, 8.5f, A(G::SWATCH_LINE, dim));
-        circle(bx + BTN * .5f, y + ROW_H * .5f, 8, A(it.c, (it.on ? 1.f : .35f) * dim));
+        {   // квадратный образец 16×16, r=4, обводка 1px
+            float sx = bx + BTN * .5f - 8, sy = y + ROW_H * .5f - 8;
+            rect(sx - 1, sy - 1, 18, 18, A(G::SWATCH_LINE, dim), 5);
+            rect(sx, sy, 16, 16, A(it.c, (it.on ? 1.f : .35f) * dim), 4);
+        }
         bx += BTN + ROW_GAP;
     }
     if (has_set(k)) {
@@ -249,7 +254,8 @@ float esp_row(float x, float y, float w, int k) {
     if (oc) {                                   // палитра 6×2
         float py = y + ROW_H + ROW_GAP, ph = 14 + 12 + 12 + 28 + 8 + 28 + 14;
         float a = anim(rid + 5, 1.f, 20.f);
-        rect(x, py, w, ph, A(G::PANEL, a), 10);
+        rect(x, py, w, ph, A(V::GLASS_HOT, a), 7);
+        ring(x, py, w, ph, V::GLASS_LINE, 7);
         char cap[96]; std::snprintf(cap, sizeof cap, S_.ru ? U8("ЦВЕТ · %s") : "COLOR · %s", label_of(k));
         text(F.ub700_9, 9, x + 14, py + 14 + 6, A(G::TEXT_FAINT, a), cap, .12f);
         char hex[12]; std::snprintf(hex, sizeof hex, "#%02X%02X%02X", (it.c >> IM_COL32_R_SHIFT) & 255, (it.c >> IM_COL32_G_SHIFT) & 255, (it.c >> IM_COL32_B_SHIFT) & 255);
@@ -261,7 +267,7 @@ float esp_row(float x, float y, float w, int k) {
             float sx = x + 14 + (i % 6) * (gw + 8), sy = py + 14 + 12 + 12 + (i / 6) * (28 + 8);
             ImU32 c = V::SWATCH[i];
             if (c == it.c) { ring(sx - 4, sy - 4, gw + 8, 36, A(G::TEXT, a), 11, 2); }
-            rect(sx, sy, gw, 28, A(c, a), 8);
+            rect(sx, sy, gw, 28, A(c, a), 5);
             if (click(sx, sy, gw, 28)) it.c = c;
         }
         hgt += ROW_GAP + ph;
@@ -270,7 +276,8 @@ float esp_row(float x, float y, float w, int k) {
         float py = y + ROW_H + ROW_GAP, cy = py + 12;
         const bool seg = k == K_box || k == K_armor, sl = k == K_box || k == K_corpses;
         float ph = 12 + (seg ? 12 + 9 + 34 : 0) + (seg && sl ? 12 : 0) + (sl ? 14 + 9 + 16 : 0) + 14;
-        rect(x, py, w, ph, G::PANEL, 10);
+        rect(x, py, w, ph, V::GLASS_HOT, 7);
+        ring(x, py, w, ph, V::GLASS_LINE, 7);
         if (seg) {
             text(F.ub500_14, 12, x + 14, cy + 6, G::TEXT_MUTED, k == K_box ? (S_.ru ? U8("Стиль") : "Style") : (S_.ru ? U8("Отображение") : "Display"));
             static const char* box_o[2] = {"2D", "3D"};
@@ -290,7 +297,8 @@ float esp_row(float x, float y, float w, int k) {
 float toggle_row(float x, float y, float w, const char* label, const char* hint, bool& v, float dim, ImGuiID id) {
     bool h = hot(x, y, w, ROW_H);
     float ht = anim(id, h ? 1.f : 0.f, 18.f);
-    rect(x, y, w, ROW_H, A(mix(G::CARD, G::PANEL, ht), dim), 10);
+    rect(x, y, w, ROW_H, A(mix(V::GLASS, V::GLASS_HOT, ht), dim), 7);
+    ring(x, y, w, ROW_H, V::GLASS_LINE, 7);
     dot(x + 19, y + ROW_H * .5f, v, id + 1);
     float tt = anim(id + 2, v ? 1.f : 0.f, 18.f);
     ImU32 tc = A(mix(G::TEXT_FAINT, G::TEXT, tt), dim);
@@ -303,12 +311,14 @@ float toggle_row(float x, float y, float w, const char* label, const char* hint,
 }
 float slider_row(float x, float y, float w, const char* label, int& v, int mn, int mx, int step, const char* fmt, float dim, ImGuiID id) {
     const float h = 12 + 14 + 10 + 16 + 14;
-    rect(x, y, w, h, A(G::CARD, dim), 10);
+    rect(x, y, w, h, A(V::GLASS, dim), 7);
+    ring(x, y, w, h, V::GLASS_LINE, 7);
     slider(x + 14, y + 12, w - 28, label, v, mn, mx, step, fmt, id, true);
     return h;
 }
 float seg_row(float x, float y, float w, const char* label, const char* const* opts, int n, int& cur, float dim, ImGuiID id, float seg_w) {
-    rect(x, y, w, ROW_H, A(G::CARD, dim), 10);
+    rect(x, y, w, ROW_H, A(V::GLASS, dim), 7);
+    ring(x, y, w, ROW_H, V::GLASS_LINE, 7);
     text(F.ub500_14, 12.5f, x + 14, y + ROW_H * .5f, A(G::TEXT, dim), label);
     cur = segmented(x + w - 6 - seg_w, y + 6, seg_w, 32, opts, n, cur, false, id);
     return ROW_H;
@@ -318,7 +328,8 @@ float seg_row(float x, float y, float w, const char* label, const char* const* o
 void draw_preview(float x, float y, float w, float h) {
     const State& s = S_; const Item* E = s.esp[s.vt]; const bool bots = s.vt == 1;
     auto on = [&](int k) { return E[K_enable].on && E[k].on; };
-    rect(x, y, w, h, G::CARD, 12);
+    rect(x, y, w, h, V::GLASS, 8);
+    ring(x, y, w, h, V::GLASS_LINE, 8);
     text(F.ub500_14, 13, x + 18, y + 24, G::TEXT_MUTED, S_.ru ? U8("Превью") : "Preview");
     text_r(F.ub700_9, 9, x + w - 18, y + 24, G::TEXT_FAINT, bots ? "BOTS" : "PLAYERS", .12f);
 
@@ -387,22 +398,23 @@ void draw_preview(float x, float y, float w, float h) {
 
 // ── рейл ──────────────────────────────────────────────────────────────────
 void draw_rail(float x, float y, float h) {
-    rect(x, y, 64, h, G::CARD, 12);
-    rect(x + 12, y + 12, 40, 40, G::LOGO_TILE, 11);
+    rect(x, y, 64, h, V::GLASS, 8);
+    ring(x, y, 64, h, V::GLASS_LINE, 8);
+    rect(x + 12, y + 12, 40, 40, G::LOGO_TILE, 7);
     icon("logo", x + 12 + 9.5f, y + 12 + 9, 21, IM_COL32_WHITE);
     static const char* ic[3] = {"nav_visual", "nav_radar", "nav_loot"};
     for (int i = 0; i < 3; i++) {
         float bx = x + 10, by = y + 12 + 40 + 14 + i * (44 + 8);
         bool hv = hot(bx, by, 44, 44);
         float t = anim(hid("rail", i), S_.sec == i ? 1.f : 0.f, 18.f);
-        if (t > 0) rect(bx, by, 44, 44, A(G::ACCENT, t), 12);
+        if (t > 0) rect(bx, by, 44, 44, A(G::ACCENT, t), 8);
         ImU32 tc = mix(hv ? G::TEXT : G::TEXT_MUTED, G::ON_ACCENT, t);
         icon(ic[i], bx + 12, by + 12, 20, tc);
         if (click(bx, by, 44, 44) && S_.sec != i) { S_.sec = i; S_.open = -1; S_.scroll = S_.scroll_t = 0; }
     }
     float lx = x + 12, ly = y + h - 12 - 28;
     bool lh = hot(lx, ly, 40, 28);
-    if (lh) rect(lx, ly, 40, 28, G::PANEL, 8);
+    if (lh) rect(lx, ly, 40, 28, V::GLASS_HOT, 5);
     text_c(F.ub700_12, 11, lx + 20, ly + 14, lh ? G::TEXT : G::TEXT_MUTED, S_.ru ? "RU" : "EN");
     if (click(lx, ly, 40, 28)) S_.ru = !S_.ru;
 }
@@ -449,10 +461,11 @@ float column_radar(float x, float y, float w, int col) {
     cy += GROUP_GAP;
     group_title(x, cy, ru ? U8("ПОЛОЖЕНИЕ") : "POSITION"); cy += CAP_H;
     // угол экрана — 4 иконки-квадрата
-    rect(x, cy, w, ROW_H, A(G::CARD, dim), 10);
+    rect(x, cy, w, ROW_H, A(V::GLASS, dim), 7);
+    ring(x, cy, w, ROW_H, V::GLASS_LINE, 7);
     text(F.ub500_14, 12.5f, x + 14, cy + ROW_H * .5f, A(G::TEXT, dim), ru ? U8("Угол экрана") : "Screen corner");
     float sw = 4 * 36 + 3 * 2 + 6, sx = x + w - 6 - sw, sy = cy + 6;
-    rect(sx, sy, sw, 32, G::SEG_BG, 9);
+    rect(sx, sy, sw, 32, G::SEG_BG, 6);
     // 4 SVG-иконки из атласа (corner_tl / corner_tr / corner_bl / corner_br)
     // — те же, что использовал старый control_panel. Растрируются nanosvg'ом
     // (icons.cpp), панель тонирует их через AddImage tint.
@@ -460,7 +473,7 @@ float column_radar(float x, float y, float w, int col) {
     for (int i = 0; i < 4; i++) {
         float bx = sx + 3 + i * 38;
         float t = anim(hid("rc", i), R.corner == i ? 1.f : 0.f, 18.f);
-        if (t > 0) rect(bx, sy + 3, 36, 26, A(G::ACCENT, t), 7);
+        if (t > 0) rect(bx, sy + 3, 36, 26, A(G::ACCENT, t), 5);
         ImU32 c = mix(G::TEXT_MUTED, G::ON_ACCENT, t);
         icon(corner_ic[i], bx + 10, sy + 8, 16, c);
         if (click(bx, sy, 36, 32)) R.corner = i;
@@ -503,11 +516,12 @@ void draw_content(float x, float y, float w, float h) {
         const char* vt[2] = {s.ru ? U8("Игроки") : "Players", s.ru ? U8("Боты") : "Bots"};
         float w0 = tw(F.ub500_14, 12, vt[0]) + 32, w1 = tw(F.ub500_14, 12, vt[1]) + 32, sw = w0 + w1 + 2 + 6;
         float sx = cx + cw - sw;
-        rect(sx, cy, sw, 34, G::CARD, 10);
+        rect(sx, cy, sw, 34, V::GLASS, 7);
+        ring(sx, cy, sw, 34, V::GLASS_LINE, 7);
         for (int i = 0; i < 2; i++) {
             float bx = sx + 3 + (i ? w0 + 2 : 0), bw = i ? w1 : w0;
             float t = anim(hid("vt", i), s.vt == i ? 1.f : 0.f, 18.f);
-            if (t > 0) rect(bx, cy + 3, bw, 28, A(G::CHIP, t), 8);
+            if (t > 0) rect(bx, cy + 3, bw, 28, A(V::GLASS_ON, t), 5);
             text_c(t > .5f ? F.ub700_12 : F.ub500_14, 12, bx + bw * .5f, cy + 17, mix(G::TEXT_MUTED, G::TEXT, t), vt[i]);
             if (click(bx, cy, bw, 34) && s.vt != i) { s.vt = i; s.open = -1; }
         }
@@ -569,7 +583,8 @@ void render_menu_v3() {
 
     // тень + окно (окно с лёгкой прозрачностью — игра слегка просвечивает)
     for (int i = 1; i <= 4; i++) rect(-i * 3.f, 12 - i * 3.f + i * 4.f, W + i * 6.f, H + i * 4.f, P::blk(.05f), 16 + i * 3.f);
-    rect(0, 0, W, H, (G::WINDOW & ~IM_COL32_A_MASK) | (240u << IM_COL32_A_SHIFT), 16);
+    rect(0, 0, W, H, V::WINDOW_GLASS, 10);
+    ring(0, 0, W, H, P::wht(.04f), 10);
 
     const float ih = H - PAD * 2;
     draw_rail(PAD, PAD, ih);

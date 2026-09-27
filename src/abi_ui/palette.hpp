@@ -92,6 +92,11 @@ constexpr ImU32 ESP_PAL[24] = {
 //  SWATCH_LINE/SCROLL* as the base; adds only the roles the new design
 //  needed on top of the existing palette.
 namespace gb3 {
+constexpr ImU32 WINDOW_GLASS = rgb(0x1C1E2C);        // фон окна: полностью непрозрачный
+constexpr ImU32 GLASS      = rgb(0xFFFFFF, 0.035f);  // полупрозрачные плашки
+constexpr ImU32 GLASS_HOT  = rgb(0xFFFFFF, 0.065f);  // hover / раскрытые панели
+constexpr ImU32 GLASS_ON   = rgb(0xFFFFFF, 0.09f);   // активный таб Игроки/Боты
+constexpr ImU32 GLASS_LINE = rgb(0xFFC4B0, 0.10f);   // тонкая тёплая обводка плашек
 constexpr ImU32 OFF_DOT    = rgb(0x4A4F68);   // кольцо выключенной строки
 constexpr ImU32 ESP_BOX    = rgb(0xE5534B);
 constexpr ImU32 NAME_PMC   = rgb(0x45A3D8);
