@@ -30,6 +30,13 @@
 #define TELEM_HOST   L"koenflow.com"
 #define TELEM_PATH   L"/api/telemetry/crash"
 #define TAIL_BYTES   (500 * 1024)
+// v1.0.28: head/tail split for reader.log. Init phase (gpu_probe, WARP
+// marker, LATCH, SIG-SCAN, canary log) always lives at the very top; a
+// pure 500 KB tail throws it away once the loop runs long enough to
+// generate half a meg of ENEMY-DECRYPT lines. Keep the first HEAD_BYTES
+// (init) and the last TAIL_TAIL_BYTES (crash context).
+#define HEAD_BYTES        (100 * 1024)
+#define TAIL_TAIL_BYTES   (400 * 1024)
 #define BODY_MAX     (8  * 1024 * 1024)
 
 extern void ah_log(const char* fmt, ...);   // provided by ah_launcher.c
@@ -113,6 +120,71 @@ static void read_tail(const wchar_t* path, uint8_t** out_buf, DWORD* out_size) {
     CloseHandle(h);
     *out_buf  = buf;
     *out_size = got;
+}
+
+// v1.0.28: head + tail split reader. For big logs, we keep the first
+// `head_max` bytes (init phase — WARP marker probe, gpu_probe, LATCH,
+// SIG-SCAN, canary) AND the last `tail_max` bytes (recent activity before
+// exit / crash context). If the file fits in head_max+tail_max we send it
+// whole. Otherwise we insert a marker line between the two halves.
+//
+// Total output <= head_max + SEP_MAX + tail_max, always <= TAIL_BYTES.
+static void read_head_tail(const wchar_t* path,
+                           DWORD head_max, DWORD tail_max,
+                           uint8_t** out_buf, DWORD* out_size) {
+    *out_buf = NULL; *out_size = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0) { CloseHandle(h); return; }
+
+    // Small file — send whole.
+    if ((ULONGLONG)sz.QuadPart <= (ULONGLONG)(head_max + tail_max)) {
+        DWORD want = (DWORD)sz.QuadPart;
+        uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, want);
+        if (!buf) { CloseHandle(h); return; }
+        DWORD got = 0;
+        if (!ReadFile(h, buf, want, &got, NULL) || got == 0) {
+            HeapFree(GetProcessHeap(), 0, buf); CloseHandle(h); return;
+        }
+        CloseHandle(h);
+        *out_buf = buf; *out_size = got;
+        return;
+    }
+
+    // Big file — split into head + separator + tail.
+    char sep[128];
+    LONGLONG cut = sz.QuadPart - (LONGLONG)head_max - (LONGLONG)tail_max;
+    int sep_n = _snprintf_s(sep, sizeof(sep), _TRUNCATE,
+        "\r\n=== TRUNCATED %lld bytes (head=%lu, tail=%lu, total=%lld) ===\r\n",
+        cut, (unsigned long)head_max, (unsigned long)tail_max, sz.QuadPart);
+    if (sep_n <= 0) sep_n = 0;
+
+    DWORD total = head_max + (DWORD)sep_n + tail_max;
+    uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, total);
+    if (!buf) { CloseHandle(h); return; }
+
+    // Head — from offset 0.
+    LARGE_INTEGER off; off.QuadPart = 0;
+    SetFilePointerEx(h, off, NULL, FILE_BEGIN);
+    DWORD gh = 0;
+    if (!ReadFile(h, buf, head_max, &gh, NULL) || gh == 0) {
+        HeapFree(GetProcessHeap(), 0, buf); CloseHandle(h); return;
+    }
+
+    // Separator.
+    if (sep_n > 0) memcpy(buf + gh, sep, (size_t)sep_n);
+
+    // Tail — from sz - tail_max.
+    off.QuadPart = sz.QuadPart - (LONGLONG)tail_max;
+    SetFilePointerEx(h, off, NULL, FILE_BEGIN);
+    DWORD gt = 0;
+    if (!ReadFile(h, buf + gh + sep_n, tail_max, &gt, NULL)) gt = 0;
+
+    CloseHandle(h);
+    *out_buf = buf;
+    *out_size = gh + (DWORD)sep_n + gt;
 }
 
 // v1.0.24: whole-file reader — for binary artefacts like MiniDump where the
@@ -207,7 +279,12 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
 
     uint8_t* reader_buf = NULL; DWORD reader_len = 0;
     uint8_t* procs_buf  = NULL; DWORD procs_len  = 0;
-    read_tail(L"C:\\Users\\Public\\ah_reader.log", &reader_buf, &reader_len);
+    // v1.0.28: reader.log gets head+tail split — init phase (gpu_probe,
+    // WARP marker, LATCH, SIG-SCAN, canary bailout) sits in the head,
+    // recent activity before exit sits in the tail. procs.log stays raw
+    // tail — it's a snapshot of running processes, only the latest matters.
+    read_head_tail(L"C:\\Users\\Public\\ah_reader.log",
+                   HEAD_BYTES, TAIL_TAIL_BYTES, &reader_buf, &reader_len);
     read_tail(L"C:\\Users\\Public\\ah_procs.log",  &procs_buf,  &procs_len);
 
     // v1.0.22: launcher-side log too — crucial for marker=0 crashes where
