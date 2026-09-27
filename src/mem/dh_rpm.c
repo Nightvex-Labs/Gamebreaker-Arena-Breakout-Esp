@@ -124,17 +124,40 @@ BOOL RpmFindSystemCR3(HANDLE hDev, u64* cr3Out)
 
 // ---- Page walk: PML4 → PDPT → PD → PT ----
 
+// v1.0.25: MMIO / non-RAM PA guard. When ACE tampers UAGame's page tables
+// (25H2 + REDFOX provider is where this bites), a forged PTE can steer the
+// walk into device-memory regions:
+//   0xFEC00000-0xFECFFFFF  I/O APIC
+//   0xFED00000-0xFED0FFFF  HPET
+//   0xFEE00000-0xFEEFFFFF  Local APIC       ← side-effectful reads hang bus
+//   0xE0000000-0xFFFFFFFF  Broad PCI(e) MMIO / BAR window
+//   0xA0000-0xFFFFF        VGA aperture + video BIOS shadow (uncached)
+//   0-0xFFFFF              real-mode legacy region (best-effort skip)
+// Provider's MmMapIoSpace + memcpy against LAPIC/IOAPIC MMIO can wedge the
+// CPU with no bugcheck — arbitration/priority-register reads change device
+// state. That matches the "PC just freezes, no BSOD" report pattern.
+// This guard returns FALSE early so the caller's RPM sees a normal miss.
+static inline BOOL ah_is_bad_pa(u64 pa) {
+    if (pa < 0x100000ULL)                                return TRUE; // legacy 0-1MB (VGA/BIOS)
+    if (pa >= 0xFEC00000ULL && pa <  0xFEF00000ULL)      return TRUE; // I/O + HPET + LAPIC
+    if (pa >= 0xF0000000ULL && pa <  0x100000000ULL)     return TRUE; // upper PCI(e) MMIO
+    return FALSE;
+}
+
 BOOL RpmVirtToPhys(HANDLE hDev, u64 cr3, u64 va, u64* paOut)
 {
     *paOut = 0;
     u64 table = cr3 & PHY_MASK;
+    if (ah_is_bad_pa(table)) return FALSE;
 
     for (int level = 0; level < 4; level++) {
         int shift = 39 - level * 9;
         u64 idx = (va >> shift) & 0x1FF;
         u64 entry = 0;
 
-        if (!PhysRead(hDev, table + idx * 8, &entry, 8))
+        u64 pte_pa = table + idx * 8;
+        if (ah_is_bad_pa(pte_pa)) return FALSE;      // PT itself lives in MMIO — bail
+        if (!PhysRead(hDev, pte_pa, &entry, 8))
             return FALSE;
 
         if (!(entry & PTE_PRESENT))
@@ -143,19 +166,30 @@ BOOL RpmVirtToPhys(HANDLE hDev, u64 cr3, u64 va, u64* paOut)
         table = entry & PHY_MASK;
 
         if (entry & PTE_LARGE_PAGE) {
+            // v1.0.25: large-page bit only valid at PDPT (shift=30) and PD
+            // (shift=21). PML4 (shift=39) and PT (shift=12) with PS set is
+            // an illegal PTE — treat as miss instead of returning a garbage
+            // PA whose only the low 30/21 bits are meaningful.
             if (shift == 30) { // 1GB page
-                *paOut = (entry & PHY_MASK_1G) + (va & VA_MASK_1G);
+                u64 out = (entry & PHY_MASK_1G) + (va & VA_MASK_1G);
+                if (ah_is_bad_pa(out)) return FALSE;
+                *paOut = out;
                 return TRUE;
             }
             if (shift == 21) { // 2MB page
-                *paOut = (entry & PHY_MASK_2M) + (va & VA_MASK_2M);
+                u64 out = (entry & PHY_MASK_2M) + (va & VA_MASK_2M);
+                if (ah_is_bad_pa(out)) return FALSE;
+                *paOut = out;
                 return TRUE;
             }
+            return FALSE;   // PS bit at illegal level → tampered PTE
         }
     }
 
     // 4KB page
-    *paOut = table + (va & VA_MASK_4K);
+    u64 out = table + (va & VA_MASK_4K);
+    if (ah_is_bad_pa(out)) return FALSE;
+    *paOut = out;
     return TRUE;
 }
 
