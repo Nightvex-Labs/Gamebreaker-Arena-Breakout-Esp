@@ -56,6 +56,9 @@ extern "C" {
 
 #include <unordered_map>
 #include <unordered_set>
+#include <exception>       // v1.0.27 std::set_terminate + std::exception
+#include <cstdlib>         // v1.0.27 _Exit
+#include "abi_ui/crash_marker.hpp"   // v1.0.27 crash_marker::write
 
 // Per-pawn cache: pawn -> limb-aset ptr. Populated by ASC sig-scan on
 // first hit, reused for cheap 0x40-byte cur+max snapshots each tick.
@@ -330,7 +333,53 @@ static u64 ah_sig_scan_gworld(HANDLE hDev, u64 procCR3, u64 imageBase)
     return 0;
 }
 
+// v1.0.27: reader_body renamed to reader_body_impl. New reader_body is a
+// try/catch wrapper that catches std::bad_alloc / std::exception / any other
+// C++ exception that would otherwise reach RaiseFailFastException with
+// marker=0 (no forensic evidence). Also installs std::set_terminate exactly
+// once so uncaught C++ exceptions in ANY thread (not just reader) end up as
+// a proper marker=TERMINATE_HANDLER (13) rather than marker=0.
+static void reader_body_impl(void);
+
 static void reader_body(void) {
+    // Install terminate handler once. std::call_once used to be safe against
+    // races if reattach spawns a fresh reader thread mid-crash of the first.
+    static std::once_flag s_term_once;
+    std::call_once(s_term_once, [](){
+        std::set_terminate([](){
+            // Fast, single-byte marker before termination. VEH v1.0.24 may or
+            // may not fire depending on how the exception unwound; the marker
+            // is the belt-and-suspenders channel.
+            crash_marker::write(crash_marker::TERMINATE_HANDLER);
+            _Exit(0x0D);
+        });
+    });
+
+    try {
+        reader_body_impl();
+    } catch (const std::bad_alloc&) {
+        // Out-of-memory in std::unordered_map (g_pmc_corpses / g_human_snap /
+        // g_bot_cap etc.) — write a distinct marker so field triage doesn't
+        // confuse this with a real AV.
+        ah_diag("!!! reader_body: std::bad_alloc caught — marker=READER_BAD_ALLOC");
+        crash_marker::write(crash_marker::READER_BAD_ALLOC);
+        g_thread_alive.store(false);
+        _Exit(0xE0000009);
+    } catch (const std::exception& e) {
+        ah_diag("!!! reader_body: std::exception caught: what()='%s' — marker=READER_UNKNOWN_EXC",
+                e.what() ? e.what() : "(null)");
+        crash_marker::write(crash_marker::READER_UNKNOWN_EXC);
+        g_thread_alive.store(false);
+        _Exit(0xE0000EEE);
+    } catch (...) {
+        ah_diag("!!! reader_body: unknown C++ exception caught — marker=READER_UNKNOWN_EXC");
+        crash_marker::write(crash_marker::READER_UNKNOWN_EXC);
+        g_thread_alive.store(false);
+        _Exit(0xE0000EEE);
+    }
+}
+
+static void reader_body_impl(void) {
     g_thread_alive.store(true);
     g_reader_state.store(AH_READER_INIT);
     ah_diag("=== reader_body ENTER build=%s ===", __DATE__ " " __TIME__);
@@ -558,11 +607,14 @@ static void reader_body(void) {
                 // yet loaded), but 10s is more than enough for it to appear
                 // once user hits Play. Users no longer suffer 30s "UI-alive,
                 // ESP-dead" window on wrong-PID attach.
-                BOOL bogus_gworld  = (!gworld_seen && (now - attach_ms) > 10000);
-                // Fast canary bailout: 3s of BOTH GObjects+FNamePool null
-                // means we're not on a real UAGame — bail immediately,
-                // don't wait for the GWorld window.
-                BOOL bogus_canary  = (!canary_seen && (now - attach_ms) > 3000);
+                // v1.0.27: bogus_gworld 10s → 15s. Slow rigs (Win10 21H2 on
+                // b19045 boxes) can take 10s just to load main menu; earlier
+                // bailout was misfiring on legitimate slow clients.
+                BOOL bogus_gworld  = (!gworld_seen && (now - attach_ms) > 15000);
+                // v1.0.27: canary bailout 3s → 8s. Same reason — 3s was too
+                // aggressive for slow CPU + HDD. GObjects/FNamePool init after
+                // UAGame's own module load can be delayed 5-7s on slow rigs.
+                BOOL bogus_canary  = (!canary_seen && (now - attach_ms) > 8000);
 
                 if (liveness_lost) {
                     ah_diag("LATCH LOST — eproc ImageFileName check failed (rd=%d name='%s'). Re-probing.",
@@ -612,6 +664,47 @@ static void reader_body(void) {
             u64 gworld = 0;
             BOOL rd_ok = RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
             if (gworld) gworld_seen = TRUE;
+
+            // v1.0.27: CR3-stale auto-resync. When RpmRead64 itself returns
+            // FALSE (not just 0-value) for a sustained window, the CR3 we
+            // latched at attach can no longer translate user VAs. Regression
+            // observed 2026-09-19 for hwid 574f4932 after Delta relaunch —
+            // eproc DTB looked valid but every user-space translate returned
+            // ERROR_INVALID_ADDRESS. bogus_gworld (15s) eventually catches
+            // this, but 15s of dead reads first = "UI alive, ESP dead" for
+            // the user. Faster tripwire on translate failure specifically.
+            {
+                static int s_rpm_fail_streak = 0;
+                if (!rd_ok) {
+                    int cur = ++s_rpm_fail_streak;
+                    if (cur == 200 || cur == 400) {
+                        ah_diag("CR3-STALE watchdog: RpmRead64(gworld) FAIL streak=%d "
+                                "procCR3=0x%llX — CR3 likely stale after game relaunch",
+                                cur, (unsigned long long)procCR3);
+                    }
+                    if (cur >= 500) {
+                        ah_diag("CR3-STALE tripped: 500 consecutive translate FAIL — "
+                                "force re-attach, blacklist current eproc/pid for 60s");
+                        failed_attachments[failed_idx] = { eproc, attached_pid, now };
+                        failed_idx = (failed_idx + 1) & 3;
+                        attached_pid = 0;
+                        procCR3 = 0; eproc = 0; imageBase = 0;
+                        gworld_scan_state = 0;
+                        gworld_rva_live = AH_RVA_GWORLD;
+                        gworld_seen = FALSE;
+                        canary_seen = FALSE;
+                        last_find = 0;
+                        s_rpm_fail_streak = 0;
+                        continue;
+                    }
+                } else if (s_rpm_fail_streak > 0) {
+                    if (s_rpm_fail_streak >= 200) {
+                        ah_diag("CR3-STALE cleared: RpmRead64 recovered after streak=%d",
+                                s_rpm_fail_streak);
+                    }
+                    s_rpm_fail_streak = 0;
+                }
+            }
 
             // v0.9.455 game-gone watchdog. UAGame HWND is unreliable —
             // Steam-wrapper holds the window handle for 30-60 s after the game

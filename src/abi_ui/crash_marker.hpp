@@ -36,6 +36,9 @@ enum Reason : uint8_t {
     TERMINATE_HANDLER    = 13,
     SELFCHECK_INTEGRITY  = 14,
     SEH_UNHANDLED        = 15,
+    READER_AV_LIMIT      = 16,   // v1.0.27 — >20 consecutive AVs in reader tick
+    READER_BAD_ALLOC     = 17,   // v1.0.27 — std::bad_alloc in reader thread
+    READER_UNKNOWN_EXC   = 18,   // v1.0.27 — unknown C++ exception in reader
 };
 
 inline void marker_path(wchar_t out[MAX_PATH]) {
@@ -96,6 +99,9 @@ inline const char* reason_name(uint8_t r) {
         case TERMINATE_HANDLER:    return "std::terminate_handler";
         case SELFCHECK_INTEGRITY:  return "selfcheck::integrity_error";
         case SEH_UNHANDLED:        return "SEH::unhandled_exception";
+        case READER_AV_LIMIT:      return "reader::av_limit_exceeded";
+        case READER_BAD_ALLOC:     return "reader::std_bad_alloc";
+        case READER_UNKNOWN_EXC:   return "reader::unknown_exception";
         default:                   return "none";
     }
 }
