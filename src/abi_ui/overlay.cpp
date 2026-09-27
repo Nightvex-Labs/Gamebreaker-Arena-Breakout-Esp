@@ -16,6 +16,7 @@
 #include <chrono>
 #include <vector>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <string>
 #include <cstdint>
@@ -277,9 +278,57 @@ bool Overlay::init(int sw, int sh) {
         if (fopen_s(&f, p, "rb") == 0 && f) { fclose(f); return true; }
         return false;
     };
+    // Font path resolution — try three roots in order:
+    //   1) CWD-relative — ah_launcher.c sets CWD to the install folder before
+    //      spawning the child, so "assets\fonts\..." works for KoenFlow.
+    //   2) EXE-relative — the child overlay lives at %TEMP%\<hex>.exe; if the
+    //      launcher chain also drops fonts next to it (dev build, sidecar
+    //      staging), that path wins.
+    //   3) DH_INSTALL_DIR — the launcher exports this env var to the cage's
+    //      install folder even when it can't set CWD (elevated relaunch,
+    //      failed cage move). Guaranteed to point at where assets/ lives.
+    //   4) Absolute Windows fallback — kept as last resort so the overlay
+    //      still boots with Segoe UI if none of the above hold.
+    static char s_font_bufs[24][MAX_PATH];
+    static int  s_font_slot = 0;
+    auto join = [&](const char* base, const char* rel) -> const char* {
+        char* out = s_font_bufs[s_font_slot++ % 24];
+        _snprintf_s(out, MAX_PATH, _TRUNCATE, "%s\\%s", base, rel);
+        return out;
+    };
+    auto exe_dir = [&](char* out, DWORD cap) -> bool {
+        DWORD n = GetModuleFileNameA(nullptr, out, cap);
+        if (!n || n >= cap) return false;
+        char* slash = std::strrchr(out, '\\');
+        if (!slash) return false;
+        *slash = 0;
+        return true;
+    };
+    auto install_dir = [&](char* out, DWORD cap) -> bool {
+        DWORD n = GetEnvironmentVariableA("DH_INSTALL_DIR", out, cap);
+        return n > 0 && n < cap;
+    };
+    auto try_resolve = [&](const char* rel) -> const char* {
+        if (!rel) return nullptr;
+        // 1) CWD-relative — original behavior, works for correctly-caged installs.
+        if (exists_file(rel)) return rel;
+        // 2) EXE-relative.
+        char base[MAX_PATH];
+        if (exe_dir(base, MAX_PATH)) {
+            const char* p = join(base, rel);
+            if (exists_file(p)) return p;
+        }
+        // 3) DH_INSTALL_DIR-relative.
+        if (install_dir(base, MAX_PATH)) {
+            const char* p = join(base, rel);
+            if (exists_file(p)) return p;
+        }
+        return nullptr;
+    };
     auto pick_font = [&](const char* primary, const char* fb1, const char* fb2) -> const char* {
-        if (exists_file(primary)) return primary;
-        if (fb1 && exists_file(fb1)) return fb1;
+        if (const char* p = try_resolve(primary)) return p;
+        if (const char* p = try_resolve(fb1))     return p;
+        // Absolute Windows path — never subject to CWD/EXE/DH_INSTALL_DIR.
         return fb2;
     };
     // Read the font's own head/hhea tables and return line_height / em.
