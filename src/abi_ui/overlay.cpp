@@ -16,6 +16,7 @@
 #include <chrono>
 #include <thread>
 #include <string>
+#include <cstdint>
 #pragma comment(lib, "psapi.lib")
 
 #pragma comment(lib, "d3d11.lib")
@@ -378,23 +379,138 @@ static bool is_polaris_or_legacy_amd() {
     return legacy;
 }
 
+// v1.0.26 GPU probe — logs vendor/device/name of every adapter for triage.
+// Cheap, no side effects, no config change; only DXGI enum.
+static void log_gpu_adapters() {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        LOG("gpu_probe: CreateDXGIFactory1 FAILED — DXGI subsystem broken");
+        return;
+    }
+    IDXGIAdapter1* adapter = nullptr;
+    UINT idx = 0;
+    for (; factory->EnumAdapters1(idx, &adapter) != DXGI_ERROR_NOT_FOUND; ++idx) {
+        DXGI_ADAPTER_DESC1 d{};
+        if (SUCCEEDED(adapter->GetDesc1(&d))) {
+            char name8[128] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name8, sizeof(name8)-1, nullptr, nullptr);
+            LOG("gpu_probe: adapter[%u] vendor=0x%04x device=0x%04x rev=0x%04x flags=0x%x vram=%lluMB name=\"%s\"",
+                idx, d.VendorId, d.DeviceId, d.Revision, d.Flags,
+                (unsigned long long)(d.DedicatedVideoMemory / (1024ULL*1024ULL)), name8);
+        }
+        adapter->Release();
+    }
+    if (idx == 0) LOG("gpu_probe: NO adapters enumerated — headless / display-driver dead");
+    factory->Release();
+}
+
+// v1.0.26 marker layout — 16-byte header replacing empty touch-file.
+// Backwards-compatible: any file smaller than sizeof(WarpMarker) is treated as
+// legacy touch (created_ft=0, warp_fail_count=0 → HW retry eligible).
+#pragma pack(push, 1)
+struct WarpMarker {
+    uint32_t magic;              // 'AWMK' (0x4B4D5741 LE)
+    uint32_t warp_fail_count;    // number of WARP init failures with marker present
+    uint64_t created_ft;         // FILETIME 100ns UTC when marker first dropped
+};
+#pragma pack(pop)
+static_assert(sizeof(WarpMarker) == 16, "WarpMarker size drift");
+
+static const uint32_t WARP_MARKER_MAGIC = 0x4B4D5741; // 'AWMK'
+static const uint64_t WARP_MARKER_TTL_100NS = 72ULL * 3600ULL * 10000000ULL; // 72h
+static const uint32_t WARP_MARKER_MAX_FAILS = 3;
+
+static bool read_warp_marker(const wchar_t* path, WarpMarker* out) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, out, sizeof(*out), &got, nullptr);
+    CloseHandle(h);
+    return ok && got == sizeof(*out) && out->magic == WARP_MARKER_MAGIC;
+}
+
+static void write_warp_marker(const wchar_t* path, const WarpMarker* m) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, m, sizeof(*m), &wrote, nullptr);
+    CloseHandle(h);
+}
+
+static uint64_t filetime_now_100ns() {
+    FILETIME ft{}; GetSystemTimeAsFileTime(&ft);
+    return ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
 bool Overlay::create_d3d() {
+    // v1.0.26 rewritten WARP-marker logic with TTL + fail-count.
+    //
     // Fallback ladder — driver crashes on some AMD legacy configs bypass SEH
     // via RaiseFailFastException / TerminateProcess from the driver DLL side,
-    // so a first-time try can be uncatchable. Two mechanisms combined:
+    // so a first-time try can be uncatchable. Three-layer defense:
     //   1. Known-bad GPU detection — skip HW on RX 4xx/5x0 series (AMD legacy
     //      driver branch, always crashes on 25H2 26200.8875+).
-    //   2. Persistent marker file — if HW attempt died last launch, next launch
-    //      sees the file and goes straight to WARP even on unknown-GPU rigs.
+    //   2. Persistent marker file with 72h TTL — if HW attempt died last launch,
+    //      next launch (within 72h) sees the file and goes straight to WARP.
+    //      After 72h expires we retry HW (driver may have been updated).
+    //   3. WARP fail-counter — if WARP itself fails ≥3 times with marker set,
+    //      the marker is deleted so next launch retries HW (WARP-only mode
+    //      isn't helping this rig — better to try HW again than stay locked).
+    log_gpu_adapters();
+
     static const wchar_t* PREFER_WARP_FLAG = L"C:\\ProgramData\\.abi_gpu_warp_only";
-    bool prefer_warp = (GetFileAttributesW(PREFER_WARP_FLAG) != INVALID_FILE_ATTRIBUTES);
+    WarpMarker mk{};
+    bool marker_present = false;
+    bool marker_valid = false;
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        marker_present = GetFileAttributesExW(PREFER_WARP_FLAG, GetFileExInfoStandard, &fad) != 0;
+        if (marker_present) {
+            if (read_warp_marker(PREFER_WARP_FLAG, &mk)) {
+                marker_valid = true;
+                LOG("create_d3d: marker present magic=OK fails=%u created_ft=0x%016llx",
+                    mk.warp_fail_count, (unsigned long long)mk.created_ft);
+            } else {
+                // Legacy empty file — synthesize marker with created_ft from filetime.
+                mk.magic = WARP_MARKER_MAGIC;
+                mk.warp_fail_count = 0;
+                mk.created_ft = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32)
+                              | fad.ftLastWriteTime.dwLowDateTime;
+                marker_valid = true;
+                LOG("create_d3d: marker present (legacy touch) — upgraded, created_ft=0x%016llx",
+                    (unsigned long long)mk.created_ft);
+            }
+        }
+    }
+
+    bool prefer_warp = marker_valid;
+
+    // TTL: marker older than 72h → invalidate, retry HW.
+    if (prefer_warp) {
+        uint64_t now = filetime_now_100ns();
+        if (mk.created_ft && now > mk.created_ft && (now - mk.created_ft) > WARP_MARKER_TTL_100NS) {
+            LOG("create_d3d: marker EXPIRED (>72h old) — deleting, retry HW");
+            DeleteFileW(PREFER_WARP_FLAG);
+            prefer_warp = false;
+        }
+    }
+
+    // Fail-cap: WARP failed ≥3 times with marker set → marker is not helping.
+    if (prefer_warp && mk.warp_fail_count >= WARP_MARKER_MAX_FAILS) {
+        LOG("create_d3d: marker fail_count=%u exceeds cap %u — WARP-only mode not helping, deleting marker",
+            mk.warp_fail_count, WARP_MARKER_MAX_FAILS);
+        DeleteFileW(PREFER_WARP_FLAG);
+        prefer_warp = false;
+    }
+
     // v0.9.428: Polaris HW-driver crash only reproduces on Win 11 25H2
     // (build 26200+).  On older Windows (Win 10 22H2 / Win 11 22H2 / 24H2)
     // the legacy AMD driver works fine and WARP causes visible ESP lag.
     // Only force WARP when we're on 25H2+ AND the GPU is Polaris.
     if (!prefer_warp && is_polaris_or_legacy_amd()) {
         typedef LONG(WINAPI *pfnRtlGetVersion)(PRTL_OSVERSIONINFOW);
-        // v0.9.472 A7: hash-based lookup.
         pfnRtlGetVersion pGV = api::resolve<pfnRtlGetVersion>(
             api::NTDLL, api::hash("RtlGetVersion"));
         RTL_OSVERSIONINFOW ov{sizeof(ov)};
@@ -406,21 +522,19 @@ bool Overlay::create_d3d() {
             LOG("create_d3d: Polaris on non-25H2 build — attempting HW (driver bug is 25H2-only)");
         }
     }
-    LOG("create_d3d: prefer_warp=%d", prefer_warp ? 1 : 0);
+    LOG("create_d3d: prefer_warp=%d marker_present=%d marker_valid=%d",
+        prefer_warp ? 1 : 0, marker_present ? 1 : 0, marker_valid ? 1 : 0);
 
     D3D_FEATURE_LEVEL fl = (D3D_FEATURE_LEVEL)0;
     const D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
     HRESULT hr = E_FAIL;
 
     if (!prefer_warp) {
-        // Drop a "we're about to try HW" marker. If this launch dies inside
-        // D3D11CreateDevice HW, next launch sees the marker → skips HW.
-        // On successful HW init we DELETE the marker below.
-        HANDLE marker = CreateFileW(PREFER_WARP_FLAG,
-                                     GENERIC_WRITE, 0, nullptr,
-                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (marker != INVALID_HANDLE_VALUE) CloseHandle(marker);
-        LOG("create_d3d: marker dropped; attempt HARDWARE + BGRA_SUPPORT");
+        // Drop a "we're about to try HW" marker with fresh timestamp + 0 fails.
+        WarpMarker fresh{ WARP_MARKER_MAGIC, 0, filetime_now_100ns() };
+        write_warp_marker(PREFER_WARP_FLAG, &fresh);
+        mk = fresh;
+        LOG("create_d3d: marker dropped (fresh, 16B); attempt HARDWARE + BGRA_SUPPORT");
         __try {
             hr = D3D11CreateDevice(
                 nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -436,12 +550,14 @@ bool Overlay::create_d3d() {
         }
 
         if (SUCCEEDED(hr)) {
-            // HW worked — drop the marker so next launch tries HW again.
+            // HW worked — clear marker so next launch tries HW again.
             DeleteFileW(PREFER_WARP_FLAG);
             LOG("create_d3d: HW OK, marker cleared");
         }
     } else {
-        LOG("create_d3d: SKIPPING HW attempt — prior launch marked this system WARP-only");
+        LOG("create_d3d: SKIPPING HW attempt — marker still valid (fails=%u age=%llums)",
+            mk.warp_fail_count,
+            (unsigned long long)((filetime_now_100ns() - mk.created_ft) / 10000ULL));
     }
 
     // WARP fallback — Microsoft software rasterizer, always works on Win ≥ 8.
@@ -456,8 +572,25 @@ bool Overlay::create_d3d() {
                 &d3d_device_, &fl, &d3d_ctx_);
             LOG("create_d3d: WARP returned hr=0x%08lx featureLevel=0x%04x", hr, (unsigned)fl);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            LOG("create_d3d: WARP crashed (impossible) code=0x%08lx", GetExceptionCode());
+            LOG("create_d3d: WARP crashed code=0x%08lx", GetExceptionCode());
             hr = E_FAIL;
+        }
+
+        if (SUCCEEDED(hr)) {
+            // WARP succeeded — reset fail_count on the marker (but keep marker,
+            // HW is still known-bad).  Only relevant if marker already existed.
+            if (prefer_warp && mk.warp_fail_count > 0) {
+                mk.warp_fail_count = 0;
+                write_warp_marker(PREFER_WARP_FLAG, &mk);
+                LOG("create_d3d: WARP OK, fail_count reset to 0");
+            }
+        } else if (prefer_warp) {
+            // WARP failed WITH marker set → increment fail count.
+            // On third failure the marker is auto-deleted next launch (checked above).
+            mk.warp_fail_count++;
+            write_warp_marker(PREFER_WARP_FLAG, &mk);
+            LOG("create_d3d: WARP FAILED with marker set — fail_count now %u (cap %u; auto-delete triggers at cap+1 next launch)",
+                mk.warp_fail_count, WARP_MARKER_MAX_FAILS);
         }
     }
 
