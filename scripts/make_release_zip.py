@@ -216,20 +216,12 @@ def main() -> int:
         n_bins += 1
     print(f"[pack] included {n_bins} driver .bin payloads under db/")
 
-    # v1.0.21: sidecar DLLs required at overlay runtime (dynamic imports the
-    # overlay can't do without). Gamebreaker links freetype.dll for HiDPI
-    # font rasterization. If present in deps/freetype/lib/, ship it next to
-    # WinRuntimeHost.exe — the stub copies it to %TEMP% alongside the
-    # decrypted child so the loader resolves the import at spawn.
-    sidecars = [ROOT / "deps" / "freetype" / "lib" / "freetype.dll"]
-    n_side = 0
-    for sc in sidecars:
-        if sc.exists():
-            shutil.copyfile(sc, stage / sc.name)
-            n_side += 1
-            print(f"[pack] included sidecar DLL: {sc.name} ({sc.stat().st_size:,} B)")
-    if n_side == 0:
-        print(f"[pack] no sidecar DLLs (arenahack-style build)")
+    # v1.0.22: freetype is statically linked (deps/freetype/lib/freetype.lib
+    # is the 4.5 MB static archive v2.13.3, ABI-matched to the headers). No
+    # DLL sidecar is required — leave the sidecar list empty for future use.
+    sidecars = []
+    if not sidecars:
+        print(f"[pack] no sidecar DLLs (static-link build)")
 
     payload = OVERLAY_EXE.read_bytes()
     print(f"[pack] overlay:  {len(payload):>10,} B  sha256 {hashlib.sha256(payload).hexdigest()[:16]}...")

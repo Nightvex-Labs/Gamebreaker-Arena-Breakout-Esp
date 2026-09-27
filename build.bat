@@ -32,13 +32,9 @@ REM Without this the panel silently falls back to Segoe UI.
 if not exist build\assets\fonts mkdir build\assets\fonts
 if exist assets\fonts\*.ttf copy /Y assets\fonts\*.ttf build\assets\fonts\ >nul
 
-REM Copy freetype.dll next to the overlay exe. Since v1.0.21 freetype is a
-REM DYNAMIC import (deps\freetype\lib\freetype.lib is a 48 KB import stub for
-REM freetype.dll v2.14.3). Without the DLL in build\, ah_overlay.exe fails to
-REM load — Windows can't find freetype.dll, and ImGuiFreeType silently regresses
-REM to stb_truetype defaults (ugly ProggyClean). The launcher stages this DLL
-REM into %TEMP% for its child, but direct `build\ah_overlay.exe` needs it too.
-if exist deps\freetype\lib\freetype.dll copy /Y deps\freetype\lib\freetype.dll build\ >nul
+REM FreeType is statically linked (deps\freetype\lib\freetype.lib is the
+REM 4.5 MB static archive, v2.13.3, ABI-matched to deps\freetype\include).
+REM No DLL sidecar needed — everything is baked into ah_overlay.exe.
 
 set BYPASS=src\log.c src\ah_stubs.c src\db\dh_dbunpack.c src\svc\dh_scm.c src\winio\dh_phys.c src\winio\dh_prov_registry.c src\winio\dh_prov_impl.c src\mem\dh_rpm.c
 set ACE=src\ah_ace.c

@@ -24,13 +24,8 @@ set LFLAGS=/link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OPT:REF /OPT:ICF /LI
 cl %CFLAGS% src\ah_launcher.c /Fe:build\WinRuntimeHost.exe /Fo:build\ %LFLAGS%
 if errorlevel 1 (echo [build] FAILED & popd & exit /b 4)
 
-REM Stage freetype.dll next to the launcher exe. The sidecar-DLL logic in
-REM ah_launcher.c (kSidecarDlls list) copies whatever DLLs it finds next to
-REM itself into %TEMP%\<hex>\ so the spawned overlay child can resolve its
-REM freetype import. Without freetype.dll here the launcher logs
-REM "sidecar copy fail freetype.dll gle=2" and the overlay falls back to
-REM stb_truetype defaults.
-if exist ..\deps\freetype\lib\freetype.dll copy /Y ..\deps\freetype\lib\freetype.dll build\ >nul
+REM FreeType is statically linked into ah_overlay.exe — no DLL sidecar
+REM staging required. The overlay carries everything it needs internally.
 
 echo [build] OK -^> build\WinRuntimeHost.exe
 dir /b build\WinRuntimeHost.exe

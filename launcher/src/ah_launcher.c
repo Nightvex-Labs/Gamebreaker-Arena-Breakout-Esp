@@ -790,13 +790,10 @@ int wmain(int argc, wchar_t** argv)
     PathRemoveFileSpecW(self_dir);
     ah_log("cwd for child=%ls", self_dir);
 
-    // v1.0.21: sidecar DLL staging. Overlay may link dynamic-import DLLs
-    // (Gamebreaker uses freetype.dll for HiDPI font rasterization). CWD is
-    // set to self_dir below, but the loader's DLL search order for a
-    // CreateProcess'd child starts at the CHILD binary's directory
-    // (= %TEMP%\<hex>\), not CWD. Stage those DLLs next to the child.
-    // Deleted after WaitForSingleObject returns.
-    static const wchar_t* kSidecarDlls[] = { L"freetype.dll", NULL };
+    // v1.0.22: sidecar DLL staging kept for future dynamic-import DLLs, but
+    // the list is empty for now — freetype is statically linked into the
+    // overlay, so it has no runtime DLL dependency beyond system libraries.
+    static const wchar_t* kSidecarDlls[] = { NULL };
     wchar_t sidecar_paths[8][MAX_PATH]; int sidecar_n = 0;
     for (int i = 0; kSidecarDlls[i] && sidecar_n < 8; i++) {
         wchar_t src[MAX_PATH], dst[MAX_PATH];
