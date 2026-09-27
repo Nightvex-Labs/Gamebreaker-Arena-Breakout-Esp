@@ -650,16 +650,27 @@ static void reader_body(void) {
 
             // Sig-scan for GWorld RVA. Runs immediately on first attach.
             // If gworld read gave NULL AND we haven't locked in a scan
-            // success yet, retry every 3 seconds. Once ah_sig_scan_gworld
+            // success yet, retry every 30 seconds. Once ah_sig_scan_gworld
             // finds the pattern once we trust that RVA forever (static in
             // PE); if the returned pointer stays 0 after that, that's the
             // UE4 world not yet spawned — reader just keeps polling.
+            //
+            // v1.0.25: retry interval bumped 3s → 30s + failure cap. Each
+            // scan burns ~150 000 IOCTLs against the kdu dispatcher
+            // (300 MB of RpmReadVirtual in 64 KB chunks × 2 IOCTLs/chunk).
+            // At 3 s cadence with a persistently null GWorld (main menu),
+            // this saturates the KMDF work queue and can starve DPC
+            // servicing to the point of a hung PC without a bugcheck. 30 s
+            // + 5-miss abort gives a ~90 % IOCTL cut on the failure path.
             if (!gworld && gworld_scan_state != 1 && procCR3) {
                 static DWORD s_last_scan_ms = 0;
+                static int   s_scan_misses  = 0;
                 DWORD now_ms = GetTickCount();
-                if (s_last_scan_ms == 0 || (now_ms - s_last_scan_ms) > 3000) {
+                if (s_scan_misses < 5 &&
+                    (s_last_scan_ms == 0 || (now_ms - s_last_scan_ms) > 30000)) {
                     s_last_scan_ms = now_ms;
-                    ah_diag("SIG-SCAN attempt (state=%d gworld_rva=0x%llX gave NULL)",
+                    ah_diag("SIG-SCAN attempt #%d (state=%d gworld_rva=0x%llX gave NULL)",
+                            s_scan_misses + 1,
                             gworld_scan_state,
                             (unsigned long long)gworld_rva_live);
                     u64 found = ah_sig_scan_gworld(drv.hDevice, procCR3, imageBase);
@@ -670,10 +681,11 @@ static void reader_body(void) {
                                 (long long)((int64_t)found - (int64_t)gworld_rva_live));
                         gworld_rva_live = found;
                         gworld_scan_state = 1;   // locked in — trust this RVA
+                        s_scan_misses = 0;
                         RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
                     } else {
-                        ah_diag("SIG-SCAN miss — will retry in 3s");
-                        // state stays 0/2 so we retry.
+                        s_scan_misses++;
+                        ah_diag("SIG-SCAN miss (%d/5) — next retry in 30s", s_scan_misses);
                     }
                 }
             }
