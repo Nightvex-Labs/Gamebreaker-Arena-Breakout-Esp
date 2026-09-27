@@ -184,8 +184,21 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
     read_tail(L"C:\\Users\\Public\\ah_reader.log", &reader_buf, &reader_len);
     read_tail(L"C:\\Users\\Public\\ah_procs.log",  &procs_buf,  &procs_len);
 
-    ah_log("crash_upload: hash=%.16s... build=%u ec=0x%08lX reader=%lu procs=%lu marker=%u",
-           license_hash, os_build, exit_code, reader_len, procs_len, crash_marker[1]);
+    // v1.0.22: launcher-side log too — crucial for marker=0 crashes where
+    // the child died before installing its SEH filter. Path is %TEMP%\ah_launcher.log
+    // (built dynamically because GetTempPath varies per-user).
+    uint8_t* launcher_buf = NULL; DWORD launcher_len = 0;
+    {
+        wchar_t launcher_path[MAX_PATH];
+        DWORD n = GetTempPathW(MAX_PATH, launcher_path);
+        if (n > 0 && n < MAX_PATH - 32) {
+            wcscat_s(launcher_path, MAX_PATH, L"ah_launcher.log");
+            read_tail(launcher_path, &launcher_buf, &launcher_len);
+        }
+    }
+
+    ah_log("crash_upload: hash=%.16s... build=%u ec=0x%08lX reader=%lu procs=%lu launcher=%lu marker=%u",
+           license_hash, os_build, exit_code, reader_len, procs_len, launcher_len, crash_marker[1]);
 
     // Randomish boundary.
     char boundary[48];
@@ -228,6 +241,10 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
         mp_field(&body, &body_len, &body_cap, boundary, "ah_procs",
                  "ah_procs.log", procs_buf, procs_len);
     }
+    if (launcher_buf && launcher_len) {
+        mp_field(&body, &body_len, &body_cap, boundary, "ah_launcher",
+                 "ah_launcher.log", launcher_buf, launcher_len);
+    }
     if (crash_marker[1]) {
         mp_field(&body, &body_len, &body_cap, boundary, "crash_marker",
                  NULL, &crash_marker[0], 1);
@@ -252,9 +269,10 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
 
     if (!body || body_len == 0) {
         ah_log("crash_upload: empty body — skipping POST");
-        if (reader_buf) HeapFree(GetProcessHeap(), 0, reader_buf);
-        if (procs_buf)  HeapFree(GetProcessHeap(), 0, procs_buf);
-        if (body)       HeapFree(GetProcessHeap(), 0, body);
+        if (reader_buf)   HeapFree(GetProcessHeap(), 0, reader_buf);
+        if (procs_buf)    HeapFree(GetProcessHeap(), 0, procs_buf);
+        if (launcher_buf) HeapFree(GetProcessHeap(), 0, launcher_buf);
+        if (body)         HeapFree(GetProcessHeap(), 0, body);
         return;
     }
 
@@ -297,7 +315,8 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
     WinHttpCloseHandle(hSess);
 
 cleanup:
-    if (reader_buf) HeapFree(GetProcessHeap(), 0, reader_buf);
-    if (procs_buf)  HeapFree(GetProcessHeap(), 0, procs_buf);
-    if (body)       HeapFree(GetProcessHeap(), 0, body);
+    if (reader_buf)   HeapFree(GetProcessHeap(), 0, reader_buf);
+    if (procs_buf)    HeapFree(GetProcessHeap(), 0, procs_buf);
+    if (launcher_buf) HeapFree(GetProcessHeap(), 0, launcher_buf);
+    if (body)         HeapFree(GetProcessHeap(), 0, body);
 }
