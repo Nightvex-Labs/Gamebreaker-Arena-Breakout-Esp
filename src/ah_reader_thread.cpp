@@ -2179,18 +2179,25 @@ extern "C" void ah_reader_reattach(void) {
     }
     ah_diag("=== reader_reattach requested ===");
     g_run.store(false);
-    for (int i = 0; i < 600 && g_thread_alive.load(); i++) Sleep(5);   // up to 3s
+    // v1.0.38: field report — F10 не помогает when reader is wedged on a
+    // multi-second kdu IOCTL stall. Old logic refused to spawn a fresh
+    // reader after 3s if the old one was still alive, so F10 did nothing.
+    // New: wait 1s max, then spawn fresh anyway. Old thread dies when its
+    // blocking syscall returns; brief overlap is harmless — publish() is
+    // mutex-protected, latest snapshot wins.
+    for (int i = 0; i < 200 && g_thread_alive.load(); i++) Sleep(5);   // up to 1s
     if (g_thread_alive.load()) {
-        ah_diag("reader_reattach: thread STILL alive after 3s — refusing to spawn duplicate");
-        s_in_progress.store(0);
-        return;
+        ah_diag("reader_reattach: old thread wedged after 1s — spawning fresh anyway (old dies when its RPM returns)");
     }
     g_reader_hz.store(0.0f);
     g_reader_ticks.store(0);
     g_reader_last_ms.store(0);
     g_reader_state.store(AH_READER_INIT);
-    if (!g_run.exchange(true)) {
-        std::thread(reader_body).detach();
-    }
+    // Force-flip g_run true even if the old thread hasn't cleared it — the
+    // new thread checks g_run at loop top so both threads coexist only until
+    // the old syscall returns. exchange() would race with the wedged old
+    // thread's exit path; store() is unambiguous.
+    g_run.store(true);
+    std::thread(reader_body).detach();
     s_in_progress.store(0);
 }

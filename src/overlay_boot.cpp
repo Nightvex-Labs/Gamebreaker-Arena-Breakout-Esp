@@ -200,10 +200,20 @@ extern "C" int AhOverlayRun(void) {
         // scene_type from +0x579). Roomid can lag behind actual raid enter on
         // slow server-room-assign; scene_type flips first. Values from the
         // Dumper-7 4.26.1 ABInfinite EGameSceneType enum: 2=InBattle (raid),
-        // 4=ShootingRoom (test range). Still gated on reader LIVE so we don't
-        // flash in-raid during ABI loading transitions.
+        // 4=ShootingRoom (test range).
+        //
+        // v1.0.38: field logs (crash-upload 4f0e2ccc) show some user builds
+        // reading scene_type=75/85/255 — either an extended enum on that
+        // build channel or a stale offset. Reader still latches ent_n=13+
+        // with in_raid=1 momentarily then loses it as scene_type flickers.
+        // Add ent_n>=4 fallback so consistent enemy stream = raid regardless
+        // of scene_type/roomid interpretation. 4 not 1 to avoid tripping on
+        // menu/loading previews that leave 1-2 preview pawns visible.
         stub_snap.in_raid =
-            ((live.roomid != 0) || (live.scene_type == 2) || (live.scene_type == 4))
+            ((live.roomid != 0)
+             || (live.scene_type == 2)
+             || (live.scene_type == 4)
+             || (live.ent_n >= 4))
             && (_reader_st == AH_READER_LIVE);
         stub_snap.cam.x   = live.x;
         stub_snap.cam.y   = live.y;
