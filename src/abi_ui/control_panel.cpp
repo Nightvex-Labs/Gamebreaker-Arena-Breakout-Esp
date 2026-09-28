@@ -78,13 +78,12 @@ namespace {
 
 struct EspView {
     bool*  enable;
-    bool*  box;      bool* skeleton; bool* name;   bool* team;  bool* health;
+    bool*  box;      bool* name;     bool* team;   bool* health;
     bool*  weapon;   bool* ammo;     bool* armor;  bool* distance;
     int*   box_style;       // 0 = 2D, 1 = 3D
     int*   armor_display;   // 0 = Text, 1 = Bar
     int*   box_distance;
-    int*   skeleton_distance;
-    ImU32* col_box;  ImU32* col_skeleton; ImU32* col_name;   ImU32* col_team;
+    ImU32* col_box;    ImU32* col_name;   ImU32* col_team;
     ImU32* col_health; ImU32* col_weapon; ImU32* col_ammo;   ImU32* col_distance;
     ImU32* armor_tier;      // [6]
 };
@@ -104,7 +103,6 @@ struct EspShadows {
     int   box_style_shadow      = 1; // 0=2D, 1=3D
     int   armor_display_shadow  = 1; // 0=Text, 1=Bar
     int   box_distance          = 200;
-    int   skeleton_distance     = 100;
 };
 static EspShadows s_pmc_shadow;
 static EspShadows s_bot_shadow;
@@ -114,7 +112,6 @@ EspView esp_view(RenderConfig& c, bool bots) {
     EspView v{};
     v.enable   = &sh.enable;
     v.box      = bots ? &c.show_box_bot      : &c.show_box_pmc;
-    v.skeleton = bots ? &c.show_skeleton_bot : &c.show_skeleton_pmc;
     v.name     = bots ? &c.show_bot_name     : &c.show_name;
     v.team     = bots ? &sh.team_bots        : &c.show_team_id;
     v.health   = bots ? &sh.health_bots      : &c.show_hp;
@@ -125,9 +122,7 @@ EspView esp_view(RenderConfig& c, bool bots) {
     v.box_style         = &sh.box_style_shadow;
     v.armor_display     = &sh.armor_display_shadow;
     v.box_distance      = &sh.box_distance;
-    v.skeleton_distance = &sh.skeleton_distance;
     v.col_box      = bots ? &c.col_box_bot      : &c.col_box_pmc;
-    v.col_skeleton = bots ? &c.col_skel_bot     : &c.col_skel_pmc;
     v.col_name     = bots ? &c.col_name_bot     : &c.col_name_pmc;
     v.col_team     = &c.col_team;
     v.col_health   = &sh.col_health;
@@ -141,9 +136,7 @@ EspView esp_view(RenderConfig& c, bool bots) {
 // Copy float ranges + mode → int shadows, so slider_row / segmented see int*.
 void pre_sync(RenderConfig& c) {
     s_pmc_shadow.box_distance      = (int)c.pmc_range_m;
-    s_pmc_shadow.skeleton_distance = (int)c.skeleton_range_m;
     s_bot_shadow.box_distance      = (int)c.bot_range_m;
-    s_bot_shadow.skeleton_distance = (int)c.bot_skeleton_range_m;
 
     // box_mode: 0=off,2=2D,3=3D → box_style 0/1 (author has no Off).
     s_pmc_shadow.box_style_shadow = (c.box_mode     == 3) ? 1 : 0;
@@ -154,10 +147,10 @@ void pre_sync(RenderConfig& c) {
     s_bot_shadow.armor_display_shadow = (c.armor_display == 2) ? 1 : 0;
 
     // Master enable: mirror of at-least-one-child.
-    s_pmc_shadow.enable = c.show_box_pmc || c.show_skeleton_pmc || c.show_name ||
+    s_pmc_shadow.enable = c.show_box_pmc || c.show_name ||
                            c.show_team_id || c.show_hp || c.show_weapon ||
                            c.show_ammo || c.show_armor || c.show_distance;
-    s_bot_shadow.enable = c.show_box_bot || c.show_skeleton_bot || c.show_bot_name ||
+    s_bot_shadow.enable = c.show_box_bot || c.show_bot_name ||
                            c.show_bot_weapon || c.show_bot_ammo || c.show_bot_armor ||
                            c.show_bot_distance;
 }
@@ -165,9 +158,7 @@ void pre_sync(RenderConfig& c) {
 // Write UI-mutated shadows back to the flat config.
 void post_sync(RenderConfig& c) {
     c.pmc_range_m         = (float)s_pmc_shadow.box_distance;
-    c.skeleton_range_m    = (float)s_pmc_shadow.skeleton_distance;
     c.bot_range_m         = (float)s_bot_shadow.box_distance;
-    c.bot_skeleton_range_m= (float)s_bot_shadow.skeleton_distance;
 
     // Preserve Off (0) if user hasn't toggled the row; otherwise adopt style.
     if (c.box_mode     != 0) c.box_mode     = (s_pmc_shadow.box_style_shadow == 1) ? 3 : 2;
@@ -323,7 +314,7 @@ enum Page { PG_PLAYERS = 0, PG_BOTS, PG_RADAR, PG_OVERLAY, PG_LOOT, PG_SETTINGS 
 
 enum ModalKind {
     MK_NONE = 0,
-    MK_BOX, MK_SKELETON, MK_NAME, MK_TEAM, MK_HEALTH,
+    MK_BOX, MK_NAME, MK_TEAM, MK_HEALTH,
     MK_WEAPON, MK_AMMO, MK_ARMOR, MK_DISTANCE, MK_CORPSES,
     MK_PREFIRE,   // только настройки: пресеты + Grace duration
     MK_TOPLOOT,   // только настройки: List size + Top loot range
@@ -913,54 +904,6 @@ void draw_box(float fx, float fy, ImU32 col, bool three_d, bool corners) {
     }
 }
 
-// Скелет (TZ §8). Кольцо головы + шея + 13 линий + 15 узлов (внешний r4.5 /
-// внутренний r1.6, всё в единицах viewBox → ×масштаб).
-// `joints` и `head_ring` повторяют cfg.skeleton_joints / cfg.head_circle,
-// чтобы превью гасило ровно то же, что гаснет в рейде.
-void draw_skeleton(float fx, float fy, ImU32 col, bool joints, bool head_ring) {
-    const float TH = 2.0f;
-    ImU32 glow = (col & 0x00FFFFFF) | (70u << 24);
-    auto S = [&](float vx, float vy) { return SV(fx, fy, vx, vy); };
-    auto line = [&](float ax, float ay, float bx, float by) {
-        g.dl->AddLine(S(ax, ay), S(bx, by), glow, TH + 2.5f);
-        g.dl->AddLine(S(ax, ay), S(bx, by), col, TH);
-    };
-
-    // Голова: круг r14 в (110,28); шея 110,42 → 110,53.
-    if (head_ring) {
-        ImVec2 hc = S(110, 28);
-        float hr = 14.0f * kVbX;
-        g.dl->AddCircle(hc, hr + 1.2f, glow, 32, TH + 2.0f);
-        g.dl->AddCircle(hc, hr, col, 32, TH);
-    }
-    line(110, 42, 110, 53);
-
-    // 13 линий тела.
-    line(110, 53, 110, 120);                       // позвоночник
-    line(110, 53, 84, 61);  line(110, 53, 135, 61); // ключицы
-    line(84, 61, 74, 100);  line(74, 100, 66, 143); // левая рука
-    line(135, 61, 145, 100);line(145, 100, 151, 143);// правая рука
-    line(110, 120, 96, 138);line(110, 120, 122, 138);// таз→бёдра
-    line(96, 138, 87, 208); line(87, 208, 81, 267); // левая нога
-    line(122, 138, 131, 208);line(131, 208, 137, 267);// правая нога
-
-    // 15 узлов: внешний r4.5 (fill 11,15,14,.85 + stroke col), внутренний r1.6 белый.
-    const float rO = 4.5f * kVbX, rI = 1.6f * kVbX;
-    const ImU32 fillO = P::SKEL_NODE;
-    const float N[15][2] = {
-        {110,53},{110,82},{84,61},{135,61},{74,100},{145,100},{66,143},{151,143},
-        {110,120},{96,138},{122,138},{87,208},{131,208},{81,267},{137,267}
-    };
-    if (joints) {
-        for (auto& n : N) {
-            ImVec2 p = S(n[0], n[1]);
-            g.dl->AddCircleFilled(p, rO, fillO, 16);
-            g.dl->AddCircle(p, rO, col, 16, TH);
-            g.dl->AddCircleFilled(p, rI, IM_COL32(255, 255, 255, 255), 12);
-        }
-    }
-}
-
 void draw_esp_preview(float x, float y, float w, float h, RenderConfig& cfg) {
     // TZ §7: preview panel bg #0E0E11, border .08, radius 16, padding 20 22.
     card_inset(ImVec2(x, y), ImVec2(x + w, y + h), C_INSET, C_LINE, 14.0f);
@@ -1007,10 +950,8 @@ void draw_esp_preview(float x, float y, float w, float h, RenderConfig& cfg) {
     }
     g.dl->PopClipRect();
 
-    // Box + skeleton — exact viewBox coordinates.
-    if (on && *e.box)      draw_box(fx, fy, *e.col_box, *e.box_style == 1, cfg.box_corners);
-    if (on && *e.skeleton) draw_skeleton(fx, fy, *e.col_skeleton,
-                                         cfg.skeleton_joints, cfg.head_circle);
+    // Box — exact viewBox coordinates.
+    if (on && *e.box) draw_box(fx, fy, *e.col_box, *e.box_style == 1, cfg.box_corners);
 
     // ── Name + TEAM pill (TZ §4): one centred row, gap 9. Pill = outline only.
     const char* nick = st.esp_show_bots ? "Scav Raider" : "Nightreaper_07";
@@ -1211,10 +1152,6 @@ void modal_settings_body(float x, float& y, float w, RenderConfig& cfg) {
                           e.box_distance, 0, 400, " m", 10);
         break;
     }
-    case MK_SKELETON:
-        y += modal_slider(x, y, w, T("Skeleton distance","Дистанция скелета"),
-                          e.skeleton_distance, 0, 400, " m", 10);
-        break;
     case MK_ARMOR: {
         const char* disp[2] = { T("Text","Текст"), T("Bar","Полоса") };
         y += modal_seg(x, y, w, T("Display","Отображение"), disp, 2, e.armor_display);
@@ -1394,7 +1331,6 @@ float modal_body_height(RenderConfig& cfg) {
     if (m.tab == 0 && m.has_settings) {
         switch (m.kind) {
         case MK_BOX:      return 54.0f + 16.0f + 37.0f;   // seg + gap + slider
-        case MK_SKELETON: return 37.0f;
         case MK_ARMOR:    return 54.0f;                   // seg
         case MK_CORPSES:  return 37.0f;
         case MK_PREFIRE:  return 54.0f + 16.0f + 37.0f;   // presets + slider
@@ -1591,10 +1527,10 @@ void page_visuals(float x, float y, float w, float h, RenderConfig& cfg, bool bo
                                        : T("Player rendering","Отрисовка игроков"),
                                   e.enable, nullptr, false, true);
         if (r.toggled && !*e.enable) {
-            *e.box = *e.skeleton = *e.name = *e.team = *e.health =
+            *e.box = *e.name = *e.team = *e.health =
             *e.weapon = *e.ammo = *e.armor = *e.distance = false;
         } else if (r.toggled && *e.enable) {
-            *e.box = *e.skeleton = *e.name = *e.health = true;
+            *e.box = *e.name = *e.health = true;
         }
     }
     bool en = *e.enable;
@@ -1646,7 +1582,7 @@ void page_visuals(float x, float y, float w, float h, RenderConfig& cfg, bool bo
         const Item& it = items[ii];
         RowResult r = setting_row(x, cy, list_w, it.icon, it.title, it.sub,
                                   it.on, it.col, it.gear, it.global ? true : en);
-        bool has_settings = (it.kind == MK_BOX || it.kind == MK_SKELETON ||
+        bool has_settings = (it.kind == MK_BOX ||
                              it.kind == MK_ARMOR || it.kind == MK_CORPSES);
         if (r.color_clicked) open_modal(it.title, it.kind, it.col, has_settings);
         if (r.gear_clicked)  { open_modal(it.title, it.kind, it.col, true); st.modal.tab = 0; }

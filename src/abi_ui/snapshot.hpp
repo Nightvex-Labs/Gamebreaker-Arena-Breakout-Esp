@@ -8,10 +8,6 @@ namespace abi {
 
 struct Vec3 { float x{}, y{}, z{}; };
 
-struct Bone { float x{}, y{}, z{}; };
-
-struct LimbHp { float base{}, cur{}; };
-
 struct Entity {
     uint64_t a{};                         // pawn addr
     std::string cls;                      // "USER" / "PMC" / "BOT_PRIMARY" etc
@@ -43,9 +39,6 @@ struct Entity {
     int   mag_max{-1};                    // mag capacity (MaxStackCount)
     float last_render{-1.0f};             // mesh+0x2F0
     float hp_dir{-1.0f};                  // direct HP float from Char+0x1B54
-    std::unordered_map<std::string, Bone> bones;          // "head" -> Bone (world coords at bone_anchor_pos)
-    float bone_anchor_x{0.0f}, bone_anchor_y{0.0f}, bone_anchor_z{0.0f};   // pos when bones were captured
-    std::unordered_map<std::string, LimbHp> hp_limbs;     // "head" -> LimbHp
     std::optional<float> yaw;             // entity yaw (root+0x17C)
     // v0.9.421: cam snapshot at moment this entity's pos/bones were captured.
     // Async threads (bot_thread) publish entities up to ~7ms after main

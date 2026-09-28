@@ -13,7 +13,6 @@ struct RenderConfig {
     // Skeleton stays OFF — not implemented.
     int   box_mode{3};                // 0=off, 2=2D, 3=3D  (Players box)
     bool  show_box_pmc{true};
-    bool  show_skeleton_pmc{false};   // not implemented — leave OFF
     bool  show_name{true};
     bool  show_team_id{true};
     bool  show_hp{true};
@@ -39,9 +38,6 @@ struct RenderConfig {
     bool  show_stats{false};              // v0.9.337: default OFF — dev-only panel
     bool  box_corners{true};              // v0.9.430: PMC corner-bracket style
     bool  box_corners_bot{true};          // v0.9.430: BOT corner-bracket style (separated)
-    bool  skeleton_joints{true};          // joint circles on skeleton
-    bool  head_circle{false};             // ring around head bone (default OFF)
-    bool  show_armor_bar{false};           // vertical armor tier stripe right of box (legacy)
     int   armor_display{1};               // v0.9.337: 0=Off, 1=Text (default), 2=Bar
     bool  show_armor_master{true};         // ME-tab master toggle; when false suppresses ALL armor rendering
     float armor_bar_font_scale{1.35f};    // label size multiplier over auto-computed base
@@ -49,7 +45,6 @@ struct RenderConfig {
     bool  radar_aim_dir{true};            // small arrow on radar dot showing yaw
     bool  radar_rings{true};              // 25 m concentric rings on radar
     float pmc_range_m{400.0f};        // 1..400 (default max per user)
-    float skeleton_range_m{100.0f};   // Skeleton draw range 1..400
 
     // === BOTS ===
     // Defaults ON per user request. Bot HP/name/team/armor menu rows hidden
@@ -57,7 +52,6 @@ struct RenderConfig {
     // them. Skeleton stays OFF — not implemented.
     int   box_mode_bot{2};            // 0=off, 2=2D, 3=3D  (Bots box)
     bool  show_box_bot{true};
-    bool  show_skeleton_bot{false};   // not implemented — leave OFF
     bool  show_bot_name{true};
     bool  show_bot_weapon{true};
     bool  show_bot_ammo{true};
@@ -66,7 +60,6 @@ struct RenderConfig {
     bool  show_bot_distance{true};
     int   bot_corpse_min_value{0};        // 0 = show all BOT corpses regardless of value
     float bot_range_m{50.0f};         // 1..400
-    float bot_skeleton_range_m{50.0f};// 1..400
 
     // === ME ===
     bool  show_fps_overlay{false};
@@ -173,14 +166,6 @@ struct RenderConfig {
     // v0.9.421: FOV source selection for ADS.  0=base_cached/mag (current),
     // 1=ADSSceneFOV direct, 2=ADSSceneFOV/scope_mag, 3=POV.FOV/scope_mag (legacy).
     int   test_fov_source    {0};
-    // v0.9.422 dev: bone diagnostics. show_bone_ids draws each rendered joint's
-    // id number as a label. dump_all_bones asks reader to emit ALL 0..N bones
-    // (as raw_N names) so the picker can locate the correct id for every limb.
-    // force_yaw_only forces reader to skip c2w matrix and use legacy yaw-only
-    // path — handy if the c2w read produces flips/shrinks in ADS.
-    int   dev_show_bone_ids  {0};   // 0/1 — draw bone id next to each joint
-    int   dev_dump_all_bones {0};   // 0/1 — reader emits raw_0..raw_N bones
-    int   dev_force_yaw_only {0};   // 0/1 — reader skips ComponentToWorld matrix
     // v0.9.422: SCOPE additional scale factor when box+skel look too small in
     // scope glass.  1.00 = no extra scale, 2.5 = compensate 2.5× glass viewport
     // shrink.  Multiplies scope_mag inside W2S/box calc (denominator of
@@ -194,8 +179,6 @@ struct RenderConfig {
     // Format: IM_COL32(R,G,B,A) — 0xAABBGGRR little-endian on disk.
     ImU32 col_box_pmc      {IM_COL32(255, 255, 255, 255)}; // white
     ImU32 col_box_bot      {IM_COL32(255,  90,  90, 255)}; // red
-    ImU32 col_skel_pmc     {IM_COL32( 96, 204, 168, 255)}; // teal
-    ImU32 col_skel_bot     {IM_COL32( 96, 204, 168, 255)}; // teal
     ImU32 col_name_pmc     {IM_COL32(150, 170, 255, 255)}; // pale blue
     ImU32 col_name_bot     {IM_COL32(150, 170, 255, 255)};
     ImU32 col_team         {IM_COL32(212,  82, 122, 255)}; // rose
@@ -220,7 +203,6 @@ void render_top_loot(const Snapshot* snap, const RenderConfig& cfg);
 void render_radar(const Snapshot* snap, const RenderConfig& cfg);
 void render_perf_hud(const RenderConfig& cfg);       // FPS corner text
 void render_my_ammo(const Snapshot* snap, const RenderConfig& cfg);
-void render_zoom_debug(const Snapshot* snap);       // v0.9.419 exp diag
 
 // Fight-mode helper: returns true if a PMC is alive within auto-radius of user.
 bool fight_mode_trigger(const Snapshot* snap, const RenderConfig& cfg);

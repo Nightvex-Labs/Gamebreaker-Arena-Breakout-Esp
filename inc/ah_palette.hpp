@@ -102,14 +102,12 @@ constexpr ImU32 HP          = POS;   // HP всегда позитив, не н�
 constexpr ImU32 SCRIM       = IM_COL32(0, 0, 0, 150);
 constexpr ImU32 SWATCH_OFF  = S3;                     // кружок цвета у выключенной строки
 constexpr ImU32 MODAL_SCRIM = alpha(BG_DEEP, 0.62f);  // TZ-Modal §1
-constexpr ImU32 SKEL_NODE   = rgb(0x0B0F0E, 0.85f);   // узел скелета в ESP-превью (игровой слой)
 constexpr ImU32 LOGO_TILE   = T1;                     // плитка под логотип
 constexpr ImU32 ON_LIGHT    = BG;                     // галка поверх светлого образца
 
 // ── ESP: дефолты элементов (TZ-Visuals-Players §3.2) ───────────────────────
 namespace esp {
 constexpr ImU32 BOX       = rgb(0xC2B49A);  // песок
-constexpr ImU32 SKELETON  = rgb(0x6FA08A);  // шалфей
 constexpr ImU32 NAME      = rgb(0x7A9BB5);  // стальной голубой
 constexpr ImU32 TEAM      = rgb(0xB06060);  // глина
 constexpr ImU32 WEAPON    = rgb(0xC08A5A);  // терракота
@@ -122,7 +120,6 @@ constexpr ImU32 CORPSE    = rgb(0x7A8288);  // слейт
 // чтобы бот и игрок различались на экране, но обои оставались в одной гамме.
 namespace esp_bot {
 constexpr ImU32 BOX       = rgb(0x9AA28A);  // олива
-constexpr ImU32 SKELETON  = rgb(0x5E8A6E);  // тёмный шалфей
 constexpr ImU32 NAME      = rgb(0x7A8288);  // слейт
 constexpr ImU32 WEAPON    = rgb(0x977F6A);  // тусклая терракота
 constexpr ImU32 AMMO      = rgb(0x7D8B5A);  // тёмная олива
