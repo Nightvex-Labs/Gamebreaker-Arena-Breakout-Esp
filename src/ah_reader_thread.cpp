@@ -2063,6 +2063,35 @@ static void reader_body_impl(void) {
             memcpy(s.loot, cached_loot, sizeof(AH_LOOT) * cached_loot_n);
         }
 
+        // v1.0.37: carry last-known-good cam pose across ticks where PC→Pawn
+        // read returned NULL (frequent transient miss — see field report:
+        // radar renders because it uses raw entity coords, boxes disappear
+        // because W2S needs valid cam pos). Preserve pos + rotation + FOV +
+        // scope so W2S stays stable during single-tick fallbacks. Refreshed
+        // whenever a new valid reading lands.
+        {
+            static float s_last_x = 0.0f, s_last_y = 0.0f, s_last_z = 0.0f;
+            static float s_last_yaw = 0.0f, s_last_pitch = 0.0f, s_last_roll = 0.0f;
+            static float s_last_fov = 90.0f;
+            static float s_last_scope_mag = 1.0f, s_last_scope_fov = 0.0f;
+            bool cam_valid = (s.x*s.x + s.y*s.y) > 0.25f;
+            if (cam_valid) {
+                s_last_x = s.x; s_last_y = s.y; s_last_z = s.z;
+                s_last_yaw = s.yaw; s_last_pitch = s.pitch; s_last_roll = s.roll;
+                s_last_fov = s.fov;
+                s_last_scope_mag = s.scope_mag; s_last_scope_fov = s.scope_fov;
+            } else if (s_last_x != 0.0f || s_last_y != 0.0f) {
+                // Restore prior valid pose so overlay's W2S keeps projecting
+                // enemies to on-screen positions even during a single-tick
+                // pawn=NULL glitch. Overlay reads snap once per frame; a
+                // one-tick miss would blank the ESP entirely.
+                s.x = s_last_x; s.y = s_last_y; s.z = s_last_z;
+                s.yaw = s_last_yaw; s.pitch = s_last_pitch; s.roll = s_last_roll;
+                s.fov = s_last_fov;
+                s.scope_mag = s_last_scope_mag; s.scope_fov = s_last_scope_fov;
+            }
+        }
+
         publish(s);
         {
             DWORD now2 = GetTickCount();
