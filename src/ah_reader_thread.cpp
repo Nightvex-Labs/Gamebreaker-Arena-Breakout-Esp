@@ -47,7 +47,12 @@ extern "C" {
 #include "../inc/dh_scm.h"
 #include "../inc/dh_provider.h"
 #include "../inc/dh_rpm.h"
+#include "../inc/ah_uspace_read.h"   // v1.0.34
 #include "../inc/ah_offsets.h"
+
+#ifndef AH_CR3_USPACE
+#define AH_CR3_USPACE 1ULL
+#endif
 #include "../inc/ah_ace.h"
 }
 
@@ -555,19 +560,25 @@ static void reader_body_impl(void) {
                     }
 
                     u64 peb = 0;
-                    RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_peb_off, &peb);
-                    u64 sz = 0;
-                    RpmGetMainImageBase(drv.hDevice, procCR3, peb, &imageBase, &sz);
+                    if (procCR3 == AH_CR3_USPACE) {
+                        imageBase = AhUspaceBase();
+                        tmp_pid   = (u64)AhUspacePid();
+                    } else {
+                        RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_peb_off, &peb);
+                        u64 sz = 0;
+                        RpmGetMainImageBase(drv.hDevice, procCR3, peb, &imageBase, &sz);
+                    }
                     attached_pid = tmp_pid;
                     attach_ms = now;
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
                     g_reader_state.store(AH_READER_ATTACHED);
-                    ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX",
+                    ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX %s",
                             find_attempts,
                             (unsigned long long)attached_pid,
                             (unsigned long long)procCR3, (unsigned long long)eproc,
-                            (unsigned long long)peb, (unsigned long long)imageBase);
+                            (unsigned long long)peb, (unsigned long long)imageBase,
+                            (procCR3 == AH_CR3_USPACE) ? "(USPACE)" : "(kdu)");
                     // ACE_CACHE scan deferred until we can capture live
                     // enemy keys from PlayerArray walk — see PlayerArray
                     // section below.
@@ -592,26 +603,32 @@ static void reader_body_impl(void) {
             }
 
             if (now - last_find >= 5000) {
-                // Liveness check — read ImageFileName at latched eproc, verify
-                // still starts with "UAGame". Cheap (16 bytes RPM). If gone,
-                // drop latch and next iter will re-probe.
                 char img[16] = {0};
-                BOOL rd = RpmReadVirtual(drv.hDevice, sysCR3,
-                                         eproc + g_eproc_imgname, img, 15);
-                BOOL liveness_lost = (!rd || _strnicmp(img, AH_PROC_NAME, 6) != 0);
+                BOOL rd;
+                BOOL liveness_lost;
+                // v1.0.34: USPACE liveness via handle-based MZ probe.
+                if (procCR3 == AH_CR3_USPACE) {
+                    rd = AhUspaceVerify();
+                    liveness_lost = !rd;
+                } else {
+                    rd = RpmReadVirtual(drv.hDevice, sysCR3,
+                                        eproc + g_eproc_imgname, img, 15);
+                    liveness_lost = (!rd || _strnicmp(img, AH_PROC_NAME, 6) != 0);
+                }
                 // v0.9.462: bogus-CR3 hard bailout tightened 30s → 10s.
                 // GWorld may legitimately be null in main menu (game not
                 // yet loaded), but 10s is more than enough for it to appear
                 // once user hits Play. Users no longer suffer 30s "UI-alive,
                 // ESP-dead" window on wrong-PID attach.
-                // v1.0.27: bogus_gworld 10s → 15s. Slow rigs (Win10 21H2 on
-                // b19045 boxes) can take 10s just to load main menu; earlier
-                // bailout was misfiring on legitimate slow clients.
-                BOOL bogus_gworld  = (!gworld_seen && (now - attach_ms) > 15000);
-                // v1.0.27: canary bailout 3s → 8s. Same reason — 3s was too
-                // aggressive for slow CPU + HDD. GObjects/FNamePool init after
-                // UAGame's own module load can be delayed 5-7s on slow rigs.
-                BOOL bogus_canary  = (!canary_seen && (now - attach_ms) > 8000);
+                // v1.0.34: skip canary+gworld bailouts on USPACE — the
+                // process is authoritatively correct via Toolhelp, gworld=0
+                // just means the user is in the main menu.
+                BOOL bogus_gworld = (procCR3 != AH_CR3_USPACE)
+                                    && !gworld_seen
+                                    && (now - attach_ms) > 15000;
+                BOOL bogus_canary = (procCR3 != AH_CR3_USPACE)
+                                    && !canary_seen
+                                    && (now - attach_ms) > 8000;
 
                 if (liveness_lost) {
                     ah_diag("LATCH LOST — eproc ImageFileName check failed (rd=%d name='%s'). Re-probing.",
@@ -636,15 +653,17 @@ static void reader_body_impl(void) {
                         failed_attachments[failed_idx] = { eproc, attached_pid, now };
                         failed_idx = (failed_idx + 1) & 3;
                     }
+                    // v1.0.34: detach USPACE handle if held.
+                    if (procCR3 == AH_CR3_USPACE) {
+                        AhUspaceDetach();
+                    }
                     attached_pid = 0;
                     procCR3 = 0; eproc = 0; imageBase = 0;
-                    gworld_scan_state = 0;   // allow sig-scan again for fresh instance
+                    gworld_scan_state = 0;
                     gworld_rva_live = AH_RVA_GWORLD;
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
-                    last_find = 0;   // don't wait 5s more — probe immediately
-                    // v1.0.33: reset state to WAITING_GAME so HUD reflects
-                    // reality after bailout (state was stuck at ATTACHED).
+                    last_find = 0;
                     g_reader_state.store(AH_READER_WAITING_GAME);
                 } else {
                     last_find = now;

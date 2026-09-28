@@ -847,7 +847,7 @@ int wmain(int argc, wchar_t** argv)
 #ifdef AH_LAUNCHER_TELEMETRY
     extern void crash_upload_after_child(DWORD child_pid, DWORD exit_code,
                                          const char* version);
-    crash_upload_after_child(pi.dwProcessId, exit_code, "1.0.33");
+    crash_upload_after_child(pi.dwProcessId, exit_code, "1.0.34");
 #endif
 
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
