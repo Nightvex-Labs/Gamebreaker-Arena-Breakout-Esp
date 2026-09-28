@@ -66,90 +66,34 @@ static void enable_debug_privilege(void) {
     CloseHandle(tok);
 }
 
-// Multi-name substring matcher — same names accepted by the kdu-side
-// RpmFindProcess so users on Steam distribution (arena_breakout.exe) or
-// CN/dev builds (UAGameShipping.exe) still attach with the same overlay.
-static BOOL name_matches(const wchar_t* exe, const char* primary) {
-    static const char* ALT[] = {
-        "arena_breakout",
-        "UAGameShipping",
-        NULL,
-    };
-    // Lowercase compare, substring, length-capped to 14 (Toolhelp gives us
-    // full basename so we don't have the 15-char EPROCESS truncation issue).
-    // Primary: first 6 chars — covers "UAGame" prefix for all UAGame*.exe.
-    if (!exe || !primary) return FALSE;
-    size_t elen = wcslen(exe);
-
-    const char* cands[4] = { primary, NULL, NULL, NULL };
-    size_t      clens[4] = { 0 };
-    clens[0] = strlen(primary); if (clens[0] > 6) clens[0] = 6;
-    int cn = 1;
-    for (int i = 0; ALT[i] && cn < 4; i++) {
-        cands[cn] = ALT[i];
-        clens[cn] = strlen(ALT[i]);
-        if (clens[cn] > 14) clens[cn] = 14;
-        cn++;
-    }
-    for (int ci = 0; ci < cn; ci++) {
-        size_t cl = clens[ci];
-        if (elen < cl) continue;
-        for (size_t i = 0; i + cl <= elen; i++) {
-            int ok = 1;
-            for (size_t k = 0; k < cl; k++) {
-                wchar_t w = exe[i + k];
-                char    c = cands[ci][k];
-                if (w >= L'A' && w <= L'Z') w = (wchar_t)(w + 32);
-                if (c >= 'A'  && c <= 'Z')  c = (char)(c + 32);
-                if ((int)w != (int)(unsigned char)c) { ok = 0; break; }
-            }
-            if (ok) return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-// v1.0.34.1: reject known launcher/wrapper process names outright. The
-// substring matcher would happily latch onto arena_breakout_infinite_launcher
-// which contains "arena_breakout" but is a small .NET loader — its module
-// base is at 0x400000, not 0x140000000, and every read into the real game's
-// VA space returns garbage.
-static BOOL is_launcher_or_wrapper(const wchar_t* exe) {
+// v1.0.36: HARD WHITELIST. Exact basename match, no substring fuzz. The
+// substring matcher used up to v1.0.35 collided on 'arena_breakout' because
+// arena_breakout_infinite_launcher.exe contains it — is_launcher_or_wrapper
+// caught the specific case but any future launcher with a different name
+// (arena_breakout_setup.exe, arena_breakout_installer.exe, ...) would slip
+// through. Exact whitelist ends the whole class of bug.
+static BOOL is_target_process(const wchar_t* exe) {
     if (!exe) return FALSE;
-    static const wchar_t* BAD[] = {
-        L"launcher",     // arena_breakout_infinite_launcher.exe, NightvexLauncher.exe
-        L"bootstrap",
-        L"updater",
-        L"crashhandler",
+    static const wchar_t* WHITELIST[] = {
+        L"UAGame.exe",           // Global retail Tencent build (primary)
+        L"UAGameShipping.exe",   // CN / dev build variant
         NULL
     };
-    for (int i = 0; BAD[i]; i++) {
-        size_t blen = wcslen(BAD[i]);
-        size_t elen = wcslen(exe);
-        if (elen < blen) continue;
-        for (size_t j = 0; j + blen <= elen; j++) {
-            int ok = 1;
-            for (size_t k = 0; k < blen; k++) {
-                wchar_t a = exe[j + k], b = BAD[i][k];
-                if (a >= L'A' && a <= L'Z') a = (wchar_t)(a + 32);
-                if (b >= L'A' && b <= L'Z') b = (wchar_t)(b + 32);
-                if (a != b) { ok = 0; break; }
-            }
-            if (ok) return TRUE;
-        }
+    for (int i = 0; WHITELIST[i]; i++) {
+        if (_wcsicmp(exe, WHITELIST[i]) == 0) return TRUE;
     }
     return FALSE;
 }
 
 static DWORD find_pid_via_toolhelp(const char* procName) {
+    (void)procName;   // v1.0.36: whitelist is fixed, procName parameter is ignored
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe = { .dwSize = sizeof(pe) };
     DWORD hit = 0;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (is_launcher_or_wrapper(pe.szExeFile)) continue;
-            if (name_matches(pe.szExeFile, procName)) {
+            if (is_target_process(pe.szExeFile)) {
                 hit = pe.th32ProcessID;
                 break;
             }
@@ -159,19 +103,23 @@ static DWORD find_pid_via_toolhelp(const char* procName) {
     return hit;
 }
 
-static u64 module_base_via_toolhelp(DWORD pid, const char* procName) {
+// v1.0.36: fetch both base and size in one Toolhelp pass. UAGame.exe has
+// SizeOfImage in the 200-500 MB range; launchers are <10 MB. Size gate is
+// the second belt (base < 4GB gate is the first).
+static BOOL module_info_via_toolhelp(DWORD pid, u64* out_base, u64* out_size) {
     HANDLE snap = CreateToolhelp32Snapshot(
         TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+    if (snap == INVALID_HANDLE_VALUE) return FALSE;
     MODULEENTRY32W me = { .dwSize = sizeof(me) };
-    u64 base = 0;
+    BOOL ok = FALSE;
     if (Module32FirstW(snap, &me)) {
         // First module = main executable in every Windows version.
-        base = (u64)(uintptr_t)me.modBaseAddr;
-        (void)procName;
+        if (out_base) *out_base = (u64)(uintptr_t)me.modBaseAddr;
+        if (out_size) *out_size = (u64)me.modBaseSize;
+        ok = TRUE;
     }
     CloseHandle(snap);
-    return base;
+    return ok;
 }
 
 BOOL AhUspaceAttach(const char* procName, DWORD* out_pid, u64* out_base) {
@@ -191,22 +139,46 @@ BOOL AhUspaceAttach(const char* procName, DWORD* out_pid, u64* out_base) {
         return FALSE;
     }
 
-    u64 base = module_base_via_toolhelp(pid, procName);
-    if (!base) {
-        diag_log("USPACE: Module32 base=0 for PID=%lu", pid);
+    // First belt (v1.0.36): IsWow64Process. UE4 shipping (UAGame.exe) is
+    // always x64 native. arena_breakout_infinite_launcher.exe is a 32-bit
+    // .NET loader running under WOW64. Field data: Task Manager shows it
+    // as "(32 bit)". Any WOW64 process cannot be UAGame — reject outright.
+    // This is the strongest single gate; the belts below stay as belt+
+    // suspenders.
+    {
+        BOOL wow64 = FALSE;
+        if (IsWow64Process(h, &wow64) && wow64) {
+            diag_log("USPACE: REJECT PID=%lu WOW64 32-bit process (not UAGame x64)", pid);
+            CloseHandle(h);
+            return FALSE;
+        }
+    }
+
+    u64 base = 0, msize = 0;
+    if (!module_info_via_toolhelp(pid, &base, &msize) || !base) {
+        diag_log("USPACE: Module32 failed PID=%lu (base=0x%llX size=%llu)",
+                 pid, (unsigned long long)base, (unsigned long long)msize);
         CloseHandle(h);
         return FALSE;
     }
 
-    // v1.0.34.1: reject wrappers. UE4 shipping build (UAGame.exe) links at
-    // 0x140000000 and stays high even with ASLR — always >= 4 GB.
-    // arena_breakout_infinite_launcher and similar .NET loaders sit at
-    // 0x400000 (2 GB below). Same filter as the kdu path uses. Without
-    // this the reader latches on the launcher, every gworld/pawn read
-    // hits unmapped VA, and CR3-STALE watchdog re-attaches forever.
+    // Second belt: UE4 shipping build links at 0x140000000 and stays high
+    // even with ASLR — always >= 4 GB. Wrappers/.NET loaders sit at
+    // 0x400000 (below 4 GB). Reject anything under.
     if (base < 0x100000000ULL) {
-        diag_log("USPACE: REJECT wrapper PID=%lu ImageBase=0x%llX (too low, not UE4 game)",
+        diag_log("USPACE: REJECT wrapper PID=%lu base=0x%llX (< 4GB)",
                  pid, (unsigned long long)base);
+        CloseHandle(h);
+        return FALSE;
+    }
+
+    // Third belt: SizeOfImage sanity. UAGame.exe ~200-500 MB.
+    // arena_breakout_infinite_launcher.exe ~20 MB in working set (field
+    // observation). SizeOfImage of a small .NET loader stays well under
+    // 100 MB. Cut at 100 MB — dead middle of the gap.
+    if (msize < 100ULL * 1024ULL * 1024ULL) {
+        diag_log("USPACE: REJECT PID=%lu ModSize=%llu MB (< 100 MB, not UAGame)",
+                 pid, (unsigned long long)(msize / (1024ULL * 1024ULL)));
         CloseHandle(h);
         return FALSE;
     }
@@ -236,7 +208,9 @@ BOOL AhUspaceAttach(const char* procName, DWORD* out_pid, u64* out_base) {
 
     if (out_pid)  *out_pid  = pid;
     if (out_base) *out_base = base;
-    diag_log("USPACE: ATTACH OK pid=%lu base=0x%llX", pid, (unsigned long long)base);
+    diag_log("USPACE: ATTACH OK pid=%lu base=0x%llX size=%llu MB (UAGame confirmed)",
+             pid, (unsigned long long)base,
+             (unsigned long long)(msize / (1024ULL * 1024ULL)));
     return TRUE;
 }
 
