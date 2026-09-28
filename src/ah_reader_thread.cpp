@@ -842,24 +842,33 @@ static void reader_body_impl(void) {
                     g_reader_state.store(AH_READER_ATTACHED);
                 }
             }
-            // v0.9.454: authoritative in-raid flag from ASGGameState+0x430.
-            // Server sets on real raid start, clears on match end / return to
-            // menu. ACE-decrypt-success was false-positive in the lobby (root
-            // pawn = menu preview character, algo=0 = plaintext, decrypt "OK").
+            // v0.9.454 + v1.0.32: dual in-raid signal.
+            // Primary: ASGGameState+0x430 roomid (uint64). Server sets on
+            //   real raid start, clears on match end.
+            // Secondary: ASGGameState+0x579 EGameSceneType (uint8) — flips
+            //   to InBattle (2) or ShootingRoom (4) immediately on raid
+            //   enter, covers server lag on room-id assignment (field
+            //   triage 574f4932 v1.0.28 stayed roomid=0 for entire raid).
             u64 raid_room = 0;
             if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_ROOMID, &raid_room, 8);
             s.roomid = raid_room;
 
-            // v0.9.454: raid → menu transition. `roomid != 0` while in a raid,
-            // 0 in main menu / matchmaking. On the falling edge we wipe every
-            // per-raid cache so the next raid starts clean. 24-tick debounce
-            // (≈1.2 s at 20 Hz) covers momentary read glitches at the actual
-            // exit moment when server tears down the replicated state.
+            uint8_t scene_type = 0;
+            if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_SCENETYPE, &scene_type, 1);
+            s.scene_type = scene_type;
+
+            // v0.9.454: raid → menu transition. `in_raid` while in a raid,
+            // clears otherwise. On the falling edge we wipe every per-raid
+            // cache so the next raid starts clean. 24-tick debounce covers
+            // momentary read glitches at the actual exit moment when server
+            // tears down the replicated state.
             {
                 static bool s_was_in_raid    = false;
                 static int  s_out_streak     = 0;
                 static bool s_cleared        = false;
-                bool in_raid_now = (raid_room != 0);
+                bool in_raid_now = (raid_room != 0)
+                                   || (scene_type == AH_SCENE_INBATTLE)
+                                   || (scene_type == AH_SCENE_SHOOTINGROOM);
                 if (in_raid_now) {
                     s_was_in_raid = true;
                     s_out_streak  = 0;
@@ -1964,7 +1973,7 @@ static void reader_body_impl(void) {
                 s_health_last_ms = now2;
                 ah_diag("HEALTH state=%d hz=%.1f attached_pid=%llu procCR3=0x%llX "
                         "img=0x%llX gworld_seen=%d canary_seen=%d "
-                        "ent=%d loot=%d roomid=0x%llX in_raid=%d",
+                        "ent=%d loot=%d roomid=0x%llX scene=%u in_raid=%d",
                         g_reader_state.load(),
                         g_reader_hz.load(),
                         (unsigned long long)attached_pid,
@@ -1973,7 +1982,10 @@ static void reader_body_impl(void) {
                         (int)gworld_seen, (int)canary_seen,
                         s.ent_n, s.loot_n,
                         (unsigned long long)s.roomid,
-                        s.roomid != 0);
+                        (unsigned)s.scene_type,
+                        (s.roomid != 0)
+                            || (s.scene_type == AH_SCENE_INBATTLE)
+                            || (s.scene_type == AH_SCENE_SHOOTINGROOM));
             }
         }
         // Update reader-Hz gauge (rolling 500ms average).

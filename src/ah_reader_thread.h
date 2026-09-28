@@ -64,6 +64,11 @@ typedef struct {
     // false-positives in the lobby (root pawn exists for the menu preview
     // character, so decrypt returns plaintext coords with algo=0).
     unsigned long long roomid;
+    // v1.0.32: EGameSceneType from ASGGameState+0x579 (uint8). Second in-raid
+    // signal — server sometimes lags assigning roomid but scene_type flips
+    // to InBattle (2) immediately on raid enter. Overlay treats
+    // (roomid != 0) || (scene_type == 2 || scene_type == 4) as in-raid.
+    unsigned char scene_type;
     unsigned long long uagame_base;
     int      ent_n;
     AH_ENT   ents[AH_MAX_ENT];

@@ -210,7 +210,12 @@ extern "C" int AhOverlayRun(void) {
         // raid). Was using live.attached (ACE-decrypt-success) — that false-
         // positived in the lobby because the menu preview character has a valid
         // root pawn with algo=0, so decrypt "worked" and attached stayed 1.
-        stub_snap.in_raid = (live.roomid != 0);
+        // v1.0.32: dual signal — roomid + EGameSceneType (SDK 4.26.1 InBattle=2,
+        // ShootingRoom=4). Roomid alone false-negatives on slow server room-id
+        // assignment (field 574f4932 v1.0.28 stayed roomid=0 in entire raid).
+        stub_snap.in_raid = (live.roomid != 0)
+                            || (live.scene_type == 2)
+                            || (live.scene_type == 4);
         stub_snap.cam.x   = live.x;
         stub_snap.cam.y   = live.y;
         stub_snap.cam.z   = live.z;

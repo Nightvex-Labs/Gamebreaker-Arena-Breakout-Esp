@@ -45,6 +45,11 @@
 // ============================================================================
 #define AH_GS_PLAYERARRAY       0x330
 #define AH_GS_MATCHSTATE        0x368    // FName — "InProgress" during raid
+// EGameSceneType uint8 — MFBaseModule enum. Verified from Dumper-7 4.26.1 ABInfinite SDK.
+// 0=GST_None, 1=GST_Lobby, 2=GST_InBattle (raid), 3=GST_CG, 4=GST_ShootingRoom, 5=GST_MAX
+#define AH_GS_SCENETYPE         0x579
+#define AH_SCENE_INBATTLE       2
+#define AH_SCENE_SHOOTINGROOM   4
 // v0.9.454: verified in Dumper-7 dump ABInfinite 4.26.1
 // (C:\Dumper-7\CppSDK\...\SGFramework_classes.hpp:44627). uint64, replicated,
 // 0 in main menu / matchmaking, non-zero once server assigns a room. Cheapest
