@@ -537,6 +537,25 @@ static void reader_body_impl(void) {
     while (g_run.load()) {
         DWORD now = GetTickCount();
 
+        // v1.0.37 (top-of-tick hard death check): SYNCHRONIZE handle stays
+        // open across CR3-STALE resets and re-attach cycles so the game-gone
+        // signal fires regardless of the current attach state. This is the
+        // fast path — WAIT_OBJECT_0 the instant UAGame terminates. Fallback
+        // remains the gworld=0 streak watchdog further down.
+        if (g_target_hproc &&
+            WaitForSingleObject(g_target_hproc, 0) == WAIT_OBJECT_0)
+        {
+            ah_diag("GAME-GONE: SYNCHRONIZE wait on prior pid=%llu signaled — process terminated",
+                    (unsigned long long)attached_pid);
+            CloseHandle(g_target_hproc);
+            g_target_hproc = NULL;
+            g_reader_state.store(AH_READER_GAME_GONE);
+            // Do not exit reader loop directly — overlay main thread watches
+            // AH_READER_GAME_GONE and drives ordered shutdown + self-destruct.
+            Sleep(50);
+            continue;
+        }
+
         // === PROCESS ATTACH / LIVENESS =========================================
         // First attach: full RpmFindProcess and LATCH pid/eproc/CR3/imageBase.
         // Subsequent probes just verify the eproc's ImageFileName still says
@@ -631,23 +650,8 @@ static void reader_body_impl(void) {
                 last_find = now;
             }
         } else {
-            // v1.0.37: hard process-death check via SYNCHRONIZE handle.
-            // Fires the moment UAGame.exe terminates — 30x faster than the
-            // gworld=0 streak watchdog (150 ticks ≈ 15 s), and immune to
-            // reader re-attach cycles that would reset the gworld streak.
-            if (g_target_hproc &&
-                WaitForSingleObject(g_target_hproc, 0) == WAIT_OBJECT_0)
-            {
-                ah_diag("GAME-GONE: SYNCHRONIZE wait on pid=%llu signaled — process terminated",
-                        (unsigned long long)attached_pid);
-                CloseHandle(g_target_hproc);
-                g_target_hproc = NULL;
-                g_reader_state.store(AH_READER_GAME_GONE);
-                // Do not exit reader loop directly — overlay main thread
-                // watches AH_READER_GAME_GONE and drives ordered shutdown.
-                Sleep(50);
-                continue;
-            }
+            // (SYNCHRONIZE handle death check moved to top-of-tick in v1.0.37
+            // so it fires even after CR3-STALE reset detaches this branch.)
             // v0.9.462: canary check runs every tick — cheap (~4 RPM), and
             // catches wrong-CR3 attach in ≤3s instead of the old 30s wait.
             // GObjects and FNamePool are non-null the moment UAGame passes
@@ -732,7 +736,10 @@ static void reader_body_impl(void) {
                     if (procCR3 == AH_CR3_USPACE) {
                         AhUspaceDetach();
                     }
-                    if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
+                    // v1.0.37: keep g_target_hproc OPEN across the detach so
+                    // top-of-tick SYNCHRONIZE check still catches the death
+                    // signal from prior latch. Only closed on a fresh attach
+                    // (line 604) or thread exit.
                     attached_pid = 0;
                     procCR3 = 0; eproc = 0; imageBase = 0;
                     gworld_scan_state = 0;   // allow sig-scan again for fresh instance
@@ -783,7 +790,8 @@ static void reader_body_impl(void) {
                                 "force re-attach, blacklist current eproc/pid for 60s");
                         failed_attachments[failed_idx] = { eproc, attached_pid, now };
                         failed_idx = (failed_idx + 1) & 3;
-                        if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
+                        // v1.0.37: keep g_target_hproc open across CR3-STALE
+                        // reset so top-of-tick SYNCHRONIZE check keeps working.
                         attached_pid = 0;
                         procCR3 = 0; eproc = 0; imageBase = 0;
                         gworld_scan_state = 0;
