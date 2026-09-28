@@ -818,9 +818,32 @@ static void draw_reader_status_hud() {
 
         const char* hint = nullptr;
         ImU32 hint_col = IM_COL32(200, 200, 200, 255);
+        char hint_buf[192];
         switch (state) {
-            case AH_READER_WAITING_GAME:
-                hint = "Waiting for Arena Breakout: Infinite to launch"; break;
+            case AH_READER_WAITING_GAME: {
+                // v1.0.33: show attach-attempt counter so the user sees
+                // real progress instead of a static "waiting…" string.
+                // >100 attempts = ACE has likely unlinked UAGame's EPROCESS
+                // from PsActiveProcessLinks (Pattern A). Actionable hint:
+                // restarting the game after the overlay is already running
+                // catches the EPROCESS via NtQSI handle table before ACE's
+                // hooks stabilise.
+                unsigned int n = snap.find_attempts;
+                if (n >= 100) {
+                    std::snprintf(hint_buf, sizeof(hint_buf),
+                        "Not found after %u attempts. Close the game, then RELAUNCH it while this overlay stays open.",
+                        n);
+                    hint = hint_buf;
+                    hint_col = IM_COL32(255, 180, 80, 255);
+                } else if (n >= 20) {
+                    std::snprintf(hint_buf, sizeof(hint_buf),
+                        "Searching for Arena Breakout: Infinite… (attempt #%u)", n);
+                    hint = hint_buf;
+                } else {
+                    hint = "Waiting for Arena Breakout: Infinite to launch";
+                }
+                break;
+            }
             case AH_READER_ATTACHED:
                 if (snap.ent_n == 0)
                     hint = "Attached — waiting for world (menu or raid load)";

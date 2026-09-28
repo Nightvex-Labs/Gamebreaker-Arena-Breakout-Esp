@@ -70,6 +70,10 @@ typedef struct {
     // (roomid != 0) || (scene_type == 2 || scene_type == 4) as in-raid.
     // Values: 0=None, 1=Lobby, 2=InBattle, 3=CG, 4=ShootingRoom.
     unsigned char scene_type;
+    // v1.0.33: current RpmFindProcess attempt counter (published from reader
+    // thread so overlay HUD can show "attach #N" progress + actionable hint
+    // when >100 attempts hint = "close game, then relaunch it AFTER overlay").
+    unsigned int find_attempts;
     unsigned long long uagame_base;
     int      ent_n;
     AH_ENT   ents[AH_MAX_ENT];
