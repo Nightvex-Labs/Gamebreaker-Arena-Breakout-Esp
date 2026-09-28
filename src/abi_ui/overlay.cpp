@@ -958,8 +958,56 @@ void Overlay::run(const std::function<void()>& frame_fn) {
         // true), so game_miss_streak alone never trips and overlay hangs empty.
         // The reader thread sets AH_READER_GAME_GONE once gworld=0 sustains
         // for ~15s — much more reliable than HWND polling.
+        //
+        // v1.0.37: also fire self-destruct — port of ABIFINAL destroy_self.
+        // Overlay wipes its own on-disk exe (extracted by launcher into
+        // %TEMP%\<hex>.exe or dropped by KoenFlow into LocalAppData). Dev
+        // gate: skip wipe if exe path is NOT under %TEMP%\ or KoenFlow dir
+        // so a dev-mode standalone build (running from source tree) is not
+        // deleted. Override with env AH_KEEP_ARTIFACTS=1.
         if (ah_reader_state() == AH_READER_GAME_GONE) {
-            LOG("overlay::run: reader reports GAME_GONE (gworld=0 held) — self-exit");
+            LOG("overlay::run: reader reports GAME_GONE — self-exit + self-destruct");
+            {
+                wchar_t exe[MAX_PATH]{};
+                GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                char keep[8] = {};
+                DWORD keep_len = GetEnvironmentVariableA("AH_KEEP_ARTIFACTS", keep, sizeof(keep));
+                bool skip = (keep_len > 0 && keep[0] == '1');
+                // Location gate: only wipe if we're under %TEMP% or KoenFlow dir.
+                if (!skip) {
+                    wchar_t temp_dir[MAX_PATH]{};
+                    GetTempPathW(MAX_PATH, temp_dir);
+                    wchar_t lad[MAX_PATH]{};
+                    GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH);
+                    wchar_t koen[MAX_PATH * 2]{};
+                    if (lad[0]) _snwprintf_s(koen, _TRUNCATE, L"%s\\KoenFlowLauncher\\", lad);
+                    bool in_temp = temp_dir[0] && _wcsnicmp(exe, temp_dir, wcslen(temp_dir)) == 0;
+                    bool in_koen = koen[0]     && _wcsnicmp(exe, koen,     wcslen(koen))     == 0;
+                    if (!in_temp && !in_koen) {
+                        LOG("selfdestruct: skip — exe '%ls' not in %%TEMP%% or KoenFlow dir (dev build?)", exe);
+                        skip = true;
+                    }
+                }
+                if (!skip) {
+                    // Delete-on-reboot fallback (guaranteed cleanup even if
+                    // spawned deleter fails or is killed).
+                    MoveFileExW(exe, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+                    // Spawn detached cmd that waits 2s (our process exits by
+                    // then) and deletes the exe. `ping -n 3` = ~2s sleep.
+                    wchar_t cmd[MAX_PATH * 3]{};
+                    _snwprintf_s(cmd, _TRUNCATE,
+                        L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /F /Q \"%s\"", exe);
+                    STARTUPINFOW si{}; si.cb = sizeof(si);
+                    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi{};
+                    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                        nullptr, nullptr, &si, &pi);
+                    LOG("selfdestruct: exe='%ls' deleter spawned=%d (MoveFileEx-reboot armed)", exe, ok);
+                    if (pi.hProcess) CloseHandle(pi.hProcess);
+                    if (pi.hThread)  CloseHandle(pi.hThread);
+                }
+            }
             running_ = false;
             break;
         }

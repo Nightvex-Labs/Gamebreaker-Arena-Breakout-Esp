@@ -215,6 +215,11 @@ static std::atomic<int>      g_reader_state{AH_READER_INIT};
 extern "C" int ah_reader_state(void) { return g_reader_state.load(); }
 static std::mutex            g_snap_lock;
 static AH_LIVE_SNAP          g_snap{};
+// v1.0.37: SYNCHRONIZE handle to target for reliable process-death detection.
+// gworld=0 watchdog alone is unreliable — reader re-attaches on decoy PIDs,
+// resetting the streak. WaitForSingleObject on this handle flips instantly
+// when the real UAGame.exe process terminates (game closed by user).
+static HANDLE                g_target_hproc = NULL;
 static std::atomic<uint32_t> g_reader_ticks{0};
 static std::atomic<uint32_t> g_reader_last_ms{0};
 static std::atomic<float>    g_reader_hz{0.0f};
@@ -602,12 +607,19 @@ static void reader_body_impl(void) {
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
                     g_reader_state.store(AH_READER_ATTACHED);
-                    ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX %s",
+                    // v1.0.37: open SYNCHRONIZE handle to target for reliable
+                    // process-death detection. SYNCHRONIZE is the lightest
+                    // access mask — ACE rarely strips it (unlike VM_READ),
+                    // and the wait check is O(1) per tick.
+                    if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
+                    g_target_hproc = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)attached_pid);
+                    ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX %s (SYNC handle=%p)",
                             find_attempts,
                             (unsigned long long)attached_pid,
                             (unsigned long long)procCR3, (unsigned long long)eproc,
                             (unsigned long long)peb, (unsigned long long)imageBase,
-                            (procCR3 == AH_CR3_USPACE) ? "(USPACE)" : "(kdu)");
+                            (procCR3 == AH_CR3_USPACE) ? "(USPACE)" : "(kdu)",
+                            (void*)g_target_hproc);
                     // ACE_CACHE scan deferred until we can capture live
                     // enemy keys from PlayerArray walk — see PlayerArray
                     // section below.
@@ -619,6 +631,23 @@ static void reader_body_impl(void) {
                 last_find = now;
             }
         } else {
+            // v1.0.37: hard process-death check via SYNCHRONIZE handle.
+            // Fires the moment UAGame.exe terminates — 30x faster than the
+            // gworld=0 streak watchdog (150 ticks ≈ 15 s), and immune to
+            // reader re-attach cycles that would reset the gworld streak.
+            if (g_target_hproc &&
+                WaitForSingleObject(g_target_hproc, 0) == WAIT_OBJECT_0)
+            {
+                ah_diag("GAME-GONE: SYNCHRONIZE wait on pid=%llu signaled — process terminated",
+                        (unsigned long long)attached_pid);
+                CloseHandle(g_target_hproc);
+                g_target_hproc = NULL;
+                g_reader_state.store(AH_READER_GAME_GONE);
+                // Do not exit reader loop directly — overlay main thread
+                // watches AH_READER_GAME_GONE and drives ordered shutdown.
+                Sleep(50);
+                continue;
+            }
             // v0.9.462: canary check runs every tick — cheap (~4 RPM), and
             // catches wrong-CR3 attach in ≤3s instead of the old 30s wait.
             // GObjects and FNamePool are non-null the moment UAGame passes
@@ -703,6 +732,7 @@ static void reader_body_impl(void) {
                     if (procCR3 == AH_CR3_USPACE) {
                         AhUspaceDetach();
                     }
+                    if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
                     attached_pid = 0;
                     procCR3 = 0; eproc = 0; imageBase = 0;
                     gworld_scan_state = 0;   // allow sig-scan again for fresh instance
@@ -753,6 +783,7 @@ static void reader_body_impl(void) {
                                 "force re-attach, blacklist current eproc/pid for 60s");
                         failed_attachments[failed_idx] = { eproc, attached_pid, now };
                         failed_idx = (failed_idx + 1) & 3;
+                        if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
                         attached_pid = 0;
                         procCR3 = 0; eproc = 0; imageBase = 0;
                         gworld_scan_state = 0;
@@ -2079,6 +2110,7 @@ static void reader_body_impl(void) {
     }
 
     CloseHandle(dev);
+    if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
     timeEndPeriod(1);
     g_thread_alive.store(false);
 }
