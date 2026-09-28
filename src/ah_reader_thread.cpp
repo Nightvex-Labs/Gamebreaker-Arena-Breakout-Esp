@@ -156,10 +156,15 @@ static u64 ah_find_limb_aset(HANDLE hDev, u64 procCR3, u64 pawn) {
 }
 
 // Read weapon ItemID + mag cur/max from a pawn via 5-hop chain:
-//   pawn.WM → curWeapon → AssembleComp → CachedMag → WCC → ContainList
+//   pawn.WM → CurWeapon → WeaponAssembleComp → CachedMagazine → WCC → ContainList
 // Returns TRUE if a valid weapon ItemID was read (fills iid_out).
 // mag_cur/mag_max default to -1 on failure. Cheap when the pawn holds no
 // weapon (returns after first null ptr — ~1-2 RPMs).
+//
+// v1.0.37: offsets re-verified against Dumper-7 4.26.1 ABInfinite SDK
+// (SGFramework_classes.hpp) after 2026-09 micropatch shift:
+//   ASGWeapon::WeaponAssembleComp @ 0x0BF0  (was mis-set to 0xBD0 = CurrentEngageEnemy)
+//   BP_MagazineBase::SGWeaponContainer @ 0x0940 (was 0x920 = pad)
 static BOOL ah_read_weapon(HANDLE hDev, u64 procCR3, u64 pawn,
                            u32* iid_out, i16* magcur_out, i16* magmax_out) {
     *iid_out = 0; *magcur_out = -1; *magmax_out = -1;
@@ -347,9 +352,14 @@ static u64 ah_sig_scan_gworld(HANDLE hDev, u64 procCR3, u64 imageBase)
 static void reader_body_impl(void);
 
 static void reader_body(void) {
+    // Install terminate handler once. std::call_once used to be safe against
+    // races if reattach spawns a fresh reader thread mid-crash of the first.
     static std::once_flag s_term_once;
     std::call_once(s_term_once, [](){
         std::set_terminate([](){
+            // Fast, single-byte marker before termination. VEH v1.0.24 may or
+            // may not fire depending on how the exception unwound; the marker
+            // is the belt-and-suspenders channel.
             crash_marker::write(crash_marker::TERMINATE_HANDLER);
             _Exit(0x0D);
         });
@@ -358,6 +368,9 @@ static void reader_body(void) {
     try {
         reader_body_impl();
     } catch (const std::bad_alloc&) {
+        // Out-of-memory in std::unordered_map (g_pmc_corpses / g_human_snap /
+        // g_bot_cap etc.) — write a distinct marker so field triage doesn't
+        // confuse this with a real AV.
         ah_diag("!!! reader_body: std::bad_alloc caught — marker=READER_BAD_ALLOC");
         crash_marker::write(crash_marker::READER_BAD_ALLOC);
         g_thread_alive.store(false);
@@ -525,8 +538,14 @@ static void reader_body_impl(void) {
         // "UAGame". If it doesn't, drop the latch and re-probe. Never re-read
         // g_eproc_dtb — ACE tamper makes that read give garbage.
         if (attached_pid == 0) {
-            // v1.0.29: fast-poll for first 30 attempts (150ms each = 4.5s)
-            // so cold-start feels instant if UAGame is already running.
+            // v1.0.29: fast-poll for first N attempts so cold-start feels
+            // instant if UAGame is already running. Field triage of v1.0.28
+            // showed cold-attach taking 60-177 attempts (30-90s at old 500ms
+            // interval) — user waited, saw no ESP, killed via task-mgr.
+            // First 30 attempts at 150ms = 4.5s of fast probe covers the
+            // "game already loaded" case. Beyond that, steady 500ms to
+            // avoid saturating the kdu dispatcher on real "game not started
+            // yet" waits.
             DWORD find_interval = (find_attempts < 30) ? 150 : 500;
             if (now - last_find >= find_interval) {
                 find_attempts++;
@@ -537,8 +556,13 @@ static void reader_body_impl(void) {
                     BOOL blacklisted = FALSE;
                     u64 tmp_pid = 0;
                     RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_pid, &tmp_pid);
-                    // v1.0.29: blacklist cooldown 60s -> 15s so a false
-                    // wrong-CR3 blip doesn't lock the user out for a minute.
+                    // v1.0.29: blacklist cooldown 60s -> 15s. First-bailout
+                    // is often a wrong-CR3 decoy that clears itself once ACE
+                    // stabilises; a 60s dead zone in the middle of user's
+                    // "why is ESP not on" panic was aggressive. 15s is long
+                    // enough that we don't re-latch the same failing eproc
+                    // in the same tick, short enough that the recovery
+                    // window is invisible to the user.
                     for (int fi = 0; fi < 4; fi++) {
                         FailedAttach& fa = failed_attachments[fi];
                         if (!fa.stamp_ms) continue;
@@ -559,6 +583,11 @@ static void reader_body_impl(void) {
                         continue;
                     }
 
+                    // v1.0.34: USPACE path — RpmFindProcess returned the
+                    // sentinel CR3, and imageBase/pid are known from
+                    // AhUspaceBase()/AhUspacePid() (Toolhelp32 already
+                    // resolved them). Skip the EPROCESS.PEB walk that
+                    // requires a real EPROCESS/CR3 pair.
                     u64 peb = 0;
                     if (procCR3 == AH_CR3_USPACE) {
                         imageBase = AhUspaceBase();
@@ -603,13 +632,22 @@ static void reader_body_impl(void) {
             }
 
             if (now - last_find >= 5000) {
+                // Liveness check — read ImageFileName at latched eproc, verify
+                // still starts with "UAGame". Cheap (16 bytes RPM). If gone,
+                // drop latch and next iter will re-probe.
+                //
+                // v1.0.34: USPACE path has no EPROCESS. Liveness via handle
+                // probe — AhUspaceVerify() reads MZ at module base. If the
+                // process died the handle read fails; treat as liveness_lost.
                 char img[16] = {0};
                 BOOL rd;
                 BOOL liveness_lost;
-                // v1.0.34: USPACE liveness via handle-based MZ probe.
                 if (procCR3 == AH_CR3_USPACE) {
                     rd = AhUspaceVerify();
                     liveness_lost = !rd;
+                    if (!rd) {
+                        snprintf(img, sizeof(img), "uspace-dead");
+                    }
                 } else {
                     rd = RpmReadVirtual(drv.hDevice, sysCR3,
                                         eproc + g_eproc_imgname, img, 15);
@@ -620,9 +658,14 @@ static void reader_body_impl(void) {
                 // yet loaded), but 10s is more than enough for it to appear
                 // once user hits Play. Users no longer suffer 30s "UI-alive,
                 // ESP-dead" window on wrong-PID attach.
-                // v1.0.34: skip canary+gworld bailouts on USPACE — the
-                // process is authoritatively correct via Toolhelp, gworld=0
-                // just means the user is in the main menu.
+                // v1.0.27: bogus_gworld 10s → 15s. Slow rigs (Win10 21H2 on
+                // b19045 boxes) can take 10s just to load main menu; earlier
+                // bailout was misfiring on legitimate slow clients.
+                // v1.0.34: USPACE path is authoritative (Toolhelp gives the
+                // real UAGame — cannot be a decoy). Skip canary+gworld
+                // bailouts entirely on USPACE — gworld=null just means the
+                // user is sitting in the main menu, not that we latched
+                // the wrong process.
                 BOOL bogus_gworld = (procCR3 != AH_CR3_USPACE)
                                     && !gworld_seen
                                     && (now - attach_ms) > 15000;
@@ -653,17 +696,20 @@ static void reader_body_impl(void) {
                         failed_attachments[failed_idx] = { eproc, attached_pid, now };
                         failed_idx = (failed_idx + 1) & 3;
                     }
-                    // v1.0.34: detach USPACE handle if held.
+                    // v1.0.34: USPACE handle held by ah_uspace_read.c —
+                    // detach so the next RpmFindProcess re-tries a fresh
+                    // Toolhelp lookup (game may have relaunched with a new
+                    // PID between our reads).
                     if (procCR3 == AH_CR3_USPACE) {
                         AhUspaceDetach();
                     }
                     attached_pid = 0;
                     procCR3 = 0; eproc = 0; imageBase = 0;
-                    gworld_scan_state = 0;
+                    gworld_scan_state = 0;   // allow sig-scan again for fresh instance
                     gworld_rva_live = AH_RVA_GWORLD;
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
-                    last_find = 0;
+                    last_find = 0;   // don't wait 5s more — probe immediately
                     g_reader_state.store(AH_READER_WAITING_GAME);
                 } else {
                     last_find = now;
@@ -865,13 +911,19 @@ static void reader_body_impl(void) {
                     g_reader_state.store(AH_READER_ATTACHED);
                 }
             }
-            // v0.9.454 + v1.0.32: dual in-raid signal.
-            // Primary: ASGGameState+0x430 roomid (uint64). Server sets on
-            //   real raid start, clears on match end.
-            // Secondary: ASGGameState+0x579 EGameSceneType (uint8) — flips
-            //   to InBattle (2) or ShootingRoom (4) immediately on raid
-            //   enter, covers server lag on room-id assignment (field
-            //   triage 574f4932 v1.0.28 stayed roomid=0 for entire raid).
+            // v0.9.454: authoritative in-raid flag from ASGGameState+0x430.
+            // Server sets on real raid start, clears on match end / return to
+            // menu. ACE-decrypt-success was false-positive in the lobby (root
+            // pawn = menu preview character, algo=0 = plaintext, decrypt "OK").
+            //
+            // v1.0.32: OR with EGameSceneType @ 0x579 (uint8 enum) — server
+            // sometimes lags assigning roomid but GameSceneType flips to
+            // InBattle (2) immediately on raid enter. In field triage of
+            // 574f4932 v1.0.28 the overlay stayed on "ATTACHED — LOADING
+            // WORLD" HUD even while the user was inside a raid because
+            // roomid stayed 0 across the entire session. Second signal
+            // covers that gap. ShootingRoom (4) is the tir/training range
+            // — also treat as in-raid so ESP works there for testing.
             u64 raid_room = 0;
             if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_ROOMID, &raid_room, 8);
             s.roomid = raid_room;
@@ -880,11 +932,11 @@ static void reader_body_impl(void) {
             if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_SCENETYPE, &scene_type, 1);
             s.scene_type = scene_type;
 
-            // v0.9.454: raid → menu transition. `in_raid` while in a raid,
-            // clears otherwise. On the falling edge we wipe every per-raid
-            // cache so the next raid starts clean. 24-tick debounce covers
-            // momentary read glitches at the actual exit moment when server
-            // tears down the replicated state.
+            // v0.9.454: raid → menu transition. `roomid != 0` while in a raid,
+            // 0 in main menu / matchmaking. On the falling edge we wipe every
+            // per-raid cache so the next raid starts clean. 24-tick debounce
+            // (≈1.2 s at 20 Hz) covers momentary read glitches at the actual
+            // exit moment when server tears down the replicated state.
             {
                 static bool s_was_in_raid    = false;
                 static int  s_out_streak     = 0;
