@@ -520,7 +520,10 @@ static void reader_body_impl(void) {
         // "UAGame". If it doesn't, drop the latch and re-probe. Never re-read
         // g_eproc_dtb — ACE tamper makes that read give garbage.
         if (attached_pid == 0) {
-            if (now - last_find >= 500) {
+            // v1.0.29: fast-poll for first 30 attempts (150ms each = 4.5s)
+            // so cold-start feels instant if UAGame is already running.
+            DWORD find_interval = (find_attempts < 30) ? 150 : 500;
+            if (now - last_find >= find_interval) {
                 find_attempts++;
                 if (RpmFindProcess(drv.hDevice, sysCR3, AH_PROC_NAME, &procCR3, &eproc)) {
                     // v0.9.462: skip recently-failed eproc/pid combos so the
@@ -529,10 +532,12 @@ static void reader_body_impl(void) {
                     BOOL blacklisted = FALSE;
                     u64 tmp_pid = 0;
                     RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_pid, &tmp_pid);
+                    // v1.0.29: blacklist cooldown 60s -> 15s so a false
+                    // wrong-CR3 blip doesn't lock the user out for a minute.
                     for (int fi = 0; fi < 4; fi++) {
                         FailedAttach& fa = failed_attachments[fi];
                         if (!fa.stamp_ms) continue;
-                        if ((now - fa.stamp_ms) > 60000) continue;
+                        if ((now - fa.stamp_ms) > 15000) continue;
                         if (fa.eproc == eproc || fa.pid == tmp_pid) {
                             blacklisted = TRUE; break;
                         }

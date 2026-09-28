@@ -220,6 +220,11 @@ static void read_crash_marker(uint8_t out[2]) {
     ReadFile(h, out, 1, &got, NULL);
     CloseHandle(h);
     out[1] = (got == 1) ? 1 : 0;
+    // v1.0.29: consume the marker after read so the next launcher run
+    // doesn't ship the same stale byte and mis-classify graceful exit.
+    if (out[1]) {
+        DeleteFileW(p);
+    }
 }
 
 // Minimal multipart writer. Appends one field to a growing buffer.

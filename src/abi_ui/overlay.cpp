@@ -11,6 +11,7 @@
 #include "image_loader.hpp"
 #include "control_panel.hpp"
 #include "misc/freetype/imgui_freetype.h"
+#include "../ah_reader_thread.h"   // v1.0.29: reader state for status HUD
 #include <psapi.h>
 #include <d3d11.h>
 #include <chrono>
@@ -957,6 +958,85 @@ static HRESULT safe_present(IDXGISwapChain1* sc) noexcept {
     }
 }
 
+// v1.0.29: reader status HUD — small top-right panel showing reader state
+// during cold-start / attach so the user doesn't rage-quit through task-mgr
+// thinking the overlay is broken. Auto-hides once state=LIVE + entities.
+static void draw_reader_status_hud() {
+    int   state = ah_reader_state();
+    float hz    = ah_reader_hz();
+    AH_LIVE_SNAP snap{};
+    ah_reader_snapshot(&snap);
+
+    bool everything_ok = (state == AH_READER_LIVE &&
+                          snap.ent_n > 0 && hz > 5.0f);
+    if (everything_ok) return;
+
+    const char* state_str = "?";
+    ImU32 state_col = IM_COL32(255, 255, 255, 255);
+    switch (state) {
+        case AH_READER_INIT:          state_str = "INIT";                     state_col = IM_COL32(200,200,200,255); break;
+        case AH_READER_PROVIDER_OK:   state_str = "DRIVER OK";                state_col = IM_COL32(200,200,255,255); break;
+        case AH_READER_CR3_OK:        state_str = "CR3 OK";                   state_col = IM_COL32(200,200,255,255); break;
+        case AH_READER_WAITING_GAME:  state_str = "WAITING FOR GAME";         state_col = IM_COL32(255,220,100,255); break;
+        case AH_READER_ATTACHED:      state_str = "ATTACHED — LOADING WORLD"; state_col = IM_COL32(255,220,100,255); break;
+        case AH_READER_LIVE:          state_str = "LIVE";                     state_col = IM_COL32(100,255,100,255); break;
+        case AH_READER_GAME_GONE:     state_str = "GAME GONE";                state_col = IM_COL32(255,100,100,255); break;
+        case AH_READER_PROVIDER_FAIL: state_str = "DRIVER LOAD FAILED";       state_col = IM_COL32(255, 60, 60,255); break;
+        case AH_READER_CR3_FAIL:      state_str = "CR3 SCAN FAILED";          state_col = IM_COL32(255, 60, 60,255); break;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.0f, 10.0f),
+                             ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize     | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoInputs;
+    if (ImGui::Begin("##ah_reader_status_hud", nullptr, flags)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, state_col);
+        ImGui::Text("[ESP] %s", state_str);
+        ImGui::PopStyleColor();
+        ImGui::Text("Hz: %.1f  ent: %d  loot: %d",
+                    hz, snap.ent_n, snap.loot_n);
+
+        const char* hint = nullptr;
+        ImU32 hint_col = IM_COL32(200, 200, 200, 255);
+        switch (state) {
+            case AH_READER_WAITING_GAME:
+                hint = "Waiting for Arena Breakout: Infinite to launch"; break;
+            case AH_READER_ATTACHED:
+                if (snap.ent_n == 0)
+                    hint = "Attached — waiting for world (menu or raid load)";
+                break;
+            case AH_READER_GAME_GONE:
+                hint = "Game closed — overlay will exit";
+                hint_col = IM_COL32(255, 120, 120, 255);
+                break;
+            case AH_READER_PROVIDER_FAIL:
+                hint = "Driver failed to load — check HVCI/Hyper-V, then relaunch";
+                hint_col = IM_COL32(255, 120, 120, 255);
+                break;
+            case AH_READER_CR3_FAIL:
+                hint = "System CR3 scan failed — kdu or Windows build mismatch";
+                hint_col = IM_COL32(255, 120, 120, 255);
+                break;
+            case AH_READER_LIVE:
+                if (snap.ent_n == 0)
+                    hint = "In menu — no players to render yet";
+                break;
+            default: break;
+        }
+        if (hint) {
+            ImGui::PushStyleColor(ImGuiCol_Text, hint_col);
+            ImGui::TextWrapped("%s", hint);
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::End();
+}
+
 namespace abi {
 
 void Overlay::run(const std::function<void()>& frame_fn) {
@@ -1061,6 +1141,10 @@ void Overlay::run(const std::function<void()>& frame_fn) {
 
         ImGui::NewFrame();
 
+        // v1.0.29: status HUD before the main frame — auto-hides once
+        // reader hits LIVE with entities visible.
+        draw_reader_status_hud();
+
         frame_fn();
 
         ImGui::Render();
@@ -1100,6 +1184,30 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                 LOG("overlay: Present DEVICE_LOST hr=0x%08lx removedReason=0x%08lx streak=%d",
                     present_hr, rr, strike);
                 if (strike >= 3) {
+                    // v1.0.29: DEVICE_LOST recovery — rebuild D3D device +
+                    // swapchain once instead of dying immediately. TDR /
+                    // Alt+Tab / Discord overlay conflict is transient.
+                    static int s_recreate_streak = 0;
+                    s_recreate_streak++;
+                    LOG("overlay: DEVICE_LOST strike=%d — attempting D3D recreate #%d",
+                        strike, s_recreate_streak);
+
+                    ImGui_ImplDX11_Shutdown();
+                    cleanup_d3d();
+
+                    if (create_d3d()) {
+                        ImGui_ImplDX11_Init(d3d_device_, d3d_ctx_);
+                        LOG("overlay: D3D recreate OK — resuming render loop (recovery #%d)",
+                            s_recreate_streak);
+                        g_present_lost_streak.store(0);
+                        if (s_recreate_streak >= 3) {
+                            LOG("overlay: >=3 device recreates this session — next DEVICE_LOST will exit");
+                        }
+                        Sleep(100);
+                        continue;
+                    }
+
+                    LOG("overlay: D3D recreate FAILED — device truly dead, writing marker + exit");
                     crash_marker::write(crash_marker::OVERLAY_DEVICE_LOST);
                     running_ = false;
                     break;
