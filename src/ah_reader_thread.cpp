@@ -156,10 +156,15 @@ static u64 ah_find_limb_aset(HANDLE hDev, u64 procCR3, u64 pawn) {
 }
 
 // Read weapon ItemID + mag cur/max from a pawn via 5-hop chain:
-//   pawn.WM → curWeapon → AssembleComp → CachedMag → WCC → ContainList
+//   pawn.WM → CurWeapon → WeaponAssembleComp → CachedMagazine → WCC → ContainList
 // Returns TRUE if a valid weapon ItemID was read (fills iid_out).
 // mag_cur/mag_max default to -1 on failure. Cheap when the pawn holds no
 // weapon (returns after first null ptr — ~1-2 RPMs).
+//
+// v1.0.37: offsets re-verified against Dumper-7 4.26.1 ABInfinite SDK
+// (SGFramework_classes.hpp) after 2026-09 micropatch shift:
+//   ASGWeapon::WeaponAssembleComp @ 0x0BF0  (was mis-set to 0xBD0 = CurrentEngageEnemy)
+//   BP_MagazineBase::SGWeaponContainer @ 0x0940 (was 0x920 = pad)
 static BOOL ah_read_weapon(HANDLE hDev, u64 procCR3, u64 pawn,
                            u32* iid_out, i16* magcur_out, i16* magmax_out) {
     *iid_out = 0; *magcur_out = -1; *magmax_out = -1;

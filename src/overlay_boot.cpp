@@ -23,6 +23,8 @@ namespace abi {
     void render_frame    (const Snapshot* snap, const RenderConfig& cfg);
     void render_loot     (const Snapshot* snap, const RenderConfig& cfg);
     namespace hud {
+        void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
+                               float framerate, float* out_bottom_y);
         void top_loot(const Snapshot* snap, const RenderConfig& cfg, float y_anchor);
         void ammo_counter(const Snapshot* snap, const RenderConfig& cfg);
     }
@@ -292,10 +294,21 @@ extern "C" int AhOverlayRun(void) {
         abi::render_frame(&stub_snap, cfg);
         // Floor-loot markers (colored dots + price text via rarity).
         abi::render_loot(&stub_snap, cfg);
-        // Top-loot panel — NEW Fey style (abi::hud::top_loot, right-anchored,
-        // vertically centered; override via cfg.top_loot_screen_x/y).
-        abi::hud::top_loot(&stub_snap, cfg, 0.0f);
-        abi::hud::ammo_counter(&stub_snap, cfg);
+        // Fey HUD stack (per ABIFINAL main.cpp:1535+): stats chips + nearest
+        // enemy cards (with mag column N/M — this is the requested enemy
+        // ammo counter), top-loot list, own-ammo circular.  Wrap in
+        // FontGlobalScale save/restore so control_panel scale isn't clobbered.
+        {
+            ImGuiIO& io_hud = ImGui::GetIO();
+            const float saved_scale = io_hud.FontGlobalScale;
+            const float user_scale  = (float)cfg.text_scale_pct * 0.01f;
+            io_hud.FontGlobalScale  = saved_scale * user_scale;
+            float hud_bottom = 0.0f;
+            abi::hud::stats_and_nearest(&stub_snap, cfg, 60.0f, &hud_bottom);
+            abi::hud::top_loot(&stub_snap, cfg, hud_bottom);
+            abi::hud::ammo_counter(&stub_snap, cfg);
+            io_hud.FontGlobalScale = saved_scale;
+        }
 
         // Top-loot panel drag (menu-only). Panel dims match hud::top_loot
         // (LOOT_W 380 + 2*LOOT_PAD_X 14 = 408; height varies with row count).

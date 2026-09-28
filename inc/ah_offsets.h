@@ -128,12 +128,16 @@
 #define AH_WM_WEAPON_LIST       0x350
 #define AH_WM_CURWEAPON         0x1F8
 #define AH_ASSEMBLE_CACHEDMAG   0x280
-#define AH_MAG_WCC_OFF          0x920
+// v1.0.37: fixed +0x20 direction error. SDK 4.26.1 ABInfinite:
+//   ASGWeapon::WeaponAssembleComp @ 0x0BF0  (was 0xBD0 = CurrentEngageEnemy — off-target!)
+//   BP_MagazineBase::SGWeaponContainer @ 0x0940 (was 0x920 = pad)
+//   ASGWeapon::WeaponAmmoComp @ 0x0C70 (was 0xC50 = GunSoundComp)
+#define AH_MAG_WCC_OFF          0x940
 #define AH_MAG_CONTAIN_LIST     0x208
 #define AH_MAG_MAX_STACK        0x120
 #define AH_CONTAIN_STACKCOUNT_ITEM 0x08
-#define AH_WEAPON_AMMO_COMP     0xC50
-#define AH_WEAPON_ASSEMBLE      0xBD0
+#define AH_WEAPON_AMMO_COMP     0xC70
+#define AH_WEAPON_ASSEMBLE      0xBF0
 // v0.9.454: verified in Dumper-7 ABInfinite 4.26.1 SDK (SGFramework_classes.hpp:60936).
 // Old 0xBE8 was pre-micropatch; struct shifted +0x20 since 2026-07-25.
 #define AH_WEAPON_ZOOMCOMP      0xC08
