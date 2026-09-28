@@ -942,29 +942,25 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         }
 #endif
 
-        // Multi-name prefix match. Tencent ships several completely different
-        // process names across channels (verified from live EPROCESS walks):
-        //   UAGame.exe            — Global retail Tencent launcher
-        //   arena_breakout.exe    — Steam distribution (truncated to
-        //                           'arena_breakout.' in EPROCESS.ImageFileName)
-        //   UAGameShipping.exe    — some CN/dev builds
-        // We match on caller's procName primary (prefix-capped at 6 so
-        // "UAGame.exe" -> "UAGame" covers all UAGame* variants), plus a
-        // hard-coded list of KNOWN alternate base names so a single overlay
-        // build works across Retail + Steam.
-        static const char* AH_ALT_NAMES[] = {
-            "arena_breakout",   // Steam
-            "UAGameShipping",   // dev/test/CN
+        // v1.0.36: HARD WHITELIST. Exact ImageFileName match (case-insensitive,
+        // NUL-terminated). EPROCESS.ImageFileName is truncated at 15 chars.
+        //   "UAGame.exe"        (10 chars) → fits
+        //   "UAGameShipping.exe"(18 chars) → truncated to "UAGameShipping."
+        // Substring 'arena_breakout' matched arena_breakout_infinite_launcher.
+        // via ImageFileName truncation and let the reader latch on the .NET
+        // launcher wrapper (base=0x400000). Killed the substring; if Steam
+        // ships an actual UAGame.exe under a different basename we'll add
+        // it explicitly by name.
+        static const char* AH_WHITELIST[] = {
+            "UAGame.exe",
+            "UAGameShipping.",   // 15-char truncation of UAGameShipping.exe
             NULL
         };
-        size_t _match_n = strlen(procName);
-        if (_match_n > 6) _match_n = 6;
-        int _matched = (_strnicmp(imgName, procName, _match_n) == 0);
-        for (int _ai = 0; !_matched && AH_ALT_NAMES[_ai]; _ai++) {
-            size_t _al = strlen(AH_ALT_NAMES[_ai]);
-            if (_al > 14) _al = 14;   // ImageFileName cap - trailing NUL
-            if (_strnicmp(imgName, AH_ALT_NAMES[_ai], _al) == 0) _matched = 1;
+        int _matched = 0;
+        for (int _wi = 0; AH_WHITELIST[_wi]; _wi++) {
+            if (_stricmp(imgName, AH_WHITELIST[_wi]) == 0) { _matched = 1; break; }
         }
+        (void)procName;   // Whitelist is fixed; caller's procName is ignored.
         if (_matched) {
             u64 dtb = 0;
             RpmRead64(hDev, sysCR3, eproc + g_eproc_dtb, &dtb);
@@ -1115,48 +1111,29 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         while (1) {
             if (pi->ImageName.Buffer && pi->ImageName.Length) {
                 size_t nchars = pi->ImageName.Length / sizeof(WCHAR);
-                // Multi-name substring match. See EPROCESS-walk matcher above
-                // for why we probe several base names — Steam distribution
-                // ships arena_breakout.exe, retail ships UAGame.exe. Same
-                // fallback path serves both by scanning for either.
-                static const char* AH_ALT_NAMES2[] = {
-                    "arena_breakout",
-                    "UAGameShipping",
+                // v1.0.36: HARD WHITELIST. NtQSI(5)'s ImageName is the full
+                // basename with .exe extension (not the 15-char EPROCESS
+                // truncation). Exact case-insensitive match against a fixed
+                // list — no substrings, no procName-driven fuzz.
+                static const wchar_t* AH_WL[] = {
+                    L"UAGame.exe",
+                    L"UAGameShipping.exe",
                     NULL
                 };
-                size_t nlen = strlen(procName);
-                if (nlen > 6) nlen = 6;
-                // Store all names + their lengths in a small array for the
-                // substring loop below.
-                const char* _cands[4]  = { procName, NULL, NULL, NULL };
-                size_t      _clens[4]  = { nlen,     0,    0,    0    };
-                int _cn = 1;
-                for (int _ci = 0; AH_ALT_NAMES2[_ci] && _cn < 4; _ci++) {
-                    _cands[_cn] = AH_ALT_NAMES2[_ci];
-                    _clens[_cn] = strlen(AH_ALT_NAMES2[_ci]);
-                    if (_clens[_cn] > 14) _clens[_cn] = 14;
-                    _cn++;
-                }
-                // Loop over every candidate; first hit wins.
-                for (int _ci = 0; !uagame_pid && _ci < _cn; _ci++) {
-                    const char* _cand = _cands[_ci];
-                    size_t      _clen = _clens[_ci];
-                    if (nchars < _clen) continue;
-                    for (size_t i = 0; !uagame_pid && i + _clen <= nchars; i++) {
-                        int ok = 1;
-                        for (size_t k = 0; k < _clen; k++) {
-                            wchar_t w = pi->ImageName.Buffer[i + k];
-                            char c = _cand[k];
-                            if (w >= L'A' && w <= L'Z') w += 32;
-                            if (c >= 'A' && c <= 'Z') c += 32;
-                            if ((int)w != (int)(unsigned char)c) { ok = 0; break; }
-                        }
-                        if (ok) {
-                            uagame_pid = (u64)(uintptr_t)pi->UniqueProcessId;
-                            break;
-                        }
+                for (int _wi = 0; !uagame_pid && AH_WL[_wi]; _wi++) {
+                    size_t wl = wcslen(AH_WL[_wi]);
+                    if (nchars != wl) continue;
+                    int ok = 1;
+                    for (size_t k = 0; k < wl; k++) {
+                        wchar_t a = pi->ImageName.Buffer[k];
+                        wchar_t b = AH_WL[_wi][k];
+                        if (a >= L'A' && a <= L'Z') a = (wchar_t)(a + 32);
+                        if (b >= L'A' && b <= L'Z') b = (wchar_t)(b + 32);
+                        if (a != b) { ok = 0; break; }
                     }
+                    if (ok) uagame_pid = (u64)(uintptr_t)pi->UniqueProcessId;
                 }
+                (void)procName;
             }
             if (uagame_pid || !pi->NextEntryOffset) break;
             pi = (SYS_PROC*)((BYTE*)pi + pi->NextEntryOffset);
