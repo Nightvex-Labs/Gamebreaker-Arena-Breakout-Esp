@@ -194,7 +194,15 @@ extern "C" int AhOverlayRun(void) {
         // publish stale/garbage roomid. Without this gate HUD flashes in-raid
         // for a frame during ABI loading screens.
         int _reader_st = ah_reader_state();
-        stub_snap.in_raid = (live.roomid != 0) && (_reader_st == AH_READER_LIVE);
+        // v1.0.32: OR the two in-raid signals (roomid from ASGGameState+0x430,
+        // scene_type from +0x579). Roomid can lag behind actual raid enter on
+        // slow server-room-assign; scene_type flips first. Values from the
+        // Dumper-7 4.26.1 ABInfinite EGameSceneType enum: 2=InBattle (raid),
+        // 4=ShootingRoom (test range). Still gated on reader LIVE so we don't
+        // flash in-raid during ABI loading transitions.
+        stub_snap.in_raid =
+            ((live.roomid != 0) || (live.scene_type == 2) || (live.scene_type == 4))
+            && (_reader_st == AH_READER_LIVE);
         stub_snap.cam.x   = live.x;
         stub_snap.cam.y   = live.y;
         stub_snap.cam.z   = live.z;

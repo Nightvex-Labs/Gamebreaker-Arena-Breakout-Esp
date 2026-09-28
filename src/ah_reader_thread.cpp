@@ -865,9 +865,22 @@ static void reader_body_impl(void) {
             // Server sets on real raid start, clears on match end / return to
             // menu. ACE-decrypt-success was false-positive in the lobby (root
             // pawn = menu preview character, algo=0 = plaintext, decrypt "OK").
+            //
+            // v1.0.32: OR with EGameSceneType @ 0x579 (uint8 enum) — server
+            // sometimes lags assigning roomid but GameSceneType flips to
+            // InBattle (2) immediately on raid enter. In field triage of
+            // 574f4932 v1.0.28 the overlay stayed on "ATTACHED — LOADING
+            // WORLD" HUD even while the user was inside a raid because
+            // roomid stayed 0 across the entire session. Second signal
+            // covers that gap. ShootingRoom (4) is the tir/training range
+            // — also treat as in-raid so ESP works there for testing.
             u64 raid_room = 0;
             if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_ROOMID, &raid_room, 8);
             s.roomid = raid_room;
+
+            uint8_t scene_type = 0;
+            if (gs) RpmReadVirtual(drv.hDevice, procCR3, gs + AH_GS_SCENETYPE, &scene_type, 1);
+            s.scene_type = scene_type;
 
             // v0.9.454: raid → menu transition. `roomid != 0` while in a raid,
             // 0 in main menu / matchmaking. On the falling edge we wipe every
@@ -878,7 +891,9 @@ static void reader_body_impl(void) {
                 static bool s_was_in_raid    = false;
                 static int  s_out_streak     = 0;
                 static bool s_cleared        = false;
-                bool in_raid_now = (raid_room != 0);
+                bool in_raid_now = (raid_room != 0)
+                                   || (scene_type == AH_SCENE_INBATTLE)
+                                   || (scene_type == AH_SCENE_SHOOTINGROOM);
                 if (in_raid_now) {
                     s_was_in_raid = true;
                     s_out_streak  = 0;
@@ -1983,7 +1998,7 @@ static void reader_body_impl(void) {
                 s_health_last_ms = now2;
                 ah_diag("HEALTH state=%d hz=%.1f attached_pid=%llu procCR3=0x%llX "
                         "img=0x%llX gworld_seen=%d canary_seen=%d "
-                        "ent=%d loot=%d roomid=0x%llX in_raid=%d",
+                        "ent=%d loot=%d roomid=0x%llX scene=%u in_raid=%d",
                         g_reader_state.load(),
                         g_reader_hz.load(),
                         (unsigned long long)attached_pid,
@@ -1992,7 +2007,10 @@ static void reader_body_impl(void) {
                         (int)gworld_seen, (int)canary_seen,
                         s.ent_n, s.loot_n,
                         (unsigned long long)s.roomid,
-                        s.roomid != 0);
+                        (unsigned)s.scene_type,
+                        (s.roomid != 0)
+                            || (s.scene_type == AH_SCENE_INBATTLE)
+                            || (s.scene_type == AH_SCENE_SHOOTINGROOM));
             }
         }
         // Update reader-Hz gauge (rolling 500ms average).
