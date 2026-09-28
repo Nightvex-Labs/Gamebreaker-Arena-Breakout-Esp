@@ -341,7 +341,6 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
 
     for (const auto& e : snap->entities) {
         if (e.me) continue;
-        // (phantom filter dropped — was a DMA jitter-grace shim)
         // Teammates in same party — hide entirely (no box/skel/label/glow)
         if (!cfg.show_mates && my_team >= 0 && e.team == my_team) continue;
         bool is_pmc = e.cls.starts_with("PMC") || e.cls.starts_with("Player") || e.cls.starts_with("USER");
@@ -926,10 +925,6 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
             // Line: armor — always visible with '-' placeholders.
             l_arm[0] = 0;
             int helm_show = e.helm, vest_show = e.vest;
-            if (helm_show < 0 && vest_show < 0 && !e.armor.empty()) {
-                helm_show = e.armor[0];
-                if (e.armor.size() > 1) vest_show = e.armor[1];
-            }
             bool show_arm_class = cfg.show_armor_master
                                 && (is_pmc ? cfg.show_armor : cfg.show_bot_armor);
             // v0.9.337 semantic: 0=Off, 1=Text, 2=Bar.
