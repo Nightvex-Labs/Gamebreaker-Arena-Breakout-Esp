@@ -31,9 +31,6 @@ static inline float deg2rad(float d) { return d * PI / 180.0f; }
 struct Mat3 { float m[3][3]; };
 
 // v0.9.422 dev toggles вЂ” defined in reader.cpp (namespace abi), pushed here.
-extern std::atomic<int> g_dev_dump_all_bones;
-extern std::atomic<int> g_dev_force_yaw_only;
-extern std::atomic<int> g_dev_show_bone_ids;
 
 // v0.9.421: TEST panel writes here at the start of each render frame.
 // world_to_screen reads it inside its static base_fov_cached branch.
@@ -190,93 +187,6 @@ static ImU32 col_orange  = IM_COL32(255, 140,   0, 255);
 static ImU32 col_grey    = IM_COL32( 80,  80,  80, 255);
 
 // Map skeleton line endpoints to limb name (for HP color).
-static const char* limb_of_line(const std::string& a, const std::string& b) {
-    auto eq = [&](const char* x, const char* y) {
-        return (a == x && b == y) || (a == y && b == x);
-    };
-    if (eq("head","neck") || eq("neck","upper_chest")) return "head";
-    if (eq("upper_chest","mid_spine") || eq("mid_spine","upper_abdomen")) return "chest";
-    if (eq("upper_abdomen","lower_spine") || eq("lower_spine","pelvis")) return "abdomen";
-    if (eq("upper_chest","shoulder_L") || eq("shoulder_L","elbow_L") || eq("elbow_L","hand_L")) return "arm_L";
-    if (eq("upper_chest","shoulder_R") || eq("shoulder_R","elbow_R") || eq("elbow_R","hand_R")) return "arm_R";
-    if (eq("pelvis","knee_L") || eq("knee_L","foot_L")) return "leg_L";
-    if (eq("pelvis","knee_R") || eq("knee_R","foot_R")) return "leg_R";
-    return nullptr;
-}
-
-// Bone-limb HP ramp:
-//   100%  = white (no damage cue)
-//    90%  = dim orange (barely visible warning)
-//    50-60% = full bright orange
-//    40%  = pinkish red
-//    20%..1% = hot bright red (glow-like pop)
-//     0%  = black (limb destroyed)
-static ImU32 hp_color(const Entity& e, const char* limb, ImU32 base) {
-    if (!limb) return base;
-    if (e.hp_limbs.empty()) return base;
-    auto it = e.hp_limbs.find(limb);
-    if (it == e.hp_limbs.end()) return IM_COL32(0, 0, 0, 255);
-    if (it->second.base <= 0.0f) return base;
-    float f = it->second.cur / it->second.base;
-    if (f <= 0.001f) return IM_COL32(0,   0,   0,   255);   // 0% в†’ black
-    if (f >= 0.999f) return IM_COL32(255, 255, 255, 255);   // 100% в†’ white
-
-    struct Stop { float t; uint8_t r, g, b; };
-    static const Stop stops[] = {
-        {1.00f, 255, 255, 255},   // white
-        {0.90f, 180,  70,   0},   // dim orange
-        {0.50f, 255, 140,   0},   // bright orange
-        {0.40f, 255,  70,  90},   // pink red
-        {0.20f, 255,   0,   0},   // hot red
-        {0.00f, 220,   0,   0},   // deep red (just before black)
-    };
-    for (int i = 0; i < 5; i++) {
-        if (f <= stops[i].t && f >= stops[i + 1].t) {
-            float span = stops[i].t - stops[i + 1].t;
-            float k = span > 0 ? (f - stops[i + 1].t) / span : 0.0f;
-            int r = (int)(stops[i + 1].r * (1 - k) + stops[i].r * k);
-            int g = (int)(stops[i + 1].g * (1 - k) + stops[i].g * k);
-            int b = (int)(stops[i + 1].b * (1 - k) + stops[i].b * k);
-            return IM_COL32(r, g, b, 255);
-        }
-    }
-    return IM_COL32(255, 255, 255, 255);
-}
-
-// Damage fraction 0..1 (0 at full HP, 1 at destroyed). Drives the halo.
-static float hp_damage(const Entity& e, const char* limb) {
-    if (!limb || e.hp_limbs.empty()) return 0.0f;
-    auto it = e.hp_limbs.find(limb);
-    if (it == e.hp_limbs.end()) return 1.0f;    // limb missing = full damage
-    if (it->second.base <= 0.0f) return 0.0f;
-    float f = it->second.cur / it->second.base;
-    if (f < 0) f = 0; if (f > 1) f = 1;
-    return 1.0f - f;
-}
-
-// Skeleton bone-pair lines (for plain non-glow path + limb HP color lookup)
-static const std::pair<const char*, const char*> SKEL_LINES[] = {
-    {"head","neck"}, {"neck","upper_chest"}, {"upper_chest","mid_spine"},
-    {"mid_spine","upper_abdomen"}, {"upper_abdomen","lower_spine"},
-    {"lower_spine","pelvis"},
-    {"upper_chest","shoulder_L"}, {"shoulder_L","elbow_L"}, {"elbow_L","hand_L"},
-    {"upper_chest","shoulder_R"}, {"shoulder_R","elbow_R"}, {"elbow_R","hand_R"},
-    {"pelvis","knee_L"}, {"knee_L","foot_L"},
-    {"pelvis","knee_R"}, {"knee_R","foot_R"},
-};
-
-// Continuous bone chains for smooth glow polylines (avoid joint-cap artifacts)
-struct LimbChain { const char* limb; const char* bones[8]; int n; };
-static const LimbChain SKEL_CHAINS[] = {
-    {"head",    {"head","neck","upper_chest"},                         3},
-    {"chest",   {"upper_chest","mid_spine","upper_abdomen"},            3},
-    {"abdomen", {"upper_abdomen","lower_spine","pelvis"},               3},
-    {"arm_L",   {"upper_chest","shoulder_L","elbow_L","hand_L"},        4},
-    {"arm_R",   {"upper_chest","shoulder_R","elbow_R","hand_R"},        4},
-    {"leg_L",   {"pelvis","knee_L","foot_L"},                           3},
-    {"leg_R",   {"pelvis","knee_R","foot_R"},                           3},
-};
-
 void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
@@ -300,9 +210,6 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
     g_fov_correction_pct = cfg.fov_correction_pct;
     g_fov_auto_horplus   = cfg.fov_auto_horplus;
     // v0.9.422 dev: push reader-side toggles (definitions live in reader.cpp).
-    g_dev_dump_all_bones.store(cfg.dev_dump_all_bones, std::memory_order_relaxed);
-    g_dev_force_yaw_only.store(cfg.dev_force_yaw_only, std::memory_order_relaxed);
-    g_dev_show_bone_ids.store(cfg.dev_show_bone_ids, std::memory_order_relaxed);
 
     Mat3 mat = cam_matrix(snap->cam);
     const auto& cam = snap->cam;
@@ -332,8 +239,7 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
 
     for (const auto& e : snap->entities) {
         if (e.me) continue;
-        // (phantom filter dropped вЂ” was a DMA jitter-grace shim)
-        // Teammates in same party вЂ” hide entirely (no box/skel/label/glow)
+        // Teammates in same party — hide entirely (no box/skel/label/glow)
         if (!cfg.show_mates && my_team >= 0 && e.team == my_team) continue;
         bool is_pmc = e.cls.starts_with("PMC") || e.cls.starts_with("Player") || e.cls.starts_with("USER");
         bool is_bot = e.cls.starts_with("BOT");
@@ -426,7 +332,6 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
         // Labels вЂ” no visible-check tint.
         ImU32 col_name_e = class_col_dead(cfg.col_name_pmc,     cfg.col_name_bot);
         ImU32 col_dist_e = class_col_dead(cfg.col_distance_pmc, cfg.col_distance_bot);
-        ImU32 col_skel_e = class_col_dead(cfg.col_skel_pmc,     cfg.col_skel_bot);
         // Fold the prefire-grace alpha into the base tint so every downstream
         // rect / text / line the loop draws dims uniformly.
         auto fold_alpha = [&](ImU32& c) {
@@ -438,7 +343,6 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
         fold_alpha(base);
         fold_alpha(col_name_e);
         fold_alpha(col_dist_e);
-        fold_alpha(col_skel_e);
 
         // Box anchor вЂ” chest-ish height (predicted pos).
         // v2026-09-23 arenahack:
@@ -478,43 +382,7 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
         float box_center_y = p.sy + ((top_pad + bot_pad) * 0.5f + (float)cfg.test_box_shift_y)
                              * scale_factor / p.depth;
 
-        // v0.9.422: BONE-ANCHORED BOX is DISABLED вЂ” the current fallback
-        // BONE_TABLE contains approximate ids that project head/foot bones
-        // to wrong screen coords, which would stretch/warp the box.  Revert
-        // to pure capsule-based box (stable).  Re-enable this override only
-        // once auto-classify (skeleton_classify.cpp) reliably returns valid
-        // head/foot indices per pawn.
-        //
-        // The block still runs so find_pt lambda stays defined for the
-        // downstream head-circle draw вЂ” but bot_y stays nullopt so box_h /
-        // box_center_y keep their capsule-computed values.
-        {
-            const float bo_x = pp.x - e.bone_anchor_x;
-            const float bo_y = pp.y - e.bone_anchor_y;
-            auto find_pt = [&](const char* name) -> std::optional<ScreenPt> {
-                auto it = e.bones.find(name);
-                if (it == e.bones.end()) return std::nullopt;
-                ScreenPt sp = world_to_screen(it->second.x + bo_x,
-                                              it->second.y + bo_y,
-                                              it->second.z,
-                                              cam, mat, cfg.screen_w, cfg.screen_h);
-                return sp.ok ? std::optional<ScreenPt>(sp) : std::nullopt;
-            };
-            auto head = find_pt("head");
-            auto footL = find_pt("foot_L");
-            auto footR = find_pt("foot_R");
-            std::optional<float> bot_y;   // stays nullopt вЂ” capsule box wins
-            if (head && bot_y) {
-                float top_y = head->sy - 4.0f;   // 4px hair/helmet padding
-                float bot_y_val = *bot_y + 2.0f;
-                box_h = bot_y_val - top_y;
-                box_center_y = (top_y + bot_y_val) * 0.5f;
-                // recompute box_w scale slightly since bones give tighter fit
-                box_w = scale_factor * (e.cap_r * 1.8f) / p.depth;
-            }
-        }
-
-        // 2D / 3D Box вЂ” per-class toggle, plain crisp lines (no glow).
+        // 2D / 3D Box — per-class toggle, plain crisp lines (no glow).
         int box_mode_this = is_pmc ? cfg.box_mode : cfg.box_mode_bot;
         bool box_class_on = (is_pmc && cfg.show_box_pmc) || (is_bot && cfg.show_box_bot);
         if (box_class_on && box_mode_this > 0) {
@@ -653,10 +521,6 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
             // (РЅР°РїСЂ. РЅР° Р±РѕС‚Р°С… reader РєР»Р°РґС‘С‚ С‚РёСЂС‹ РІ e.armor РІРјРµСЃС‚Рѕ .helm/.vest),
             // Р±РµСЂС‘Рј РёР· e.armor[]. РќСѓР»РµРІРѕР№ С‚РёСЂ = В«РЅРµ РЅР°РґРµС‚РѕВ» вЂ” СЃРєСЂС‹РІР°РµРј.
             int hb = e.helm, vb = e.vest;
-            if (hb < 1 && vb < 1 && !e.armor.empty()) {
-                hb = e.armor[0];
-                if (e.armor.size() > 1) vb = e.armor[1];
-            }
             if (hb > 0) {
                 dl->AddRectFilled(ImVec2(bx - 0.5f, by - 0.5f),
                                   ImVec2(bx + bw + 0.5f, by + half + 0.5f), shadow);
@@ -676,194 +540,7 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
             }
         }
 
-        // Skeleton + HP coloring вЂ” gated by per-class skeleton range
-        float dist_m_skel = dist_units / UE_UNITS_PER_M;
-        float skel_range_class = is_pmc ? cfg.skeleton_range_m : cfg.bot_skeleton_range_m;
-        bool skel_on = ((is_pmc && cfg.show_skeleton_pmc) || (is_bot && cfg.show_skeleton_bot))
-                       && dist_m_skel <= skel_range_class;
-        // v0.9.337: two guards against close-range skeleton mangling.
-        //
-        //   (a) DEAD entities carry a frozen pose from the moment the reader
-        //       last captured bones вЂ” usually mid-walk/mid-fall, and the
-        //       bone_anchor drift compensation then teleports that mid-motion
-        //       pose to the corpse's death location. Result: contorted
-        //       skeletons on 7m corpses (screenshot from operator). Just
-        //       hide the skeleton on dead entities вЂ” box+name+dist are still
-        //       drawn so you can spot the corpse for looting.
-        //
-        //   (b) STALE live entities: if the reader hasn't refreshed this
-        //       entity's position within the last ~350ms, the pose we have
-        //       is old, the predicted pp probably diverges from real,
-        //       and (predicted - bone_anchor) offset warps knees, arms,
-        //       spine independently вЂ” the "twisted skeleton at close range"
-        //       glitch. Drop the skeleton until fresh data arrives.
-        if (skel_on && e.dead) skel_on = false;
-        if (skel_on && e.last_pos_t > 0.0) {
-            using namespace std::chrono;
-            double now_s = duration<double>(steady_clock::now().time_since_epoch()).count();
-            double age = now_s - e.last_pos_t;
-            // v0.9.422: relaxed 0.35в†’1.5s.  With ComponentToWorld matrix now
-            // properly applied to bones, the "twisted skeleton at close range"
-            // glitch this guard used to catch is fixed at source.  Old tight
-            // window caused skeletons to flicker/freeze when reader missed a
-            // tick or two under bridge contention at close range.
-            if (age > 1.5) skel_on = false;
-        }
-        // v0.9.337: MOVEMENT gate. Bones are captured in world coords AT
-        // bone_anchor_pos with the pawn's yaw at that moment baked in.
-        // We translate them by (pp - bone_anchor) to move the skeleton
-        // with the predicted position, but we DON'T re-rotate.
-        //
-        // v0.9.410 CLEANUP:
-        //   * dropped the drift2 > 10000 kill-switch (users report skeleton
-        //     disappears at close range when character is moving вЂ” this was
-        //     the culprit; naive translation is fine visually up to 5-6m)
-        //   * dropped the "collapsed pose < 80cm" guard (fired on legit
-        //     crouches, revive stances, low-cover peeks)
-        //   * dropped the foot-alignment override (it was pinning feet to
-        //     pp.z - cap_hh, which in this game's crouch dropped the whole
-        //     skeleton ~50px below the box because cap_hh doesn't shrink
-        //     the way the v0.9.337 comment assumed; bones are stored in
-        //     absolute world Z so no vertical re-shift is needed)
-        if (skel_on && !e.bones.empty()) {
-            // Horizontal shift only вЂ” bones stored in absolute world XY at
-            // capture time, so slide them to the predicted position.
-            const float bo_x = pp.x - e.bone_anchor_x;
-            const float bo_y = pp.y - e.bone_anchor_y;
-            // v2026-09-20: restore historical delta-Z shift (was in
-            // .ui_backup_prev/render.cpp). Bones captured at bone_anchor_z;
-            // shift by (pp.z - anchor_z) so skeleton tracks vertical
-            // pelvis movement (jumps, crouches, terrain slope).
-            const float bo_z = pp.z - e.bone_anchor_z;
-            auto find_bone = [&](const char* name) -> std::optional<ImVec2> {
-                auto it = e.bones.find(name);
-                if (it == e.bones.end()) return std::nullopt;
-                auto sp = world_to_screen(it->second.x + bo_x,
-                                          it->second.y + bo_y,
-                                          it->second.z + bo_z,
-                                          cam, mat, cfg.screen_w, cfg.screen_h);
-                if (!sp.ok) return std::nullopt;
-                return ImVec2(sp.sx, sp.sy);
-            };
-            // Plain crisp lines only вЂ” glow path removed. Thickness scales
-            // inversely with distance. v0.9.337: coefficient dropped from
-            // 1.6 в†’ 1.35 (~-16%) and floor 0.6 в†’ 0.5 per operator request,
-            // close-range bones were reading too chunky and covering armor
-            // ID text underneath.
-            // v0.9.410: another -12% pass вЂ” 1.35 в†’ 1.18, floor 0.5 в†’ 0.44
-            // v0.9.422 polish: thinner lines matching Crooked-Arms reference.
-            // Base 0.75 (was 1.18) with floor 0.35 (was 0.44).  Distance
-            // falloff still applies but caps at ~1px at close range.
-            float thk = 0.75f * std::min(1.0f, 25.0f / std::max(dist_m_skel, 1.0f));
-            if (thk < 0.35f) thk = 0.35f;
-            for (auto& [a, b] : SKEL_LINES) {
-                auto pa = find_bone(a);
-                auto pb = find_bone(b);
-                if (!pa || !pb) continue;
-                const char* limb = limb_of_line(a, b);
-                ImU32 c = hp_color(e, limb, col_skel_e);
-
-                // Halo underlay вЂ” wider, semi-transparent copy of the core
-                // color. Alpha grows with damage so low-HP limbs bloom.
-                float dmg = hp_damage(e, limb);
-                if (dmg > 0.05f) {
-                    ImU32 halo = (c & 0x00FFFFFFu) |
-                                 ((uint32_t)(dmg * 140.0f) << 24);
-                    dl->AddLine(*pa, *pb, halo, thk * (1.6f + dmg * 2.0f));
-                }
-                dl->AddLine(*pa, *pb, c, thk);
-            }
-
-            // Joint dots at key articulation points вЂ” cleaner readability.
-            if (cfg.skeleton_joints) {
-                // Only limb extremities вЂ” 8 dots total. Spine/shoulder dots
-                // stacked visually and made the skeleton look busy at range.
-                static const struct { const char* bone; const char* limb; } JOINTS[] = {
-                    { "elbow_L", "arm_L" }, { "hand_L", "arm_L" },
-                    { "elbow_R", "arm_R" }, { "hand_R", "arm_R" },
-                    { "knee_L",  "leg_L" }, { "foot_L", "leg_L" },
-                    { "knee_R",  "leg_R" }, { "foot_R", "leg_R" },
-                };
-                // v0.9.422: joint dots вЂ” decouple radius from line thickness
-                // (thin lines look better, but dots need to stay visible).
-                // r = 1.65px close, floors at 0.8px far.
-                float r_dot_base = 1.18f * std::min(1.0f, 25.0f / std::max(dist_m_skel, 1.0f));
-                if (r_dot_base < 0.5f) r_dot_base = 0.5f;
-                float r = r_dot_base * 1.4f + 0.4f;
-                for (auto& j : JOINTS) {
-                    auto jp = find_bone(j.bone);
-                    if (!jp) continue;
-                    ImU32 jc = hp_color(e, j.limb, col_skel_e);
-                    dl->AddCircleFilled(*jp, r, jc, 10);
-                    dl->AddCircle(*jp, r + 0.6f, IM_COL32(0, 0, 0, 220), 10, 0.8f);
-                }
-            }
-
-            // v0.9.422 dev: raw bone-id picker.  When dump_all_bones=1, reader
-            // emits every bone as raw_N; we draw a small dot per raw and вЂ” if
-            // show_bone_ids=1 вЂ” the id label next to it so you can identify
-            // which numeric id corresponds to shoulder/elbow/spine/etc.
-            if (cfg.dev_dump_all_bones || cfg.dev_show_bone_ids) {
-                bool draw_labels = cfg.dev_show_bone_ids != 0;
-                ImU32 raw_dot = IM_COL32(255, 220,  60, 220);   // yellow
-                ImU32 raw_txt = IM_COL32(255, 255, 255, 255);
-                ImU32 raw_bg  = IM_COL32(  0,   0,   0, 200);
-                for (const auto& [name, b] : e.bones) {
-                    // Only process raw_* entries (present when dump_all_bones=1).
-                    if (name.rfind("raw_", 0) != 0) continue;
-                    ScreenPt sp = world_to_screen(b.x, b.y, b.z, cam, mat,
-                                                  cfg.screen_w, cfg.screen_h);
-                    if (!sp.ok) continue;
-                    ImVec2 pt(sp.sx, sp.sy);
-                    dl->AddCircleFilled(pt, 2.5f, raw_dot, 8);
-                    if (draw_labels) {
-                        const char* idstr = name.c_str() + 4;   // skip "raw_"
-                        ImVec2 tsz = ImGui::CalcTextSize(idstr);
-                        ImVec2 tp(sp.sx + 3.0f, sp.sy - tsz.y - 1.0f);
-                        dl->AddRectFilled(ImVec2(tp.x - 1, tp.y),
-                                          ImVec2(tp.x + tsz.x + 1, tp.y + tsz.y),
-                                          raw_bg);
-                        dl->AddText(tp, raw_txt, idstr);
-                    }
-                }
-            }
-            // If show_bone_ids is on but dump is off, also label the named
-            // BONE_TABLE joints so you can see what id our current table
-            // resolves to on this pawn.
-            if (cfg.dev_show_bone_ids && !cfg.dev_dump_all_bones) {
-                ImU32 ntxt = IM_COL32(180, 255, 180, 255);
-                ImU32 nbg  = IM_COL32(  0,   0,   0, 200);
-                for (const auto& [name, b] : e.bones) {
-                    if (name.rfind("raw_", 0) == 0) continue;
-                    ScreenPt sp = world_to_screen(b.x, b.y, b.z, cam, mat,
-                                                  cfg.screen_w, cfg.screen_h);
-                    if (!sp.ok) continue;
-                    ImVec2 tsz = ImGui::CalcTextSize(name.c_str());
-                    ImVec2 tp(sp.sx + 4.0f, sp.sy - tsz.y * 0.5f);
-                    dl->AddRectFilled(ImVec2(tp.x - 1, tp.y),
-                                      ImVec2(tp.x + tsz.x + 1, tp.y + tsz.y),
-                                      nbg);
-                    dl->AddText(tp, ntxt, name.c_str());
-                }
-            }
-
-            // Head ring вЂ” sized from neck-to-head distance so it hugs the
-            // real head, not a fixed pixel radius.
-            if (cfg.head_circle) {
-                auto hp = find_bone("head");
-                auto np = find_bone("neck");
-                if (hp && np) {
-                    float dx = hp->x - np->x, dy = hp->y - np->y;
-                    float r  = sqrtf(dx*dx + dy*dy) * 0.75f;
-                    if (r < 3.0f) r = 3.0f;
-                    ImU32 hc = hp_color(e, "head", cfg.col_head);
-                    dl->AddCircle(*hp, r, hc, 20, thk + 0.4f);
-                    dl->AddCircle(*hp, r + 0.8f, IM_COL32(0, 0, 0, 220), 20, 0.8f);
-                }
-            }
-        }
-
-        // Multi-line label stack вЂ” name, weapon, armor, dist+flags. HP hidden.
+        // Multi-line label stack — name, weapon, armor, dist+flags. HP hidden.
         if (cfg.show_hud) {
             float dist_m = dist_units / UE_UNITS_PER_M;
             char l_name[64], l_team[16], l_hp[24], l_wpn[32], l_mag[32], l_arm[32], l_dist[64];
@@ -925,13 +602,9 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
             // РќРµ РјРµСЂР¶РёРј вЂ” РѕСЂСѓР¶РёРµ/РїР°С‚СЂРѕРЅС‹/РґРёСЃС‚Р°РЅС†РёСЏ СЂРёСЃСѓСЋС‚СЃСЏ РѕРґРЅРѕР№ СЃС‚СЂРѕРєРѕР№
             // РџРћР” Р±РѕРєСЃРѕРј РЅРёР¶Рµ (weapon В· ammo В· dist).
 
-            // Line: armor вЂ” always visible with '-' placeholders.
+            // Line: armor — always visible with '-' placeholders.
             l_arm[0] = 0;
             int helm_show = e.helm, vest_show = e.vest;
-            if (helm_show < 0 && vest_show < 0 && !e.armor.empty()) {
-                helm_show = e.armor[0];
-                if (e.armor.size() > 1) vest_show = e.armor[1];
-            }
             bool show_arm_class = is_pmc
                                 && cfg.show_armor_master
                                 && cfg.show_armor;
@@ -1517,76 +1190,7 @@ void render_perf_hud(const RenderConfig& cfg) {
     dl->AddText(font, fs, ImVec2(x,y),     IM_COL32(180,255,180,255), buf);
 }
 
-// v0.9.419 exp: temporary diag HUD вЂ” dump raw AnimProxy zoom_offset + cam
-// angles so we can derive the correct application formula from real values
-// (hip, ADS level, ADS aim-up, ADS aim-down). Remove before shipping.
-void render_zoom_debug(const Snapshot* snap) {
-    if (!snap) return;
-    const auto& cam = snap->cam;
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    ImFont* font = ImGui::GetFont();
-    float fs = ImGui::GetFontSize();
-    float x = 12.0f, y = 40.0f;
-    char buf[192];
-    // v0.9.421: show effective_fov actually used, matching source selector.
-    float sm_dbg = (cam.scope_mag > 0.5f && cam.scope_mag < 20.0f) ? cam.scope_mag : 1.0f;
-    static float base_fov_dbg = 110.0f;
-    if (sm_dbg <= 1.05f && cam.fov > 60.0f && cam.fov < 130.0f) base_fov_dbg = cam.fov;
-    float eff_fov_dbg;
-    const char* src_lbl = "base/sm";
-    if (sm_dbg > 1.5f) {
-        int src = g_test_fov_source;
-        if      (src == 1 && cam.scope_fov > 1.0f) { eff_fov_dbg = cam.scope_fov;      src_lbl = "ADSScene"; }
-        else if (src == 2 && cam.scope_fov > 1.0f) { eff_fov_dbg = cam.scope_fov/sm_dbg; src_lbl = "ADSScene/sm"; }
-        else if (src == 3)                          { eff_fov_dbg = cam.fov/sm_dbg;    src_lbl = "POV/sm"; }
-        else                                        { eff_fov_dbg = (base_fov_dbg + g_test_fov_bias)/sm_dbg; src_lbl = "base/sm"; }
-    } else {
-        eff_fov_dbg = cam.fov;
-        src_lbl = "hip";
-    }
-    snprintf(buf, sizeof(buf),
-             "FOV[%s]=%.2f  POV=%.1f base=%.1f ADSScn=%.1f mag=%.1fx  yaw=%+.1f pitch=%+.1f roll=%+.1f",
-             src_lbl, eff_fov_dbg, cam.fov, base_fov_dbg, cam.scope_fov, sm_dbg,
-             cam.yaw, cam.pitch, cam.roll);
-    dl->AddText(font, fs, ImVec2(x+1, y+1), IM_COL32(0,0,0,220), buf);
-    dl->AddText(font, fs, ImVec2(x,   y),   IM_COL32(255,200,120,255), buf);
-    // v0.9.419: always show CHAIN string from reader::diag() (fallback)
-    const char* d = reader::diag();
-    if (d && d[0]) {
-        float y2 = y + fs + 4.0f;
-        dl->AddText(font, fs, ImVec2(x+1, y2+1), IM_COL32(0,0,0,220), d);
-        dl->AddText(font, fs, ImVec2(x,   y2),   IM_COL32(120,255,180,255), d);
-    }
-    // v0.9.420: scope chain вЂ” shows which link (pawn/wm/cw/zc/live) is
-    // failing so we can pinpoint the offset drift after game patches.
-    const char* sd = reader::scope_diag();
-    if (sd && sd[0]) {
-        float y3 = y + (fs + 4.0f) * 2.0f;
-        dl->AddText(font, fs, ImVec2(x+1, y3+1), IM_COL32(0,0,0,220), sd);
-        dl->AddText(font, fs, ImVec2(x,   y3),   IM_COL32(255,140,200,255), sd);
-    }
-    // v0.9.420: PCM struct dump вЂ” 4 rows of 16 floats each, PCM+0x2100..0x21FF.
-    // Screenshot in hip vs 7x ADS, diff to find post-modifier POV location.
-    for (int i = 0; i < 4; ++i) {
-        const char* cd = reader::cam_diag(i);
-        if (cd && cd[0]) {
-            float y4 = y + (fs + 4.0f) * (3 + i);
-            dl->AddText(font, fs, ImVec2(x+1, y4+1), IM_COL32(0,0,0,220), cd);
-            dl->AddText(font, fs, ImVec2(x,   y4),   IM_COL32(180,220,255,255), cd);
-        }
-    }
-    // v0.9.421: per-class bone diag вЂ” compare PMC vs BOT arr_num and lz values.
-    for (int i = 0; i < 2; ++i) {
-        const char* bd = reader::bone_diag(i);
-        if (bd && bd[0]) {
-            float y5 = y + (fs + 4.0f) * (7 + i);
-            dl->AddText(font, fs, ImVec2(x+1, y5+1), IM_COL32(0,0,0,220), bd);
-            dl->AddText(font, fs, ImVec2(x,   y5),   IM_COL32(255,220,120,255), bd);
-        }
-    }
-}
-
-// User's own ammo вЂ” bottom-right, big font.
+// User's own ammo — bottom-right, big font.
 void render_my_ammo(const Snapshot* snap, const RenderConfig& cfg) {
     if (!snap || !cfg.show_my_ammo) return;
     const auto& cam = snap->cam;

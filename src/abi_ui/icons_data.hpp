@@ -98,9 +98,6 @@ inline constexpr SvgEntry kSvgTable[] = {
   { "frame",
     R"(<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M4 8V6a2 2 0 0 1 2-2h2'/><path d='M16 4h2a2 2 0 0 1 2 2v2'/><path d='M20 16v2a2 2 0 0 1-2 2h-2'/><path d='M8 20H6a2 2 0 0 1-2-2v-2'/></svg>)"
   },
-  { "skeleton",
-    R"(<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M17 10c.7-.7 1.69 0 2.5 0a2.5 2.5 0 1 0 0-5 .5.5 0 0 1-.5-.5 2.5 2.5 0 1 0-5 0c0 .81.7 1.8 0 2.5l-7 7c-.7.7-1.69 0-2.5 0a2.5 2.5 0 0 0 0 5c.28 0 .5.22.5.5a2.5 2.5 0 1 0 5 0c0-.81-.7-1.8 0-2.5Z'/></svg>)"
-  },
   { "tag",
     R"(<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M20.4 13.2 13.2 20.4a2 2 0 0 1-2.8 0l-7-7A2 2 0 0 1 2.8 12V4.8A2 2 0 0 1 4.8 2.8H12a2 2 0 0 1 1.4.6l7 7a2 2 0 0 1 0 2.8z'/><circle cx='7.4' cy='7.4' r='1.3'/></svg>)"
   },

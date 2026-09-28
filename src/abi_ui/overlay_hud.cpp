@@ -216,21 +216,6 @@ void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
                 std::snprintf(buf, sizeof(buf), "%.0f %.0f %.0f", me_ent_ptr->x, me_ent_ptr->y, me_ent_ptr->z);
                 chip("me", buf, false);
             }
-            // 2026-08-18 self_v2 — spawn-reliable locator diagnostic.
-            if (snap->self_v2.valid) {
-                const char* mname = "?";
-                switch (snap->self_v2.method) {
-                    case 1: mname = "spawn"; break;
-                    case 2: mname = "pawn";  break;
-                    case 3: mname = "sync";  break;
-                    case 4: mname = "ack";   break;
-                }
-                std::snprintf(buf, sizeof(buf), "%s %.0f %.0f %.0f", mname,
-                              snap->self_v2.x, snap->self_v2.y, snap->self_v2.z);
-                chip("v2", buf, /*accent*/ true);
-            } else {
-                chip("v2", "MISS", false);
-            }
         }
         // v0.9.430: FOV / scope chips removed at operator request (screenshot clutter).
         y_cursor += CHIP_H + HUD_COL_GAP;

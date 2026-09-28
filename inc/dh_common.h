@@ -184,11 +184,6 @@ typedef enum {
 // CharacterEquipComponent
 #define DF_EQUIP_INFOARRAY         0x1D8
 
-// USkinnedMeshComponent
-#define DF_MESH_SKELETALMESH       0x728
-#define DF_MESH_BONEARRAY          0x760
-#define DF_MESH_BONEARRAY2         0x770
-
 // UCharacterMovementComponent
 #define DF_MOVE_VELOCITY           0x2B0
 

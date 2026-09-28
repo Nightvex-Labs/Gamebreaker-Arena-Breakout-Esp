@@ -168,13 +168,11 @@
 #define AH_ZC_TARGET_SCOPE_MAG  0x578   // SDK ScopeMagnification (static target)
 
 // ============================================================================
-// Mesh + bones
+// Mesh
 // ============================================================================
 #define AH_MESH_ANIM_INSTANCE   0x778
 #define AH_MESH_LAST_RENDER     0x32C
-#define AH_MESH_BONE_ARRAY      0x818
 #define AH_MESH_COMPONENT_TO_WORLD  0x220
-#define AH_BONE_FTRANSFORM_SZ   48
 
 // ============================================================================
 // ULevel
