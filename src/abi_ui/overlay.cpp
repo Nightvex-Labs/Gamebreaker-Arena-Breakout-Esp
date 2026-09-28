@@ -3,6 +3,7 @@
 #include "api_resolver.hpp"  // v0.9.472 A7
 #include "runlog.hpp"
 #include "crash_marker.hpp"
+#include "../ah_reader_thread.h"   // v0.9.455: ah_reader_state()
 #include <dwmapi.h>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -10,14 +11,9 @@
 #include "icons.hpp"
 #include "image_loader.hpp"
 #include "control_panel.hpp"
-#include "misc/freetype/imgui_freetype.h"
-#include "../ah_reader_thread.h"   // v1.0.29: reader state for status HUD
 #include <psapi.h>
 #include <d3d11.h>
 #include <chrono>
-#include <vector>
-#include <cstdio>
-#include <cstring>
 #include <thread>
 #include <string>
 #include <cstdint>
@@ -46,18 +42,6 @@ static HWND find_game_hwnd();
 // v0.9.436: set to true in create_d3d() when WARP is selected.  Read by
 // per-frame fps-cap clamp below to hard-limit renderer to 30fps under WARP.
 static bool g_using_warp = false;
-
-}   // close namespace abi so the getters below live at file scope
-
-// Panel DPI ratio (1.0 at 96 dpi, 1.5 at 144 dpi …). Written once during
-// font atlas build. overlay_boot.cpp (extern "C" AhOverlayRun) reads it
-// through the C-linkage getter so no name-mangling surprises across
-// extern "C" boundaries.
-static float s_panel_dpi = 1.0f;
-extern "C" float ah_get_panel_dpi(void) { return s_panel_dpi; }
-extern "C" void  ah_set_panel_dpi(float v) { s_panel_dpi = v; }
-
-namespace abi {
 
 Overlay* Overlay::s_instance = nullptr;
 
@@ -210,21 +194,6 @@ void Overlay::set_input_capture(bool on) {
 bool Overlay::init(int sw, int sh) {
     sw_ = sw; sh_ = sh;
     LOG("overlay::init enter sw=%d sh=%d", sw, sh);
-
-    // HOST_PATCH.md v5 §2.1 — declare the process DPI-aware BEFORE the
-    // window is created so Windows never bitmap-scales the frame (the
-    // classic "жирный / мутный шрифт" symptom). Per-monitor v2 is the
-    // strictest mode, falls back to older APIs on pre-Win10 1703.
-    using PFN_SetProcessDpiAwarenessContext = BOOL (WINAPI*)(DPI_AWARENESS_CONTEXT);
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    bool dpi_set = false;
-    if (user32) {
-        auto p = (PFN_SetProcessDpiAwarenessContext)
-                 GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-        if (p && p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) dpi_set = true;
-    }
-    if (!dpi_set) SetProcessDPIAware();
-
     LOG("overlay::init calling create_window()");
     if (!create_window()) { LOG("overlay::init create_window FAIL"); return false; }
     LOG("overlay::init create_window OK hwnd=%p", hwnd_);
@@ -250,198 +219,33 @@ bool Overlay::init(int sw, int sh) {
     st.Colors[ImGuiCol_WindowBg]  = ImVec4(0,0,0,0);
     st.Colors[ImGuiCol_MenuBarBg] = ImVec4(0,0,0,0);
 
-    // Latin + Cyrillic + symbols for the panel and Latin/Cyrillic
-    // gamertags. Chinese-Simplified is intentionally NOT baked here — with
-    // 10 typed faces at 12..52 px each the CJK range (~4700 codepoints)
-    // overflows the default 1024×1024 atlas and silently drops the tail,
-    // producing empty boxes for Cyrillic. A separate CJK atlas would need
-    // its own font slot; not in scope for panel typography.
+    // Combined Latin + Cyrillic + Simplified-Chinese range so we can display
+    // any player nickname regardless of alphabet.
     ImFontGlyphRangesBuilder builder;
     builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
     builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+    builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
     // Cover extras common in gamertags — arrows, symbols, extended Latin.
     static const ImWchar extra_range[] = { 0x2000, 0x206F, 0x2100, 0x21FF, 0x2600, 0x26FF, 0 };
     builder.AddRanges(extra_range);
     static ImVector<ImWchar> ranges;
     builder.BuildRanges(&ranges);
 
-    // Bigger atlas so 10 Unbounded/JBM faces × Latin+Cyrillic pack cleanly
-    // (default 1024 wraps and starts dropping glyphs quietly).
-    io.Fonts->TexDesiredWidth = 4096;
-
-    // GameBreaker panel font loader (HOST_PATCH.md v5 §2).
-    // 10 typed faces, each keyed by ImFontConfig::Name ("gb:ub700:24" etc)
-    // so control_panel.cpp's find_font() can pick them up. Baked size =
-    // CSS-em × (ascent-descent)/unitsPerEm × DPI so a "14 px" CSS glyph
-    // renders at the same physical size ImGui would draw a 14 px CSS box.
-    auto exists_file = [](const char* p) {
-        FILE* f = nullptr;
-        if (fopen_s(&f, p, "rb") == 0 && f) { fclose(f); return true; }
-        return false;
+    ImFontConfig cfg;
+    cfg.MergeMode = false;
+    cfg.PixelSnapH = true;
+    // Simple single-font loader (baseline pre-bundle).
+    const char* font_candidates[] = {
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
     };
-    // Font path resolution — try three roots in order:
-    //   1) CWD-relative — ah_launcher.c sets CWD to the install folder before
-    //      spawning the child, so "assets\fonts\..." works for KoenFlow.
-    //   2) EXE-relative — the child overlay lives at %TEMP%\<hex>.exe; if the
-    //      launcher chain also drops fonts next to it (dev build, sidecar
-    //      staging), that path wins.
-    //   3) DH_INSTALL_DIR — the launcher exports this env var to the cage's
-    //      install folder even when it can't set CWD (elevated relaunch,
-    //      failed cage move). Guaranteed to point at where assets/ lives.
-    //   4) Absolute Windows fallback — kept as last resort so the overlay
-    //      still boots with Segoe UI if none of the above hold.
-    static char s_font_bufs[24][MAX_PATH];
-    static int  s_font_slot = 0;
-    auto join = [&](const char* base, const char* rel) -> const char* {
-        char* out = s_font_bufs[s_font_slot++ % 24];
-        _snprintf_s(out, MAX_PATH, _TRUNCATE, "%s\\%s", base, rel);
-        return out;
-    };
-    auto exe_dir = [&](char* out, DWORD cap) -> bool {
-        DWORD n = GetModuleFileNameA(nullptr, out, cap);
-        if (!n || n >= cap) return false;
-        char* slash = std::strrchr(out, '\\');
-        if (!slash) return false;
-        *slash = 0;
-        return true;
-    };
-    auto install_dir = [&](char* out, DWORD cap) -> bool {
-        DWORD n = GetEnvironmentVariableA("DH_INSTALL_DIR", out, cap);
-        return n > 0 && n < cap;
-    };
-    auto try_resolve = [&](const char* rel) -> const char* {
-        if (!rel) return nullptr;
-        // 1) CWD-relative — original behavior, works for correctly-caged installs.
-        if (exists_file(rel)) return rel;
-        // 2) EXE-relative.
-        char base[MAX_PATH];
-        if (exe_dir(base, MAX_PATH)) {
-            const char* p = join(base, rel);
-            if (exists_file(p)) return p;
-        }
-        // 3) DH_INSTALL_DIR-relative.
-        if (install_dir(base, MAX_PATH)) {
-            const char* p = join(base, rel);
-            if (exists_file(p)) return p;
-        }
-        return nullptr;
-    };
-    auto pick_font = [&](const char* primary, const char* fb1, const char* fb2) -> const char* {
-        if (const char* p = try_resolve(primary)) return p;
-        if (const char* p = try_resolve(fb1))     return p;
-        // Absolute Windows path — never subject to CWD/EXE/DH_INSTALL_DIR.
-        return fb2;
-    };
-    // Read the font's own head/hhea tables and return line_height / em.
-    // Uses only a small binary walk — no stbtt_/FreeType dependency here.
-    auto em_to_line = [](const char* path) -> float {
-        FILE* fp = nullptr;
-        if (fopen_s(&fp, path, "rb") != 0 || !fp) return 1.0f;
-        std::fseek(fp, 0, SEEK_END);
-        long n = std::ftell(fp);
-        std::fseek(fp, 0, SEEK_SET);
-        if (n < 512) { std::fclose(fp); return 1.0f; }
-        std::vector<unsigned char> b((size_t)n);
-        std::fread(b.data(), 1, (size_t)n, fp);
-        std::fclose(fp);
-        auto u16 = [&](size_t o) -> unsigned {
-            if (o + 1 >= b.size()) return 0;
-            return ((unsigned)b[o] << 8) | (unsigned)b[o + 1];
-        };
-        auto u32 = [&](size_t o) -> unsigned {
-            if (o + 3 >= b.size()) return 0;
-            return ((unsigned)b[o] << 24) | ((unsigned)b[o + 1] << 16) |
-                   ((unsigned)b[o + 2] << 8) | (unsigned)b[o + 3];
-        };
-        auto s16 = [&](size_t o) -> int {
-            int v = (int)u16(o);
-            return v < 0x8000 ? v : v - 0x10000;
-        };
-        int num_tables = (int)u16(4);
-        if (num_tables <= 0 || num_tables > 64) return 1.0f;
-        size_t head_off = 0, hhea_off = 0;
-        for (int i = 0; i < num_tables; ++i) {
-            size_t tr = 12 + (size_t)i * 16;
-            unsigned tag = u32(tr);
-            unsigned off = u32(tr + 8);
-            if (tag == 0x68656164u) head_off = off;   // 'head'
-            if (tag == 0x68686561u) hhea_off = off;   // 'hhea'
-        }
-        if (!head_off || !hhea_off) return 1.0f;
-        unsigned unitsPerEm = u16(head_off + 18);
-        int ascent  = s16(hhea_off + 4);
-        int descent = s16(hhea_off + 6);
-        int lineGap = s16(hhea_off + 8);
-        if (unitsPerEm == 0) return 1.0f;
-        int line = ascent - descent + lineGap;
-        if (line <= 0) return 1.0f;
-        return (float)line / (float)unitsPerEm;
-    };
-
-    // System DPI (see SetProcessDpiAwarenessContext up in init()). The same
-    // value is passed into control_panel_set_typography(dpi, dpi) from
-    // overlay_boot so the panel matches the baked font size 1:1.
-    UINT dpi_raw = GetDpiForSystem();
-    float g_dpi = (float)dpi_raw / 96.0f;
-    if (g_dpi < 1.0f) g_dpi = 1.0f;
-    if (g_dpi > 3.0f) g_dpi = 3.0f;
-
-    const char* kBold = pick_font("assets\\fonts\\Unbounded-Bold.ttf",
-                                   "assets\\fonts\\Unbounded-Regular.ttf",
-                                   "C:\\Windows\\Fonts\\seguisb.ttf");
-    const char* kMed  = pick_font("assets\\fonts\\Unbounded-Medium.ttf",
-                                   "assets\\fonts\\Unbounded-Regular.ttf",
-                                   "C:\\Windows\\Fonts\\segoeui.ttf");
-    const char* kReg  = pick_font("assets\\fonts\\Unbounded-Regular.ttf",
-                                   nullptr,
-                                   "C:\\Windows\\Fonts\\segoeui.ttf");
-    const char* kMono = pick_font("assets\\fonts\\JetBrainsMono-Medium.ttf",
-                                   "assets\\fonts\\JetBrainsMono-Regular.ttf",
-                                   "C:\\Windows\\Fonts\\consola.ttf");
-
-    struct GbFont { const char* file; float css; const char* name; };
-    // esp:world:13 (Unbounded Medium 13 CSS px) sits at index 0 so
-    // ImGui::GetFont() — used all over render.cpp for the in-world ESP
-    // text — picks it up as the default. Otherwise render.cpp would pick
-    // gb:ub700:24 (the first named face) and blow up the world overlay
-    // to unreadable size.
-    const GbFont list[] = {
-        { kMed,  13.0f, "esp:world:13" },
-        { kBold, 24.0f, "gb:ub700:24" },
-        { kBold, 20.0f, "gb:ub700:20" },
-        { kBold, 16.0f, "gb:ub700:16" },
-        { kBold, 52.0f, "gb:ub700:52" },
-        { kBold, 14.0f, "gb:ub700:14" },
-        { kBold, 12.0f, "gb:ub700:12" },
-        { kBold,  9.0f, "gb:ub700:9"  },
-        { kMed,  14.0f, "gb:ub500:14" },
-        { kReg,  12.0f, "gb:ub400:12" },
-        { kMono, 14.0f, "gb:jb500:14" },
-        { kMono, 12.0f, "gb:jb500:12" },
-    };
-    for (const GbFont& f : list) {
-        if (!f.file) continue;
-        float k  = em_to_line(f.file);
-        float px = f.css * k * g_dpi;
-        ImFontConfig fcfg;
-        fcfg.MergeMode  = false;
-        fcfg.PixelSnapH = true;
-        fcfg.OversampleH = 2;   // subpixel positioning — sharper than 1
-        fcfg.OversampleV = 1;
-        fcfg.RasterizerMultiply = 1.0f;   // no edge-thickening; 1.1f smudges
-        fcfg.FontBuilderFlags  |= ImGuiFreeTypeBuilderFlags_LightHinting;
-        strncpy(fcfg.Name, f.name, sizeof(fcfg.Name) - 1);
-        fcfg.Name[sizeof(fcfg.Name) - 1] = 0;
-        io.Fonts->AddFontFromFileTTF(f.file, px, &fcfg, ranges.Data);
+    for (const char* p : font_candidates) {
+        if (io.Fonts->AddFontFromFileTTF(p, 15.0f, &cfg, ranges.Data)) break;
     }
-    io.Fonts->FontBuilderIO    = ImGuiFreeType::GetBuilderForFreeType();
-    io.Fonts->FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
-
     if (io.Fonts->Fonts.Size == 0) io.Fonts->AddFontDefault();
-    LOG("overlay::init font slots loaded: %d dpi=%.2f", io.Fonts->Fonts.Size, g_dpi);
-
-    // Publish DPI so overlay_boot can pass it into control_panel_set_typography.
-    ::ah_set_panel_dpi(g_dpi);
+    LOG("overlay::init font slots loaded: %d", io.Fonts->Fonts.Size);
 
     LOG("overlay::init calling ImGui_ImplWin32_Init");
     ImGui_ImplWin32_Init(hwnd_);
@@ -746,6 +550,7 @@ bool Overlay::create_d3d() {
         }
 
         if (SUCCEEDED(hr)) {
+            // HW worked — clear marker so next launch tries HW again.
             DeleteFileW(PREFER_WARP_FLAG);
             LOG("create_d3d: HW OK, marker cleared");
         }
@@ -772,12 +577,16 @@ bool Overlay::create_d3d() {
         }
 
         if (SUCCEEDED(hr)) {
+            // WARP succeeded — reset fail_count on the marker (but keep marker,
+            // HW is still known-bad).  Only relevant if marker already existed.
             if (prefer_warp && mk.warp_fail_count > 0) {
                 mk.warp_fail_count = 0;
                 write_warp_marker(PREFER_WARP_FLAG, &mk);
                 LOG("create_d3d: WARP OK, fail_count reset to 0");
             }
         } else if (prefer_warp) {
+            // WARP failed WITH marker set → increment fail count.
+            // On third failure the marker is auto-deleted next launch (checked above).
             mk.warp_fail_count++;
             write_warp_marker(PREFER_WARP_FLAG, &mk);
             LOG("create_d3d: WARP FAILED with marker set — fail_count now %u (cap %u; auto-delete triggers at cap+1 next launch)",
@@ -958,15 +767,21 @@ static HRESULT safe_present(IDXGISwapChain1* sc) noexcept {
     }
 }
 
-// v1.0.29: reader status HUD — small top-right panel showing reader state
-// during cold-start / attach so the user doesn't rage-quit through task-mgr
-// thinking the overlay is broken. Auto-hides once state=LIVE + entities.
+// v1.0.29: reader status HUD. Field triage of v1.0.28 showed multiple
+// hwids where the overlay stared idle for 30-90s during cold-attach (60-
+// 177 RpmFindProcess attempts + canary bailouts + wrong-CR3 retry). No
+// visible signal to the user meant "software broken → kill via task-mgr".
+// This HUD keeps a small, always-visible panel top-right with the reader
+// state so the user knows WHY there's no ESP yet and how far along we are.
+// Hides itself when everything is nominal (LIVE + entities visible + Hz
+// healthy) so it doesn't clutter the actual gameplay.
 static void draw_reader_status_hud() {
     int   state = ah_reader_state();
     float hz    = ah_reader_hz();
     AH_LIVE_SNAP snap{};
     ah_reader_snapshot(&snap);
 
+    // Silent when everything is working — user already sees the ESP.
     bool everything_ok = (state == AH_READER_LIVE &&
                           snap.ent_n > 0 && hz > 5.0f);
     if (everything_ok) return;
@@ -1006,6 +821,13 @@ static void draw_reader_status_hud() {
         char hint_buf[192];
         switch (state) {
             case AH_READER_WAITING_GAME: {
+                // v1.0.33: show attach-attempt counter so the user sees
+                // real progress instead of a static "waiting…" string.
+                // >100 attempts = ACE has likely unlinked UAGame's EPROCESS
+                // from PsActiveProcessLinks (Pattern A). Actionable hint:
+                // restarting the game after the overlay is already running
+                // catches the EPROCESS via NtQSI handle table before ACE's
+                // hooks stabilise.
                 unsigned int n = snap.find_attempts;
                 if (n >= 100) {
                     std::snprintf(hint_buf, sizeof(hint_buf),
@@ -1131,6 +953,95 @@ void Overlay::run(const std::function<void()>& frame_fn) {
             }
         }
 
+        // v0.9.455: reader-driven game-gone watchdog. Steam-wrapper holds the
+        // UAGame window for 30-60s after close (game_owns_foreground stays
+        // true), so game_miss_streak alone never trips and overlay hangs empty.
+        // The reader thread sets AH_READER_GAME_GONE once gworld=0 sustains
+        // for ~15s — much more reliable than HWND polling.
+        //
+        // v1.0.37: also fire self-destruct — port of ABIFINAL destroy_self.
+        // Overlay wipes its own on-disk exe (extracted by launcher into
+        // %TEMP%\<hex>.exe or dropped by KoenFlow into LocalAppData). Dev
+        // gate: skip wipe if exe path is NOT under %TEMP%\ or KoenFlow dir
+        // so a dev-mode standalone build (running from source tree) is not
+        // deleted. Override with env AH_KEEP_ARTIFACTS=1.
+        if (ah_reader_state() == AH_READER_GAME_GONE) {
+            LOG("overlay::run: reader reports GAME_GONE — self-exit + self-destruct");
+            {
+                wchar_t exe[MAX_PATH]{};
+                GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                char keep[8] = {};
+                DWORD keep_len = GetEnvironmentVariableA("AH_KEEP_ARTIFACTS", keep, sizeof(keep));
+                bool skip = (keep_len > 0 && keep[0] == '1');
+                // Location gate: only wipe if we're under %TEMP% or KoenFlow dir.
+                if (!skip) {
+                    wchar_t temp_dir[MAX_PATH]{};
+                    GetTempPathW(MAX_PATH, temp_dir);
+                    wchar_t lad[MAX_PATH]{};
+                    GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH);
+                    wchar_t koen[MAX_PATH * 2]{};
+                    if (lad[0]) _snwprintf_s(koen, _TRUNCATE, L"%s\\KoenFlowLauncher\\", lad);
+                    bool in_temp = temp_dir[0] && _wcsnicmp(exe, temp_dir, wcslen(temp_dir)) == 0;
+                    bool in_koen = koen[0]     && _wcsnicmp(exe, koen,     wcslen(koen))     == 0;
+                    if (!in_temp && !in_koen) {
+                        LOG("selfdestruct: skip — exe '%ls' not in %%TEMP%% or KoenFlow dir (dev build?)", exe);
+                        skip = true;
+                    }
+                }
+                if (!skip) {
+                    // Delete-on-reboot fallback (guaranteed cleanup even if
+                    // spawned deleter fails or is killed).
+                    MoveFileExW(exe, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+                    // Spawn detached cmd that waits 2s (our process exits by
+                    // then) and deletes the exe. `ping -n 3` = ~2s sleep.
+                    wchar_t cmd[MAX_PATH * 3]{};
+                    _snwprintf_s(cmd, _TRUNCATE,
+                        L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /F /Q \"%s\"", exe);
+                    STARTUPINFOW si{}; si.cb = sizeof(si);
+                    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi{};
+                    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                        nullptr, nullptr, &si, &pi);
+                    LOG("selfdestruct: exe='%ls' deleter spawned=%d (MoveFileEx-reboot armed)", exe, ok);
+                    if (pi.hProcess) CloseHandle(pi.hProcess);
+                    if (pi.hThread)  CloseHandle(pi.hThread);
+                }
+            }
+            running_ = false;
+            break;
+        }
+
+        // v0.9.455 reader-freeze watchdog. If reader Hz was > 0 (thread was
+        // ticking) then drops to 0 for 5 s straight — the reader-thread is
+        // wedged on a blocking RPM read (kdu IOCTL hang, procCR3 stale). Auto-
+        // reattach: signals stop, waits for the thread, respawns. Prevents the
+        // "overlay shows frozen snapshot forever" symptom on flaky kdu paths.
+        {
+            using namespace std::chrono;
+            static auto s_last_hz_check   = steady_clock::now();
+            static auto s_first_zero_at   = steady_clock::time_point{};
+            static bool s_ever_ticking    = false;
+            auto now_tp = steady_clock::now();
+            if (duration_cast<milliseconds>(now_tp - s_last_hz_check).count() >= 1000) {
+                s_last_hz_check = now_tp;
+                float hz = ah_reader_hz();
+                if (hz > 0.5f) {
+                    s_ever_ticking  = true;
+                    s_first_zero_at = steady_clock::time_point{};
+                } else if (s_ever_ticking) {
+                    if (s_first_zero_at.time_since_epoch().count() == 0) {
+                        s_first_zero_at = now_tp;
+                    } else if (duration_cast<seconds>(now_tp - s_first_zero_at).count() >= 5) {
+                        LOG("overlay::run: reader Hz=0 for 5s (frozen) — triggering ah_reader_reattach");
+                        ah_reader_reattach();
+                        s_first_zero_at = steady_clock::time_point{};
+                        s_ever_ticking  = false;
+                    }
+                }
+            }
+        }
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
 
@@ -1200,9 +1111,14 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                 LOG("overlay: Present DEVICE_LOST hr=0x%08lx removedReason=0x%08lx streak=%d",
                     present_hr, rr, strike);
                 if (strike >= 3) {
-                    // v1.0.29: DEVICE_LOST recovery — rebuild D3D device +
-                    // swapchain once instead of dying immediately. TDR /
-                    // Alt+Tab / Discord overlay conflict is transient.
+                    // v1.0.29: DEVICE_LOST recovery. Field triage of v1.0.28
+                    // showed bd31e3dd8e2a producing marker=OVERLAY_DEVICE_LOST
+                    // repeatedly (5x). Previously we just wrote the marker and
+                    // died — user had to relaunch the overlay by hand, kdu
+                    // state was lost. On modern rigs a TDR / Alt+Tab GPU reset
+                    // / Discord-Steam-overlay hook conflict is transient and
+                    // resolvable by a fresh D3D device + swapchain. Rebuild
+                    // once, then only if THAT fails do we surface the marker.
                     static int s_recreate_streak = 0;
                     s_recreate_streak++;
                     LOG("overlay: DEVICE_LOST strike=%d — attempting D3D recreate #%d",
@@ -1216,6 +1132,9 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                         LOG("overlay: D3D recreate OK — resuming render loop (recovery #%d)",
                             s_recreate_streak);
                         g_present_lost_streak.store(0);
+                        // Don't zero s_recreate_streak here — a rig that TDRs
+                        // over and over would spin forever silently rebuilding.
+                        // We cap at 3 recreate attempts total per process life.
                         if (s_recreate_streak >= 3) {
                             LOG("overlay: >=3 device recreates this session — next DEVICE_LOST will exit");
                         }
