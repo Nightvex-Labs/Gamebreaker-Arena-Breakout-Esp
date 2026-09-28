@@ -109,6 +109,38 @@ static BOOL name_matches(const wchar_t* exe, const char* primary) {
     return FALSE;
 }
 
+// v1.0.34.1: reject known launcher/wrapper process names outright. The
+// substring matcher would happily latch onto arena_breakout_infinite_launcher
+// which contains "arena_breakout" but is a small .NET loader — its module
+// base is at 0x400000, not 0x140000000, and every read into the real game's
+// VA space returns garbage.
+static BOOL is_launcher_or_wrapper(const wchar_t* exe) {
+    if (!exe) return FALSE;
+    static const wchar_t* BAD[] = {
+        L"launcher",     // arena_breakout_infinite_launcher.exe, NightvexLauncher.exe
+        L"bootstrap",
+        L"updater",
+        L"crashhandler",
+        NULL
+    };
+    for (int i = 0; BAD[i]; i++) {
+        size_t blen = wcslen(BAD[i]);
+        size_t elen = wcslen(exe);
+        if (elen < blen) continue;
+        for (size_t j = 0; j + blen <= elen; j++) {
+            int ok = 1;
+            for (size_t k = 0; k < blen; k++) {
+                wchar_t a = exe[j + k], b = BAD[i][k];
+                if (a >= L'A' && a <= L'Z') a = (wchar_t)(a + 32);
+                if (b >= L'A' && b <= L'Z') b = (wchar_t)(b + 32);
+                if (a != b) { ok = 0; break; }
+            }
+            if (ok) return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static DWORD find_pid_via_toolhelp(const char* procName) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -116,6 +148,7 @@ static DWORD find_pid_via_toolhelp(const char* procName) {
     DWORD hit = 0;
     if (Process32FirstW(snap, &pe)) {
         do {
+            if (is_launcher_or_wrapper(pe.szExeFile)) continue;
             if (name_matches(pe.szExeFile, procName)) {
                 hit = pe.th32ProcessID;
                 break;
@@ -161,6 +194,19 @@ BOOL AhUspaceAttach(const char* procName, DWORD* out_pid, u64* out_base) {
     u64 base = module_base_via_toolhelp(pid, procName);
     if (!base) {
         diag_log("USPACE: Module32 base=0 for PID=%lu", pid);
+        CloseHandle(h);
+        return FALSE;
+    }
+
+    // v1.0.34.1: reject wrappers. UE4 shipping build (UAGame.exe) links at
+    // 0x140000000 and stays high even with ASLR — always >= 4 GB.
+    // arena_breakout_infinite_launcher and similar .NET loaders sit at
+    // 0x400000 (2 GB below). Same filter as the kdu path uses. Without
+    // this the reader latches on the launcher, every gworld/pawn read
+    // hits unmapped VA, and CR3-STALE watchdog re-attaches forever.
+    if (base < 0x100000000ULL) {
+        diag_log("USPACE: REJECT wrapper PID=%lu ImageBase=0x%llX (too low, not UE4 game)",
+                 pid, (unsigned long long)base);
         CloseHandle(h);
         return FALSE;
     }
