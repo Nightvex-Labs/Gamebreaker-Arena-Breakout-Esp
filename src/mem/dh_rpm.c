@@ -1,7 +1,12 @@
 #include "../../inc/dh_rpm.h"
 #include "../../inc/dh_phys.h"
+#include "../../inc/ah_uspace_read.h"   // v1.0.34: userspace attach + read path
 #include <windows.h>
 #include <stdio.h>
+
+// v1.0.34: sentinel CR3 value that means "read via userspace HANDLE, not phys".
+// Real CR3 is always page-aligned (>= 0x1000) so 1 is safe as a marker.
+#define AH_CR3_USPACE 1ULL
 
 // v1.0.22 diag override — DH_INFO/DH_ERROR usually compile to nothing in
 // DH_RELEASE. Under AH_DIAG we want early-exit visibility in RpmFindProcess,
@@ -211,6 +216,17 @@ void RpmBumpGeneration(void) {
 
 BOOL RpmReadVirtual(HANDLE hDev, u64 cr3, u64 va, void* buf, u32 size)
 {
+    // v1.0.34: userspace fast-path — sentinel CR3 means the reader thread
+    // successfully opened a PROCESS_VM_READ handle to the game via Toolhelp
+    // + NtOpenProcess (see ah_uspace_read.c). All reads go through
+    // NtReadVirtualMemory instead of kdu phys + CR3 walk. This is the
+    // ABIFINAL model — works on rigs where ACE unlinks EPROCESS from
+    // PsActiveProcessLinks (Pattern-A cold-start failures).
+    if (cr3 == AH_CR3_USPACE) {
+        (void)hDev;
+        return AhUspaceRead(va, buf, size);
+    }
+
     u8* dst = (u8*)buf;
     u32 remaining = size;
 
@@ -572,6 +588,39 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
 {
     *procCR3 = 0;
     if (eprocessOut) *eprocessOut = 0;
+
+    // v1.0.34: userspace attach FIRST. Toolhelp32 walks PspCidTable, not
+    // PsActiveProcessLinks — works even when ACE has unlinked the game's
+    // EPROCESS (Pattern-A cold-start failures). OpenProcess(VM_READ)
+    // succeeds on ~95% of consumer rigs (HVCI off, no strict handle strip).
+    // Only fall back to the kdu phys/CR3 walk if userspace fails.
+    if (AhUspaceOk()) {
+        // Already attached from a previous call; just re-verify the handle
+        // is still good (game may have exited or ACE may have revoked
+        // PROCESS_VM_READ post-open).
+        if (AhUspaceVerify()) {
+            *procCR3 = AH_CR3_USPACE;
+            if (eprocessOut) *eprocessOut = 0;
+#ifdef AH_DIAG
+            ah_procs_log("USPACE: re-verified existing handle, using userspace path");
+#endif
+            return TRUE;
+        }
+        AhUspaceDetach();   // stale — drop it
+    }
+    {
+        DWORD u_pid = 0; u64 u_base = 0;
+        if (AhUspaceAttach(procName, &u_pid, &u_base)) {
+            *procCR3 = AH_CR3_USPACE;
+            if (eprocessOut) *eprocessOut = 0;
+#ifdef AH_DIAG
+            ah_procs_log("USPACE: attached PID=%lu base=0x%llX — userspace primary path in use",
+                         u_pid, (unsigned long long)u_base);
+#endif
+            return TRUE;
+        }
+    }
+
 #ifdef AH_DIAG
     {
         HANDLE lh = CreateFileA("C:\\Users\\Public\\ah_procs.log",
