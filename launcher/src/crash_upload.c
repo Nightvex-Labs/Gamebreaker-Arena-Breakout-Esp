@@ -225,6 +225,14 @@ static void read_crash_marker(uint8_t out[2]) {
     ReadFile(h, out, 1, &got, NULL);
     CloseHandle(h);
     out[1] = (got == 1) ? 1 : 0;
+    // v1.0.29: consume the marker after read so the NEXT launcher run
+    // doesn't ship the same stale byte and mis-classify a graceful exit
+    // as e.g. READER_AV or OVERLAY_DEVICE_LOST. Field triage of v1.0.28
+    // showed multiple hwids reporting marker=0x0c/0x0a alongside ec=0
+    // (clean exit) — the marker was leaking across process lifetimes.
+    if (out[1]) {
+        DeleteFileW(p);
+    }
 }
 
 // Minimal multipart writer. Appends one field to a growing buffer.

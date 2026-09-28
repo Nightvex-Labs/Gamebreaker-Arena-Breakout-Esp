@@ -528,7 +528,16 @@ static void reader_body_impl(void) {
         // "UAGame". If it doesn't, drop the latch and re-probe. Never re-read
         // g_eproc_dtb — ACE tamper makes that read give garbage.
         if (attached_pid == 0) {
-            if (now - last_find >= 500) {
+            // v1.0.29: fast-poll for first N attempts so cold-start feels
+            // instant if UAGame is already running. Field triage of v1.0.28
+            // showed cold-attach taking 60-177 attempts (30-90s at old 500ms
+            // interval) — user waited, saw no ESP, killed via task-mgr.
+            // First 30 attempts at 150ms = 4.5s of fast probe covers the
+            // "game already loaded" case. Beyond that, steady 500ms to
+            // avoid saturating the kdu dispatcher on real "game not started
+            // yet" waits.
+            DWORD find_interval = (find_attempts < 30) ? 150 : 500;
+            if (now - last_find >= find_interval) {
                 find_attempts++;
                 if (RpmFindProcess(drv.hDevice, sysCR3, AH_PROC_NAME, &procCR3, &eproc)) {
                     // v0.9.462: skip recently-failed eproc/pid combos so the
@@ -537,10 +546,17 @@ static void reader_body_impl(void) {
                     BOOL blacklisted = FALSE;
                     u64 tmp_pid = 0;
                     RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_pid, &tmp_pid);
+                    // v1.0.29: blacklist cooldown 60s -> 15s. First-bailout
+                    // is often a wrong-CR3 decoy that clears itself once ACE
+                    // stabilises; a 60s dead zone in the middle of user's
+                    // "why is ESP not on" panic was aggressive. 15s is long
+                    // enough that we don't re-latch the same failing eproc
+                    // in the same tick, short enough that the recovery
+                    // window is invisible to the user.
                     for (int fi = 0; fi < 4; fi++) {
                         FailedAttach& fa = failed_attachments[fi];
                         if (!fa.stamp_ms) continue;
-                        if ((now - fa.stamp_ms) > 60000) continue;
+                        if ((now - fa.stamp_ms) > 15000) continue;
                         if (fa.eproc == eproc || fa.pid == tmp_pid) {
                             blacklisted = TRUE; break;
                         }
