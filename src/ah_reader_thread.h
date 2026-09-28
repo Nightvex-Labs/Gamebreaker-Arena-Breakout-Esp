@@ -69,6 +69,8 @@ typedef struct {
     // to InBattle (2) immediately on raid enter. Overlay treats
     // (roomid != 0) || (scene_type == 2 || scene_type == 4) as in-raid.
     unsigned char scene_type;
+    // v1.0.33: current RpmFindProcess attempt counter for HUD progress + hint.
+    unsigned int find_attempts;
     unsigned long long uagame_base;
     int      ent_n;
     AH_ENT   ents[AH_MAX_ENT];

@@ -643,6 +643,9 @@ static void reader_body_impl(void) {
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
                     last_find = 0;   // don't wait 5s more — probe immediately
+                    // v1.0.33: reset state to WAITING_GAME so HUD reflects
+                    // reality after bailout (state was stuck at ATTACHED).
+                    g_reader_state.store(AH_READER_WAITING_GAME);
                 } else {
                     last_find = now;
                 }
@@ -650,6 +653,7 @@ static void reader_body_impl(void) {
         }
 
         AH_LIVE_SNAP s{};
+        s.find_attempts = (unsigned int)find_attempts;   // v1.0.33 HUD progress
         // Per-tick throttle flags — shared by PlayerArray walk + bot update.
         static uint32_t s_tick_ctr = 0;
         ++s_tick_ctr;
