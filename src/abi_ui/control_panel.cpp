@@ -20,6 +20,9 @@
 #include "icons.hpp"
 #include "overlay_hud.hpp"
 #include "palette.hpp"
+extern "C" {
+#include "../../inc/ah_test_trace.h"   // TEST-REMOVE
+}
 
 #include <imgui.h>
 #include <imgui_internal.h>   // ImClamp
@@ -1958,6 +1961,10 @@ void draw_panel_background(ImVec2 wa, ImVec2 wb) {
 }
 
 void render_control_panel(RenderConfig& cfg) {
+    // TEST-REMOVE
+    static unsigned long long tt_cp = 0; tt_cp++;
+    if ((tt_cp % 300) == 0) ah_test_trace_write("render_control_panel ENTER #%llu show=%d",
+        tt_cp, (int)cfg.show_control_panel);
     ImGuiIO& io = ImGui::GetIO();
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));

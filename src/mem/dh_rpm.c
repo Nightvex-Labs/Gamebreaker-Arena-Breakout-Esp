@@ -1,6 +1,7 @@
 #include "../../inc/dh_rpm.h"
 #include "../../inc/dh_phys.h"
 #include "../../inc/ah_uspace_read.h"   // v1.0.34: userspace attach + read path
+#include "../../inc/ah_test_trace.h"    // TEST-REMOVE: instrumentation
 #include <windows.h>
 #include <stdio.h>
 
@@ -216,6 +217,13 @@ void RpmBumpGeneration(void) {
 
 BOOL RpmReadVirtual(HANDLE hDev, u64 cr3, u64 va, void* buf, u32 size)
 {
+    // TEST-REMOVE: RPM is 50K+/sec; sample every 5000 calls (~0.1s).
+    static unsigned long long tt_rpm_ctr = 0;
+    tt_rpm_ctr++;
+    if ((tt_rpm_ctr % 5000) == 0) {
+        ah_test_trace_write("RpmReadVirtual #%llu cr3=0x%llX va=0x%llX size=%u",
+            tt_rpm_ctr, (unsigned long long)cr3, (unsigned long long)va, (unsigned)size);
+    }
     // v1.0.34: userspace fast-path — sentinel CR3 means the reader thread
     // successfully opened a PROCESS_VM_READ handle to the game via Toolhelp
     // + NtOpenProcess (see ah_uspace_read.c). All reads go through
@@ -583,9 +591,208 @@ static dh_pfnNQSI dh_get_direct_nqsi(void)
     return cached;
 }
 
+// v1.0.38.11: PspCidTable direct walk. Bulletproof against ACE DKOM-unlink
+// from PsActiveProcessLinks — PspCidTable is what NtOpenProcess itself uses
+// to resolve PID → EPROCESS, so ACE cannot remove UAGame from it without
+// breaking the game's own kernel handle operations.
+//
+// Method:
+//   1. Locate PspCidTable VA in ntoskrnl by disassembling
+//      PsLookupProcessByProcessId (exported). First few bytes contain
+//      `LEA rcx, [PspCidTable]` = 48 8D 0D disp32.
+//   2. Read HANDLE_TABLE pointer at PspCidTable.
+//   3. Decode HANDLE_TABLE.TableCode: bits 0-2 = level (0/1/2), rest = root.
+//   4. Walk tree for index = target_pid >> 2.
+//   5. Leaf HANDLE_TABLE_ENTRY has Object = EPROCESS with lock bits in low 3.
+//   6. Read DTB from EPROCESS+g_eproc_dtb.
+//
+// Returns TRUE on success, fills *out_eproc / *out_dtb.
+static BOOL RpmFindEprocViaPspCidTable(HANDLE hDev, u64 sysCR3, u64 ntBase,
+                                        u64 target_pid,
+                                        u64* out_eproc, u64* out_dtb)
+{
+    if (out_eproc) *out_eproc = 0;
+    if (out_dtb)   *out_dtb   = 0;
+    if (!target_pid || !ntBase) return FALSE;
+
+    // --- Step 1: find PsLookupProcessByProcessId export in ntoskrnl. ---
+    IMAGE_DOS_HEADER dh = {0};
+    if (!RpmReadVirtual(hDev, sysCR3, ntBase, &dh, sizeof(dh))
+        || dh.e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+    IMAGE_NT_HEADERS64 nh = {0};
+    if (!RpmReadVirtual(hDev, sysCR3, ntBase + dh.e_lfanew, &nh, sizeof(nh))
+        || nh.Signature != IMAGE_NT_SIGNATURE) return FALSE;
+    DWORD expRVA  = nh.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!expRVA) return FALSE;
+    IMAGE_EXPORT_DIRECTORY ed = {0};
+    if (!RpmReadVirtual(hDev, sysCR3, ntBase + expRVA, &ed, sizeof(ed))) return FALSE;
+
+    const char* target = "PsLookupProcessByProcessId";
+    DWORD targetLen = (DWORD)strlen(target);
+    DWORD psl_rva = 0;
+    for (DWORD i = 0; i < ed.NumberOfNames; i++) {
+        DWORD nameRVA = 0;
+        if (!RpmReadVirtual(hDev, sysCR3,
+            ntBase + ed.AddressOfNames + i * 4, &nameRVA, 4)) continue;
+        char name[64] = {0};
+        if (!RpmReadVirtual(hDev, sysCR3, ntBase + nameRVA, name, 63)) continue;
+        if (strncmp(name, target, targetLen) == 0 && name[targetLen] == 0) {
+            USHORT ordIdx = 0;
+            RpmReadVirtual(hDev, sysCR3,
+                ntBase + ed.AddressOfNameOrdinals + i * 2, &ordIdx, 2);
+            RpmReadVirtual(hDev, sysCR3,
+                ntBase + ed.AddressOfFunctions + ordIdx * 4, &psl_rva, 4);
+            break;
+        }
+    }
+    if (!psl_rva) {
+        DH_ERROR("PspCidTable: PsLookupProcessByProcessId not in exports");
+        return FALSE;
+    }
+
+    // --- Step 2: read first 96 bytes of the function, find LEA rcx,[rip+disp32]
+    // which loads PspCidTable's address. Pattern: 48 8D 0D XX XX XX XX.
+    // Modern ntoskrnl builds sometimes use rax first (`48 8D 05 ..`) — accept
+    // both r/m destinations by masking the ModR/M byte low bits.
+    u8 code[96] = {0};
+    if (!RpmReadVirtual(hDev, sysCR3, ntBase + psl_rva, code, sizeof(code))) return FALSE;
+    u64 pspcid_va = 0;
+    for (int i = 0; i < (int)sizeof(code) - 7; i++) {
+        // 48 8D <ModR/M with mod=00 and rm=101> XX XX XX XX
+        if (code[i] == 0x48 && code[i+1] == 0x8D
+            && (code[i+2] & 0xC7) == 0x05)
+        {
+            int32_t disp = *(int32_t*)(code + i + 3);
+            u64 next_ip = ntBase + psl_rva + (u32)i + 7;
+            pspcid_va = next_ip + (int64_t)disp;
+            DH_INFO("PspCidTable: LEA @ nt+0x%X (offset+%d) disp=%+d → PspCidTable VA=0x%llX",
+                    (unsigned)psl_rva, i, (int)disp,
+                    (unsigned long long)pspcid_va);
+            break;
+        }
+    }
+    if (!pspcid_va) {
+        DH_ERROR("PspCidTable: LEA pattern not found in first %zu bytes of PsLookupProcessByProcessId",
+                 sizeof(code));
+        return FALSE;
+    }
+
+    // --- Step 3: PspCidTable is `PHANDLE_TABLE PspCidTable` — read pointer. ---
+    u64 ht_va = 0;
+    if (!RpmRead64(hDev, sysCR3, pspcid_va, &ht_va) || !ht_va) {
+        DH_ERROR("PspCidTable: read of pointer at 0x%llX failed", (unsigned long long)pspcid_va);
+        return FALSE;
+    }
+    if ((ht_va >> 48) != 0xFFFF) {
+        DH_ERROR("PspCidTable: HANDLE_TABLE VA 0x%llX not canonical kernel", (unsigned long long)ht_va);
+        return FALSE;
+    }
+
+    // --- Step 4: read HANDLE_TABLE.TableCode at +8 (stable Win10/11). ---
+    u64 table_code = 0;
+    if (!RpmRead64(hDev, sysCR3, ht_va + 8, &table_code) || !table_code) {
+        DH_ERROR("PspCidTable: TableCode read failed at HT=0x%llX+8", (unsigned long long)ht_va);
+        return FALSE;
+    }
+    u32 level    = (u32)(table_code & 3);
+    u64 root_va  = table_code & ~(u64)7;
+    DH_INFO("PspCidTable: HT=0x%llX TableCode=0x%llX level=%u root=0x%llX",
+            (unsigned long long)ht_va, (unsigned long long)table_code,
+            level, (unsigned long long)root_va);
+
+    // --- Step 5: walk tree for index = target_pid / 4.
+    // Leaf entries: 16 bytes each (Object + HighValue) → 256 entries per 4 KB page.
+    // Intermediate: 8-byte pointers → 512 entries per 4 KB page.
+    u64 index = target_pid >> 2;
+    u64 entry_va = 0;
+
+    if (level == 0) {
+        // 1-level: root is directly array of HANDLE_TABLE_ENTRY.
+        entry_va = root_va + index * 16;
+    } else if (level == 1) {
+        // 2-level: root is array of pointers to leaf arrays (256 entries each).
+        u64 hi = index >> 8;
+        u64 lo = index & 0xFF;
+        u64 sub_va = 0;
+        if (!RpmRead64(hDev, sysCR3, root_va + hi * 8, &sub_va) || !sub_va) {
+            DH_ERROR("PspCidTable: L1 sub-page read failed hi=%llu",
+                     (unsigned long long)hi);
+            return FALSE;
+        }
+        entry_va = sub_va + lo * 16;
+    } else if (level == 2) {
+        // 3-level: root is array of pointers to mid-arrays (512 each),
+        // each mid points to leaf arrays (256 each).
+        u64 hi  = index >> 17;              // 512 * 256 = 131072 = 2^17
+        u64 mid = (index >> 8) & 0x1FF;
+        u64 lo  = index & 0xFF;
+        u64 mid_va = 0, sub_va = 0;
+        if (!RpmRead64(hDev, sysCR3, root_va + hi * 8, &mid_va) || !mid_va) {
+            DH_ERROR("PspCidTable: L2 mid read failed hi=%llu", (unsigned long long)hi);
+            return FALSE;
+        }
+        if (!RpmRead64(hDev, sysCR3, mid_va + mid * 8, &sub_va) || !sub_va) {
+            DH_ERROR("PspCidTable: L2 sub read failed mid=%llu", (unsigned long long)mid);
+            return FALSE;
+        }
+        entry_va = sub_va + lo * 16;
+    } else {
+        DH_ERROR("PspCidTable: unknown level %u", level);
+        return FALSE;
+    }
+
+    // --- Step 6: read HANDLE_TABLE_ENTRY.Object. For CID table, Object is
+    // the raw EPROCESS/KTHREAD pointer with lock bits in low 3 bits.
+    u64 obj_raw = 0;
+    if (!RpmRead64(hDev, sysCR3, entry_va, &obj_raw)) {
+        DH_ERROR("PspCidTable: leaf entry read failed at 0x%llX",
+                 (unsigned long long)entry_va);
+        return FALSE;
+    }
+    u64 eproc = obj_raw & ~(u64)7;
+    if ((eproc >> 48) != 0xFFFF) {
+        DH_ERROR("PspCidTable: entry Object 0x%llX not canonical kernel (pid=%llu index=%llu entry=0x%llX)",
+                 (unsigned long long)obj_raw, (unsigned long long)target_pid,
+                 (unsigned long long)index, (unsigned long long)entry_va);
+        return FALSE;
+    }
+
+    // --- Step 7: sanity — read PID field from the resolved EPROCESS,
+    // must match target_pid. Guards against dangling / freed pool.
+    u64 pid_check = 0;
+    if (!RpmRead64(hDev, sysCR3, eproc + g_eproc_pid, &pid_check)) {
+        DH_ERROR("PspCidTable: PID field read at eproc=0x%llX+0x%X failed",
+                 (unsigned long long)eproc, g_eproc_pid);
+        return FALSE;
+    }
+    if (pid_check != target_pid) {
+        DH_ERROR("PspCidTable: PID mismatch — eproc.pid=%llu target=%llu (dangling entry?)",
+                 (unsigned long long)pid_check, (unsigned long long)target_pid);
+        return FALSE;
+    }
+
+    // --- Step 8: read DTB.
+    u64 dtb = 0;
+    if (!RpmRead64(hDev, sysCR3, eproc + g_eproc_dtb, &dtb) || !dtb) {
+        DH_ERROR("PspCidTable: DTB read failed at eproc=0x%llX+0x%X",
+                 (unsigned long long)eproc, g_eproc_dtb);
+        return FALSE;
+    }
+
+    DH_INFO("PspCidTable: RESOLVED pid=%llu → eproc=0x%llX DTB=0x%llX",
+            (unsigned long long)target_pid,
+            (unsigned long long)eproc,
+            (unsigned long long)dtb);
+    if (out_eproc) *out_eproc = eproc;
+    if (out_dtb)   *out_dtb   = dtb;
+    return TRUE;
+}
+
 BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
                     const char* procName, u64* procCR3, u64* eprocessOut)
 {
+    ah_test_trace_write("RpmFindProcess ENTER target='%s' sysCR3=0x%llX",   // TEST-REMOVE
+        procName ? procName : "(null)", (unsigned long long)sysCR3);
     *procCR3 = 0;
     if (eprocessOut) *eprocessOut = 0;
 
@@ -857,17 +1064,85 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         DiscoverPebOffset(hDev, sysCR3, psisp);
     }
 
-    // Step 3: walk ActiveProcessLinks
+    // v1.0.38.3: authoritative PID resolution via NtQSI(5) BEFORE the
+    // ActiveProcessLinks walk. NtQSI(5) enumerates PspCidTable, which ACE
+    // can't cheaply forge — the PID it returns is the live PID even if
+    // ACE has scrubbed EPROCESS.ImageFileName or DKOM-unlinked the game
+    // from ActiveProcessLinks. Once known, target_pid drives an extra
+    // accept criterion in the bidirectional walker below: name-match OR
+    // pid==target_pid. For a PID-authoritative match, the MZ probe is
+    // skipped (freshly-spawned process may not have its PE header
+    // page-resident through the DTB yet — this is why the previous
+    // walker classified all 7 UAGame hits as "decoys" and never latched
+    // onto the real one).
+    u64 target_pid = 0;
+    {
+        typedef struct _SYS_PROC_INF_LOCAL {
+            ULONG NextEntryOffset;
+            ULONG NumberOfThreads;
+            BYTE Reserved1[48];
+            UNICODE_STRING ImageName;
+            LONG BasePriority;
+            HANDLE UniqueProcessId;
+        } SYS_PROC_INF_LOCAL;
+        ULONG need_p = 0;
+        pNtQSI(5, NULL, 0, &need_p);
+        if (need_p) {
+            need_p += 0x10000;
+            PVOID pbuf = VirtualAlloc(NULL, need_p, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+            if (pbuf) {
+                NTSTATUS stp = pNtQSI(5, pbuf, need_p, &need_p);
+                if (stp >= 0) {
+                    SYS_PROC_INF_LOCAL* pi = (SYS_PROC_INF_LOCAL*)pbuf;
+                    while (1) {
+                        if (pi->ImageName.Buffer && pi->ImageName.Length) {
+                            size_t nchars = pi->ImageName.Length / sizeof(WCHAR);
+                            static const wchar_t* WL_UP[] = {
+                                L"UAGame.exe",
+                                L"UAGameShipping.exe",
+                                NULL
+                            };
+                            for (int _wi = 0; !target_pid && WL_UP[_wi]; _wi++) {
+                                size_t wl = wcslen(WL_UP[_wi]);
+                                if (nchars != wl) continue;
+                                int ok_m = 1;
+                                for (size_t k = 0; k < wl; k++) {
+                                    wchar_t a = pi->ImageName.Buffer[k];
+                                    wchar_t b = WL_UP[_wi][k];
+                                    if (a >= L'A' && a <= L'Z') a = (wchar_t)(a + 32);
+                                    if (b >= L'A' && b <= L'Z') b = (wchar_t)(b + 32);
+                                    if (a != b) { ok_m = 0; break; }
+                                }
+                                if (ok_m) target_pid = (u64)(uintptr_t)pi->UniqueProcessId;
+                            }
+                        }
+                        if (target_pid || !pi->NextEntryOffset) break;
+                        pi = (SYS_PROC_INF_LOCAL*)((BYTE*)pi + pi->NextEntryOffset);
+                    }
+                }
+                VirtualFree(pbuf, 0, MEM_RELEASE);
+            }
+        }
+#ifdef AH_DIAG
+        ah_procs_log("target_pid via NtQSI(5) = %llu (0 = unknown; walker matches by name only)",
+                     (unsigned long long)target_pid);
+#endif
+    }
+
+    // Step 3: BIDIRECTIONAL walk of ActiveProcessLinks (Flink + Blink).
+    // Observed on Win11 25H2 (26220) with live ACE: forward Flink chain
+    // gets a poisoned pointer ~1100 nodes deep — RpmRead64 rejects it
+    // and the walk terminates before reaching the live UAGame's
+    // EPROCESS. UAGame is spawned late, so it lives near tail in Flink
+    // order = near head->Blink in Blink order. Walking Blink from head
+    // first reaches the newest EPROCESSes (including UAGame) within a
+    // handful of steps; the forward Flink walk still runs after to
+    // cover older processes ACE hasn't tampered with. Visited set is
+    // shared across both directions — if backward walk meets forward
+    // walk, coverage is complete.
     u64 head = psisp + g_eproc_links;
-    u64 cur  = head;
     u32 count = 0;
-
-    // Read first link
-    u64 flink = 0;
-    if (!RpmRead64(hDev, sysCR3, cur, &flink))
-        return FALSE;
-
-    cur = flink;
+    u64 flink = 0;   // scratch used inside the inner loop
     // v1.0.22 diag: dump every walked ImageFileName to ah_procs.log so
     // we can see what UAGame is really called in EPROCESS on Win11 25H2.
 #ifdef AH_DIAG
@@ -884,6 +1159,14 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
     u64* visited = (u64*)HeapAlloc(GetProcessHeap(), 0, VIS_CAP * sizeof(u64));
     u32 visited_n = 0;
     int cycle_hit = 0;
+    for (int dir = 0; dir < 2; dir++) {
+        // LIST_ENTRY layout: Flink at +0, Blink at +8. dir 0 walks
+        // forward via Flink, dir 1 walks backward via Blink starting
+        // from head. Both share `visited` — a hit on backward means
+        // we met forward's territory (coverage complete).
+        const u32 link_off = (dir == 0) ? 0u : 8u;
+        u64 cur = 0;
+        if (!RpmRead64(hDev, sysCR3, head + link_off, &cur)) continue;
     while (cur != head && count < VIS_CAP) {
         u64 eproc = cur - g_eproc_links;
         // Cycle probe — O(n) linear scan; n <= 8192 so worst-case ~32M ops
@@ -961,12 +1244,21 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
             if (_stricmp(imgName, AH_WHITELIST[_wi]) == 0) { _matched = 1; break; }
         }
         (void)procName;   // Whitelist is fixed; caller's procName is ignored.
-        if (_matched) {
+
+        // v1.0.38.3: authoritative-PID accept. NtQSI(5) at the top of
+        // this function resolved target_pid (from PspCidTable, which ACE
+        // can't cheaply spoof); if this eproc's PID matches, it IS the
+        // live game — even if ImageFileName is scrubbed or ImageBase
+        // pages haven't been faulted in yet through the DTB.
+        u64 pid_here = 0;
+        RpmRead64(hDev, sysCR3, eproc + g_eproc_pid, &pid_here);
+        int pid_match_target = (target_pid && pid_here == target_pid);
+
+        if (_matched || pid_match_target) {
             u64 dtb = 0;
             RpmRead64(hDev, sysCR3, eproc + g_eproc_dtb, &dtb);
             if (dtb) {
-                u64 pid = 0;
-                RpmRead64(hDev, sysCR3, eproc + g_eproc_pid, &pid);
+                u64 pid = pid_here;   // keep DH_INFO variable name below
                 // Decoy filter — ACE sometimes spawns duplicate processes
                 // whose DTB translates to garbage / all-zeros to defeat
                 // external walkers. Real game: the one whose PE header
@@ -1007,6 +1299,20 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
                         is_real = TRUE;
                     }
                 }
+                // v1.0.38.3: PID-authoritative accept — MZ probe can miss
+                // a freshly-launched process whose PE header hasn't been
+                // page-faulted in through the game DTB yet. NtQSI(5) can't
+                // lie about a live PID (reads PspCidTable), so if pid_here
+                // equals target_pid, treat this EPROCESS as real. Wrapper
+                // filter below still runs on probe_base and rejects if it
+                // resolved to a low VA (< 4 GB).
+                if (!is_real && pid_match_target) {
+#ifdef AH_DIAG
+                    ah_procs_log("PID-AUTH accept: PID=%llu (target from NtQSI(5)) — skipping MZ probe",
+                                 (unsigned long long)pid);
+#endif
+                    is_real = TRUE;
+                }
                 // Wrapper filter: Steam ships arena_breakout.exe as a small
                 // bootstrap PE with ASLR ImageBase in low VA (~0x570000).
                 // Real UE4 shipping build (UAGame.exe) links at 0x140000000
@@ -1036,11 +1342,12 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
         }
 
     next:
-        if (!RpmRead64(hDev, sysCR3, cur, &flink) || flink == cur)
+        if (!RpmRead64(hDev, sysCR3, cur + link_off, &flink) || flink == cur)
             break;
         cur = flink;
         count++;
-    }
+    }   // end inner while (per-direction walk)
+    }   // end outer for (bidirectional Flink/Blink)
     HeapFree(GetProcessHeap(), 0, visited);
 #ifdef AH_DIAG
     {
@@ -1051,11 +1358,9 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
             SetFilePointer(lh, 0, NULL, FILE_END);
             char line[192];
             int n = _snprintf(line, sizeof(line),
-                "== WALK END: count=%u reads_ok=%u reads_fail=%u cycle_at=%u exit_via=%s ==\r\n",
+                "== BIDIR WALK END: total=%u reads_ok=%u reads_fail=%u cycle_at=%u %s ==\r\n",
                 count, diag_read_ok, diag_read_fail, diag_cycle_at,
-                cycle_hit ? "cycle"
-                    : (cur == head) ? "head-loop"
-                    : (count >= 8192 ? "cap" : "flink-fail"));
+                cycle_hit ? "cycle-hit-or-met" : "natural-exit");
             DWORD w = 0;
             WriteFile(lh, line, (DWORD)n, &w, NULL);
             CloseHandle(lh);
@@ -1066,6 +1371,41 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
     DH_ERROR("process '%s' not found in EPROCESS list (%u scanned) — "
              "all candidates were ACE decoys",
              procName, count);
+
+    // v1.0.38.11: PspCidTable direct walk — bulletproof against DKOM
+    // unlinking from ActiveProcessLinks. If target_pid is known
+    // (NtQSI(5) resolved it at function top), walk PspCidTable directly:
+    // it's what NtOpenProcess itself uses, ACE cannot remove UAGame's
+    // entry from it without breaking every kernel handle op on the
+    // game process.
+    if (target_pid) {
+        u64 cid_eproc = 0, cid_dtb = 0;
+        if (RpmFindEprocViaPspCidTable(hDev, sysCR3, ntBase, target_pid,
+                                        &cid_eproc, &cid_dtb))
+        {
+            // Verify PE header via CR3 — same wrapper filter as walker.
+            u64 peb_cid = 0, ib_cid = 0;
+            RpmRead64(hDev, sysCR3, cid_eproc + g_eproc_peb_off, &peb_cid);
+            if (peb_cid && (peb_cid >> 48) == 0)
+                RpmRead64(hDev, cid_dtb, peb_cid + 0x10, &ib_cid);
+            if (ib_cid && ib_cid < 0x100000000ULL) {
+                DH_ERROR("PspCidTable resolved eproc but ImageBase=0x%llX < 4 GB (wrapper?) — reject",
+                         (unsigned long long)ib_cid);
+            } else {
+                DH_INFO("PspCidTable RESOLVED: eproc=0x%llX DTB=0x%llX ImgBase=0x%llX pid=%llu (bypassed DKOM)",
+                        (unsigned long long)cid_eproc,
+                        (unsigned long long)cid_dtb,
+                        (unsigned long long)ib_cid,
+                        (unsigned long long)target_pid);
+                *procCR3 = cid_dtb;
+                if (eprocessOut) *eprocessOut = cid_eproc;
+                return TRUE;
+            }
+        } else {
+            DH_ERROR("PspCidTable walk FAILED for target_pid=%llu — falling to NtQSI(64) fallback",
+                     (unsigned long long)target_pid);
+        }
+    }
 
     // v1.0.22 fallback for Win11 25H2 where ACE DKOM-unlinks UAGame from
     // ActiveProcessLinks. Path:

@@ -7,6 +7,9 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+extern "C" {
+#include "../../inc/ah_test_trace.h"   // TEST-REMOVE
+}
 
 namespace abi {
 
@@ -194,9 +197,14 @@ static ImU32 col_orange  = IM_COL32(255, 140,   0, 255);
 static ImU32 col_grey    = IM_COL32( 80,  80,  80, 255);
 
 void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
+    // TEST-REMOVE: sampled entry log
+    static unsigned long long tt_rf = 0; tt_rf++;
+    bool tt_this = (tt_rf % 300) == 0;
+    if (tt_this) ah_test_trace_write("render_frame ENTER #%llu snap=%p", tt_rf, (void*)snap);
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
     if (!snap) {
+        if (tt_this) ah_test_trace_write("render_frame: snap null — memserver_disconnected label");   // TEST-REMOVE
         dl->AddText(ImVec2(20, 20), col_red, "memserver disconnected");
         return;
     }
@@ -204,7 +212,12 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
     // "me" pawn coords are outside the raid envelope. Skip drawing entirely
     // — the preview mannequin + fake loadout entities that show up in the
     // main menu would otherwise get boxes / skeletons.
-    if (!snap->in_raid) return;
+    if (!snap->in_raid) {
+        if (tt_this) ah_test_trace_write("render_frame: !in_raid, skip");   // TEST-REMOVE
+        return;
+    }
+    if (tt_this) ah_test_trace_write("render_frame ent_n=%zu cam=(%.0f,%.0f,%.0f)",   // TEST-REMOVE
+        snap->entities.size(), snap->cam.x, snap->cam.y, snap->cam.z);
 
     // v0.9.421 TEST: expose bias to W2S static base FOV path.
     g_test_fov_bias    = cfg.test_fov_bias;
@@ -484,8 +497,13 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
         // silhouette. Two stacked segments (top = helm, bottom = vest) with
         // a color per tier so the top labels can stay lean.
         // v0.9.337 semantic: 0=Off, 1=Text, 2=Bar. Off = neither text nor bar.
+        // v1.0.38.12: bots don't wear armor in game — suppress entire armor
+        // display (bar + text) for bot targets regardless of cfg.show_bot_armor.
+        // Field 2026-10-01: users complained "у ботов нет брони, но overlay
+        // рисует H:- A:- placeholders".
         bool armor_bar_on  = cfg.show_armor_master
-                          && (cfg.armor_display == 2);
+                          && (cfg.armor_display == 2)
+                          && is_pmc;
         // Distance clamp: drop only if the box is unreadably tiny (~1 px);
         // the old 18 px gate hid armor bar on distant enemies which the user
         // wants visible at all ranges the box itself renders.
@@ -602,8 +620,8 @@ void render_frame(const Snapshot* snap, const RenderConfig& cfg) {
             // Line: armor — always visible with '-' placeholders.
             l_arm[0] = 0;
             int helm_show = e.helm, vest_show = e.vest;
-            bool show_arm_class = cfg.show_armor_master
-                                && (is_pmc ? cfg.show_armor : cfg.show_bot_armor);
+            // v1.0.38.12: force-hide armor for bots (no armor game-side).
+            bool show_arm_class = cfg.show_armor_master && is_pmc && cfg.show_armor;
             // v0.9.337 semantic: 0=Off, 1=Text, 2=Bar.
             bool armor_text_on  = (cfg.armor_display == 1);
             if (show_arm_class && armor_text_on) {

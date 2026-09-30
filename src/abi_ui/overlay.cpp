@@ -17,6 +17,9 @@
 #include <thread>
 #include <string>
 #include <cstdint>
+extern "C" {
+#include "../../inc/ah_test_trace.h"  // TEST-REMOVE: instrumentation
+}
 #pragma comment(lib, "psapi.lib")
 
 #pragma comment(lib, "d3d11.lib")
@@ -46,7 +49,7 @@ static bool g_using_warp = false;
 Overlay* Overlay::s_instance = nullptr;
 
 Overlay::Overlay() { s_instance = this; }
-Overlay::~Overlay() { shutdown(); s_instance = nullptr; }
+Overlay::~Overlay() { TEST_TRACE("~Overlay ENTER"); shutdown(); s_instance = nullptr; TEST_TRACE("~Overlay EXIT"); }   // TEST-REMOVE
 
 LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     const bool input_on = s_instance ? s_instance->input_capture_.load() : false;
@@ -192,6 +195,7 @@ void Overlay::set_input_capture(bool on) {
 }
 
 bool Overlay::init(int sw, int sh) {
+    TEST_TRACE("Overlay::init ENTER sw=%d sh=%d", sw, sh);   // TEST-REMOVE
     sw_ = sw; sh_ = sh;
     LOG("overlay::init enter sw=%d sh=%d", sw, sh);
     LOG("overlay::init calling create_window()");
@@ -678,17 +682,23 @@ void Overlay::set_capture_protection(bool on) {
 }
 
 void Overlay::shutdown() {
+    TEST_TRACE("Overlay::shutdown ENTER dev=%p ctx=%p hwnd=%p",   // TEST-REMOVE
+        (void*)d3d_device_, (void*)d3d_ctx_, (void*)hwnd_);
     if (d3d_device_) {
+        TEST_TRACE("shutdown icons + ImGui_ImplDX11");   // TEST-REMOVE
         icons::shutdown();
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
     }
+    TEST_TRACE("shutdown cleanup_d3d");   // TEST-REMOVE
     cleanup_d3d();
     if (hwnd_) {
+        TEST_TRACE("shutdown DestroyWindow");   // TEST-REMOVE
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
+    TEST_TRACE("Overlay::shutdown EXIT");   // TEST-REMOVE
 }
 
 // Resolve the game window (matched by exe name) so the overlay can mirror
@@ -878,6 +888,7 @@ static void draw_reader_status_hud() {
 namespace abi {
 
 void Overlay::run(const std::function<void()>& frame_fn) {
+    TEST_TRACE("Overlay::run ENTER hwnd=%p", (void*)hwnd_);   // TEST-REMOVE
     MSG msg{};
     HWND game_hwnd = nullptr;
     // Start hidden — init() showed the window for DirectComposition setup,
@@ -886,6 +897,8 @@ void Overlay::run(const std::function<void()>& frame_fn) {
     bool overlay_visible = false;
     ShowWindowAsync(hwnd_, SW_HIDE);
     int  game_probe_ctr  = 0;
+    // TEST-REMOVE: frame counter for stall/crash bracketing
+    unsigned long long test_frame_no = 0;
 
     // v0.9.409 Alt+Tab hide via cached HWND compare. Only USER32 call is
     // GetForegroundWindow (safe, returns whatever HWND — no callback), plus
@@ -896,12 +909,21 @@ void Overlay::run(const std::function<void()>& frame_fn) {
     // exposure and system-wide GetForegroundWindow load.
     int  fg_poll_ctr = 0;
     while (running_) {
+        // TEST-REMOVE: bracket each frame with counter + timestamp so a stall
+        // between two adjacent frames is trivially visible in the log.
+        test_frame_no++;
+        if ((test_frame_no % 60) == 0) {
+            TEST_TRACE("FRAME #%llu top-of-loop running=%d", test_frame_no, (int)running_);
+        }
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            if (msg.message == WM_QUIT) running_ = false;
+            if (msg.message == WM_QUIT) {
+                TEST_TRACE("WM_QUIT received frame=%llu", test_frame_no);   // TEST-REMOVE
+                running_ = false;
+            }
         }
-        if (!running_) break;
+        if (!running_) { TEST_TRACE("running=false after pump frame=%llu", test_frame_no); break; }   // TEST-REMOVE
 
         // ── Overlay visibility gate + game-death auto-exit ────────────────
         // Re-locate game HWND every ~1s (60 frames @60fps). Between probes
@@ -966,6 +988,7 @@ void Overlay::run(const std::function<void()>& frame_fn) {
         // so a dev-mode standalone build (running from source tree) is not
         // deleted. Override with env AH_KEEP_ARTIFACTS=1.
         if (ah_reader_state() == AH_READER_GAME_GONE) {
+            TEST_TRACE("GAME_GONE branch ENTER frame=%llu", test_frame_no);   // TEST-REMOVE
             LOG("overlay::run: reader reports GAME_GONE — self-exit + self-destruct");
             {
                 wchar_t exe[MAX_PATH]{};
@@ -989,23 +1012,23 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                     }
                 }
                 if (!skip) {
-                    // Delete-on-reboot fallback (guaranteed cleanup even if
-                    // spawned deleter fails or is killed).
+                    // MoveFileEx-reboot as guaranteed cleanup on next reboot.
+                    // Live-file delete is launcher's job: WinRuntimeHost.exe
+                    // does DeleteFileW(tmp_path) right after WaitForSingleObject
+                    // returns, so our detached-cmd deleter was redundant.
+                    //
+                    // v1.0.38 field report (Discord USMC2072G): the detached
+                    // `cmd /c ping -n 3 & del` was popping a visible CMD window
+                    // for the user on every raid-end false-fire (see gworld=0
+                    // watchdog fix above). CREATE_NO_WINDOW + DETACHED_PROCESS
+                    // are mutually exclusive per MSDN; on his Windows build
+                    // DETACHED_PROCESS won and the console showed anyway.
+                    // Dropping the cmd deleter entirely removes the UX hit AND
+                    // one whole class of spawn-race flakiness. Reboot-fallback
+                    // is enough.
+                    TEST_TRACE("selfdestruct: MoveFileEx-reboot armed for %ls (no cmd deleter)", exe);   // TEST-REMOVE
                     MoveFileExW(exe, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-                    // Spawn detached cmd that waits 2s (our process exits by
-                    // then) and deletes the exe. `ping -n 3` = ~2s sleep.
-                    wchar_t cmd[MAX_PATH * 3]{};
-                    _snwprintf_s(cmd, _TRUNCATE,
-                        L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /F /Q \"%s\"", exe);
-                    STARTUPINFOW si{}; si.cb = sizeof(si);
-                    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-                    PROCESS_INFORMATION pi{};
-                    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
-                        nullptr, nullptr, &si, &pi);
-                    LOG("selfdestruct: exe='%ls' deleter spawned=%d (MoveFileEx-reboot armed)", exe, ok);
-                    if (pi.hProcess) CloseHandle(pi.hProcess);
-                    if (pi.hThread)  CloseHandle(pi.hThread);
+                    LOG("selfdestruct: exe='%ls' MoveFileEx-reboot armed (launcher does live delete)", exe);
                 }
             }
             running_ = false;
@@ -1066,19 +1089,32 @@ void Overlay::run(const std::function<void()>& frame_fn) {
             if (steps != 0.0f) io.AddMouseWheelEvent(0.0f, steps);
         }
 
+        // TEST-REMOVE: trace ImGui pipeline boundaries every 300 frames so we
+        // see the last checkpoint reached before a crash.
+        bool tt_log_this_frame = ((test_frame_no % 300) == 0);
+        if (tt_log_this_frame) TEST_TRACE("ImGui::NewFrame call frame=%llu", test_frame_no);
         ImGui::NewFrame();
+        if (tt_log_this_frame) TEST_TRACE("ImGui::NewFrame returned frame=%llu", test_frame_no);
 
         // v1.0.29: status HUD before the main frame — auto-hides once
         // reader hits LIVE with entities visible.
+        if (tt_log_this_frame) TEST_TRACE("draw_reader_status_hud call frame=%llu", test_frame_no);
         draw_reader_status_hud();
+        if (tt_log_this_frame) TEST_TRACE("draw_reader_status_hud returned frame=%llu", test_frame_no);
 
+        if (tt_log_this_frame) TEST_TRACE("frame_fn call frame=%llu", test_frame_no);
         frame_fn();
+        if (tt_log_this_frame) TEST_TRACE("frame_fn returned frame=%llu", test_frame_no);
 
+        if (tt_log_this_frame) TEST_TRACE("ImGui::Render call frame=%llu", test_frame_no);
         ImGui::Render();
+        if (tt_log_this_frame) TEST_TRACE("ImGui::Render returned frame=%llu", test_frame_no);
         const float clr[4] = { 0, 0, 0, 0 };   // v0.9.437: always transparent (fuser removed)
         d3d_ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
         d3d_ctx_->ClearRenderTargetView(rtv_, clr);
+        if (tt_log_this_frame) TEST_TRACE("RenderDrawData call frame=%llu", test_frame_no);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        if (tt_log_this_frame) TEST_TRACE("RenderDrawData returned frame=%llu", test_frame_no);
 
         // VSync off. Cap render loop at cfg.render_fps_cap (30/60/120).
         // When overlay is hidden (Alt+Tab / game not foreground), fall back
@@ -1092,8 +1128,13 @@ void Overlay::run(const std::function<void()>& frame_fn) {
         // fast-fail the process (bypassing SEH entirely). This was the
         // "software just closes mid-game" report on weak / mobile GPUs
         // where TDR fires under intense combat scenes.
+        // TEST-REMOVE: pre-Present trace so we see if this is where crash sits
+        if ((test_frame_no % 300) == 0) {
+            TEST_TRACE("pre-Present frame=%llu sc=%p", test_frame_no, (void*)swapchain_);
+        }
         HRESULT present_hr = safe_present(swapchain_);
         if (FAILED(present_hr)) {
+            TEST_TRACE("Present FAIL hr=0x%08lX frame=%llu", (unsigned long)present_hr, test_frame_no);   // TEST-REMOVE
             if (present_hr == DXGI_ERROR_DEVICE_REMOVED ||
                 present_hr == DXGI_ERROR_DEVICE_HUNG    ||
                 present_hr == DXGI_ERROR_DEVICE_RESET)

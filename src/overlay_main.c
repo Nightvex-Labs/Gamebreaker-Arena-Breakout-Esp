@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <dbghelp.h>
+#include "../inc/ah_test_trace.h"    // TEST-REMOVE: instrumentation
 
 #pragma comment(lib, "Dbghelp.lib")
 
@@ -18,6 +19,16 @@ extern int  AhOverlayRun(void);
 // ships to koenflow.com telemetry. This is the only path to see WHY
 // marker=0 crashes happen (the SEH filter never runs for fast-fails).
 static LONG CALLBACK veh_crash_dump(EXCEPTION_POINTERS* ep) {
+    // TEST-REMOVE: fire on ANY VEH entry, even benign ones — we want to see
+    // every exception the process observes, filtered or not.
+    if (ep && ep->ExceptionRecord) {
+        ah_test_trace_write("VEH ENTER code=0x%08lX flags=0x%lX addr=%p",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode,
+            (unsigned long)ep->ExceptionRecord->ExceptionFlags,
+            ep->ExceptionRecord->ExceptionAddress);
+    } else {
+        ah_test_trace_write("VEH ENTER (null ep)");
+    }
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
 
@@ -152,6 +163,15 @@ static LONG CALLBACK veh_crash_dump(EXCEPTION_POINTERS* ep) {
 // Ends by returning EXCEPTION_EXECUTE_HANDLER so the process terminates
 // cleanly with the actual exception code as exit status.
 static LONG WINAPI ah_overlay_unhandled_seh(EXCEPTION_POINTERS* ep) {
+    // TEST-REMOVE: trace immediately so we see the SEH filter got invoked
+    // even if subsequent WriteFile of marker fails.
+    if (ep && ep->ExceptionRecord) {
+        ah_test_trace_write("SEH FILTER ENTER code=0x%08lX addr=%p",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode,
+            ep->ExceptionRecord->ExceptionAddress);
+    } else {
+        ah_test_trace_write("SEH FILTER ENTER (null ep)");
+    }
     wchar_t path[MAX_PATH];
     DWORD n = GetTempPathW(MAX_PATH, path);
     if (n && n < MAX_PATH) {
@@ -174,20 +194,27 @@ static LONG WINAPI ah_overlay_unhandled_seh(EXCEPTION_POINTERS* ep) {
 
 int wmain(int argc, wchar_t** argv) {
     (void)argc; (void)argv;
+    ah_test_trace_write("wmain ENTER argc=%d", argc);   // TEST-REMOVE
     // v1.0.24: VEH FIRST — before hardening, before SEH filter. VEH is the
     // only handler that catches fast-fails (RaiseFailFastException, /GS
     // cookie, CFG violation, heap corruption). These bypass SEH entirely,
     // so any of them without VEH = marker=0 with zero forensic evidence.
     AddVectoredExceptionHandler(1 /* CALL_FIRST */, veh_crash_dump);
+    ah_test_trace_write("wmain VEH installed");   // TEST-REMOVE
 
     // Anti-debug + AMSI/ETW patch. Silent ExitProcess if a debugger is
     // attached. If ntdll patching AVs (Win11 25H2 HVCI edge case), VEH
     // above will catch it and drop a dump before the process dies.
+    ah_test_trace_write("wmain calling DhInitHardening");   // TEST-REMOVE
     DhInitHardening();
+    ah_test_trace_write("wmain DhInitHardening returned");   // TEST-REMOVE
 
     // v0.9.455: install last-chance SEH filter for exceptions that DO go
     // through normal exception dispatching (not fast-fails). Writes marker=15.
     SetUnhandledExceptionFilter(ah_overlay_unhandled_seh);
+    ah_test_trace_write("wmain SEH filter installed, calling AhOverlayRun");   // TEST-REMOVE
     // NO printf — spawned from detached/no-console launcher, stdout invalid.
-    return AhOverlayRun();
+    int rv = AhOverlayRun();
+    ah_test_trace_write("wmain AhOverlayRun returned rv=%d — normal exit", rv);   // TEST-REMOVE
+    return rv;
 }
