@@ -613,6 +613,21 @@ bool Overlay::create_d3d() {
     if (dxgi_adapter) dxgi_adapter->GetParent(IID_PPV_ARGS(&dxgi_factory));
     LOG("create_d3d: dxgi_factory=%p", dxgi_factory);
 
+    // v1.0.38.17 HIGH fix: lines 606-614 defensively null-guard each DXGI
+    // acquisition but then :627 unconditionally dereferences dxgi_factory
+    // and :629-630 unconditionally Release both factory + adapter. If any
+    // QueryInterface/GetAdapter/GetParent failed, we crash. Also hr from
+    // CreateSwapChainForComposition was never checked. Audit workflow HIGH
+    // (overlay.cpp:627 correctness, trek B).
+    if (!dxgi_dev || !dxgi_adapter || !dxgi_factory) {
+        LOG("create_d3d: DXGI acquisition FAILED dev=%p adapter=%p factory=%p",
+            dxgi_dev, dxgi_adapter, dxgi_factory);
+        if (dxgi_factory) dxgi_factory->Release();
+        if (dxgi_adapter) dxgi_adapter->Release();
+        if (dxgi_dev)     dxgi_dev->Release();
+        return false;
+    }
+
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width            = sw_;
     sd.Height           = sh_;
@@ -628,6 +643,11 @@ bool Overlay::create_d3d() {
     LOG("create_d3d: CreateSwapChainForComposition hr=0x%08lx swapchain=%p", hr, swapchain_);
     dxgi_factory->Release();
     dxgi_adapter->Release();
+    if (FAILED(hr) || !swapchain_) {
+        LOG("create_d3d: swapchain create FAILED hr=0x%08lx", hr);
+        dxgi_dev->Release();
+        return false;
+    }
 
     // Step 3: DirectComposition: device, target, visual
     hr = DCompositionCreateDevice(dxgi_dev, IID_PPV_ARGS(&dcomp_dev_));
@@ -1165,11 +1185,23 @@ void Overlay::run(const std::function<void()>& frame_fn) {
                     LOG("overlay: DEVICE_LOST strike=%d — attempting D3D recreate #%d",
                         strike, s_recreate_streak);
 
+                    // v1.0.38.17 BLOCKER fix: icons::g_icons holds SRV +
+                    // Texture2D pointers bound to the OLD d3d_device_.
+                    // Dropping without shutdown leaks + leaves dangling
+                    // pointers that control_panel.cpp samples next frame →
+                    // use-after-free → crash (reader thread was fine, but
+                    // overlay thread SEH on ImGui::Image(stale_srv)). Mirror
+                    // the init-order from Overlay::init (line 265 icons::init
+                    // after D3D up) and Overlay::shutdown (line 689 icons::
+                    // shutdown before D3D down). Audit workflow BLOCKER
+                    // (overlay.cpp:1168, trek B d3d11-lifecycle).
+                    icons::shutdown();
                     ImGui_ImplDX11_Shutdown();
                     cleanup_d3d();
 
                     if (create_d3d()) {
                         ImGui_ImplDX11_Init(d3d_device_, d3d_ctx_);
+                        icons::init(d3d_device_, 32);
                         LOG("overlay: D3D recreate OK — resuming render loop (recovery #%d)",
                             s_recreate_streak);
                         g_present_lost_streak.store(0);

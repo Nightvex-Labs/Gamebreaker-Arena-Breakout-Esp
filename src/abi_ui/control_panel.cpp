@@ -1029,6 +1029,14 @@ void open_modal(const char* title, ModalKind kind, ImU32* target, bool has_setti
     m.has_settings = has_settings;
     m.tab = has_settings ? 0 : 1;
     m.backup = target ? *target : 0;
+    // v1.0.38.17 HIGH fix: clear position-modal fields when a non-position
+    // modal opens. Prior: int_target/int_backup set only by
+    // open_modal_position, never cleared by open_modal — so after any
+    // position chooser closed via Done (toggles m.open only), subsequent
+    // color-modal cancel at line 1359 blindly deref'd a now-stale
+    // int_target pointing into a destroyed/renamed field. Audit workflow
+    // HIGH (control_panel.cpp:1359 modal correctness, trek B).
+    m.int_target = nullptr; m.int_backup = 0;
     m.just_opened = true;   // swallow the opening click (see Modal::just_opened)
     std::snprintf(m.title, sizeof(m.title), "%s", title);
     if (target) {

@@ -329,9 +329,15 @@ static const DhEprocLayout kEprocLayouts[] = {
     // as Win11 21H2 (22000) — the kernel body was only realigned in Germanium
     // (24H2+), so the same DTB/PID/LINKS/IMGNAME/PEB offsets work verbatim.
     { 19041, 19045, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win10 20H1-22H2" },
-    { 22000, 22000, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 21H2" },
-    { 22621, 22621, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 22H2" },
-    { 22631, 22631, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 23H2" },
+    // v1.0.38.17 HIGH fix: Win11 21H2/22H2/23H2 were EXACT-match (22000,
+    // 22621, 22631) → any Insider / Server 2022 / LTSC / KB-patched build
+    // fell through to "not in known-good table" → EprocInit FALSE →
+    // RpmFindProcess cold-fail → reader never attached. Pre-Germanium EPROCESS
+    // layout is identical across the Win11 Cobalt/Nickel/Vibranium branch,
+    // so range the entries like the Win10 20H1-22H2 row above. Audit
+    // workflow HIGH (dh_rpm.c:332 os-compat, trek B).
+    { 22000, 22620, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 21H2 branch" },
+    { 22621, 22699, 0x28, 0x440, 0x448, 0x5A8, 0x550, "Win11 22H2/23H2 branch" },
     // Germanium — realigned layout (Win11 24H2 / 25H2 / 26H2).
     // Range 26100..30000 covers every current + upcoming Germanium build:
     //   26100  = 24H2 initial   (PID=0x1D0 LINKS=0x1D8 PEB=0x2E0 — verified)
@@ -1038,21 +1044,68 @@ BOOL RpmFindProcess(HANDLE hDev, u64 sysCR3,
     // from g_eproc_dtb — must equal the CR3 we walked in with. Mismatch = wrong
     // offsets for this build, bail with actionable error instead of walking a
     // wrong LIST_ENTRY chain into garbage.
+    //
+    // v1.0.38.17 HIGH fix: DTB has been stable at +0x28 since Vista, so a
+    // DTB-only probe tells us nothing about whether PID / LINKS / IMGNAME /
+    // PEB offsets actually match. On 25H2 KB 26220 or any Germanium Insider
+    // that drifts those four while leaving DTB alone, we'd pass this probe
+    // and walk ActiveProcessLinks into garbage. Extend the probe: validate
+    // System EPROCESS has PID == 4 (hardcoded in NT), ImageFileName starts
+    // with "System", and flink/blink both land on canonical kernel VAs
+    // (upper 16 bits = 0xFFFF). Audit workflow HIGH (dh_rpm.c:1041, trek B).
     {
         u64 sys_dtb = 0;
         if (!RpmRead64(hDev, sysCR3, psisp + g_eproc_dtb, &sys_dtb)) {
-            DH_ERROR("layout probe: read System EPROCESS+DTB(0x%X) failed",
-                     g_eproc_dtb);
+            DH_ERROR("layout probe: read System EPROCESS+DTB(0x%X) failed", g_eproc_dtb);
             return FALSE;
         }
         if ((sys_dtb & ~0xFFFULL) != (sysCR3 & ~0xFFFULL)) {
             DH_ERROR("layout probe FAILED: EPROCESS+0x%X = 0x%llX, expected sysCR3=0x%llX. "
                      "kEprocLayouts row for this build is wrong — verify offsets against "
-                     "Vergilius Project.",
-                     g_eproc_dtb, sys_dtb, sysCR3);
+                     "Vergilius Project.", g_eproc_dtb, sys_dtb, sysCR3);
             return FALSE;
         }
-        DH_INFO("layout probe OK: System DTB @ +0x%X matches sysCR3", g_eproc_dtb);
+
+        // PID: System process is always pid 4 since NT 4.
+        u64 sys_pid = 0;
+        if (!RpmRead64(hDev, sysCR3, psisp + g_eproc_pid, &sys_pid)) {
+            DH_ERROR("layout probe: read System EPROCESS+PID(0x%X) failed", g_eproc_pid);
+            return FALSE;
+        }
+        if ((sys_pid & 0xFFFFFFFF) != 4) {
+            DH_ERROR("layout probe FAILED: EPROCESS+PID(0x%X) = %llu, expected 4 (System). "
+                     "PID offset wrong for this build.", g_eproc_pid, sys_pid);
+            return FALSE;
+        }
+
+        // ImageFileName: first 6 chars must be "System". Field is 15-byte char[].
+        char sys_name[16] = {0};
+        if (!RpmReadVirtual(hDev, sysCR3, psisp + g_eproc_imgname, sys_name, 15)) {
+            DH_ERROR("layout probe: read System EPROCESS+IMGNAME(0x%X) failed", g_eproc_imgname);
+            return FALSE;
+        }
+        if (memcmp(sys_name, "System", 6) != 0) {
+            DH_ERROR("layout probe FAILED: EPROCESS+IMGNAME(0x%X) = '%.15s', expected 'System'. "
+                     "IMGNAME offset wrong for this build.", g_eproc_imgname, sys_name);
+            return FALSE;
+        }
+
+        // ActiveProcessLinks: flink/blink must be canonical kernel VAs
+        // (upper 16 bits = 0xFFFF — Win11 kernel space starts at 0xFFFF800000000000).
+        u64 flink = 0, blink = 0;
+        if (!RpmRead64(hDev, sysCR3, psisp + g_eproc_links,     &flink) ||
+            !RpmRead64(hDev, sysCR3, psisp + g_eproc_links + 8, &blink)) {
+            DH_ERROR("layout probe: read System EPROCESS+LINKS(0x%X) failed", g_eproc_links);
+            return FALSE;
+        }
+        if ((flink >> 48) != 0xFFFF || (blink >> 48) != 0xFFFF) {
+            DH_ERROR("layout probe FAILED: EPROCESS+LINKS(0x%X) flink=0x%llX blink=0x%llX "
+                     "— not canonical kernel VAs. LINKS offset wrong for this build.",
+                     g_eproc_links, flink, blink);
+            return FALSE;
+        }
+
+        DH_INFO("layout probe OK: DTB + PID=4 + IMGNAME='System' + LINKS canonical, all four offsets valid");
     }
 
     // Lazy-discover EPROCESS.Peb offset from OUR OWN process. First call per

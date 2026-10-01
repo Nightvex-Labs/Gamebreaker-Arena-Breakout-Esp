@@ -11,6 +11,7 @@
 
 extern void DhInitHardening(void);   // src/hardening/dh_amsi_etw.c
 extern int  AhOverlayRun(void);
+extern void DhProviderShutdownAll(void);   // src/winio/dh_prov_impl.c — called from SEH + atexit
 
 // v1.0.24: Vectored Exception Handler — catches faults BEFORE SEH filter,
 // including fast-fails (RaiseFailFastException, /GS cookie, CFG violation,
@@ -188,6 +189,16 @@ static LONG WINAPI ah_overlay_unhandled_seh(EXCEPTION_POINTERS* ep) {
             CloseHandle(h);
         }
     }
+    // v1.0.38.17 BLOCKER fix: the CRT's __scrt_common_main_seh __except body
+    // (what EXECUTE_HANDLER unwinds into) calls _exit(code) — NOT exit().
+    // _exit skips CRT atexit handlers, so the v15 atexit(ah_atexit_teardown)
+    // installed in wmain is DEAD on EVERY crash path. Call ShutdownAll
+    // DIRECTLY here so SEH-killed overlay still tears down its kdu service
+    // + driver image + .sys blob. Without this, each crash leaves a
+    // persistent orphan that NukeOrphans must sweep on next launch (and may
+    // fail silently on admin elevation drift). Audit workflow BLOCKER
+    // (overlay_main.c:192, trek B).
+    DhProviderShutdownAll();
     (void)ep;
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -199,7 +210,8 @@ static LONG WINAPI ah_overlay_unhandled_seh(EXCEPTION_POINTERS* ep) {
 // any detached reader thread that didn't reach its own cleanup before
 // process termination. ExitProcess() does NOT invoke atexit — those paths
 // (GWORLD-STUCK self-restart) already call DhProviderShutdownAll directly.
-extern void DhProviderShutdownAll(void);
+// v1.0.38.17: SEH handler also calls DhProviderShutdownAll because the
+// CRT's EXECUTE_HANDLER path uses _exit() which skips atexit.
 static void ah_atexit_teardown(void) {
     ah_test_trace_write("ah_atexit_teardown: provider shutdown");   // TEST-REMOVE
     DhProviderShutdownAll();

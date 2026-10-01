@@ -234,11 +234,23 @@ void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
         return;
     }
 
+    // v1.0.38.17 HIGH fix: nearest-cards list honored only self + BOT_*
+    // skip. Teammates (same team as local player) fell through and rendered
+    // with full card chrome (name, weapon, mag counter, armor pill, VIS/DEAD),
+    // which contradicted every sibling render path that respects
+    // cfg.show_mates (overlay_hud.cpp radar, render.cpp ESP). Apply the
+    // same team filter the radar uses. Audit workflow HIGH
+    // (overlay_hud.cpp:243 info-leak, trek B).
+    int my_team = -1;
+    for (const auto& e : snap->entities) {
+        if (e.me) { my_team = e.team; break; }
+    }
     std::vector<const Entity*> es;
     es.reserve(snap->entities.size());
     for (const auto& e : snap->entities) {
         if (e.me) continue;
         if (e.cls.starts_with("BOT")) continue;
+        if (!cfg.show_mates && my_team >= 0 && e.team == my_team) continue;
         es.push_back(&e);
     }
     std::sort(es.begin(), es.end(), [&](const Entity* a, const Entity* b) {

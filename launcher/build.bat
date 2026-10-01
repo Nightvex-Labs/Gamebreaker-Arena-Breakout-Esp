@@ -16,7 +16,7 @@ if not exist build mkdir build
 
 echo [build] compiling launcher -^> build\WinRuntimeHost.exe
 set CFLAGS=/nologo /W3 /O2 /GS- /MT /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /DAH_LAUNCHER_TELEMETRY
-set LFLAGS=/link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OPT:REF /OPT:ICF /LIBPATH:deps\vmprotect\lib Bcrypt.lib Crypt32.lib Kernel32.lib User32.lib Shlwapi.lib Winhttp.lib Advapi32.lib VMProtectSDK64.lib
+set LFLAGS=/link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OPT:REF /OPT:ICF /LIBPATH:deps\vmprotect\lib Bcrypt.lib Crypt32.lib Kernel32.lib User32.lib Shlwapi.lib Shell32.lib Winhttp.lib Advapi32.lib Ole32.lib VMProtectSDK64.lib
 cl %CFLAGS% src\ah_launcher.c src\crash_upload.c /Fe:build\WinRuntimeHost.exe /Fo:build\ %LFLAGS%
 if errorlevel 1 (echo [build] FAILED & popd & exit /b 4)
 
