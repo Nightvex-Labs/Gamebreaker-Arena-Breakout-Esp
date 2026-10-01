@@ -3,9 +3,16 @@ REM arenahack launcher — outputs build\App.exe. Reads ah_bundle.kfpl from
 REM same directory as itself at runtime.
 
 setlocal
-set VCVARS="C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-if not exist %VCVARS% (
-  echo [build] vcvars64.bat not found at %VCVARS%
+REM Auto-pick MSVC 2022 edition (Community/Professional/Enterprise/BuildTools).
+set VCVARS=
+for %%E in (Community Professional Enterprise BuildTools) do (
+  if not defined VCVARS (
+    if exist "C:\Program Files\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat" set VCVARS="C:\Program Files\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat"
+    if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat" set VCVARS="C:\Program Files (x86)\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat"
+  )
+)
+if not defined VCVARS (
+  echo [build] vcvars64.bat not found under any 2022 edition
   exit /b 2
 )
 call %VCVARS% >nul
