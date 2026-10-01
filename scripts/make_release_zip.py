@@ -231,6 +231,23 @@ def main() -> int:
     if n_side == 0:
         print(f"[pack] no sidecar DLLs (arenahack-style build)")
 
+    # menu_v3 (Spectra Dark) baked faces live in assets/fonts/*.ttf. The
+    # overlay's 3-fallback resolver tries CWD / EXE dir / DH_INSTALL_DIR in
+    # that order; the launcher sets CWD to the install folder before spawning
+    # the child, so dropping the TTFs here means the resolver's first hop
+    # succeeds and Unbounded/JBM load. Without this, overlay falls back to
+    # C:\Windows\Fonts\seguisb.ttf → menu renders Segoe UI through FreeType
+    # LightHinting at Unbounded-derived pixel sizes = soft/мыло.
+    fonts_src = ROOT / "assets" / "fonts"
+    n_fonts = 0
+    if fonts_src.exists():
+        fonts_dst = stage / "assets" / "fonts"
+        fonts_dst.mkdir(parents=True, exist_ok=True)
+        for ttf in sorted(fonts_src.glob("*.ttf")):
+            shutil.copyfile(ttf, fonts_dst / ttf.name)
+            n_fonts += 1
+    print(f"[pack] included {n_fonts} TTF font(s) under assets/fonts/")
+
     payload = OVERLAY_EXE.read_bytes()
     print(f"[pack] overlay:  {len(payload):>10,} B  sha256 {hashlib.sha256(payload).hexdigest()[:16]}...")
     print(f"[pack] launcher: {LAUNCHER_EXE.stat().st_size:>10,} B  WinRuntimeHost.exe (VMPed)")
