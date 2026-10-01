@@ -1556,7 +1556,18 @@ static void reader_body_impl(void) {
                                 // freeze). Now: track when each pawn was last
                                 // logged, emit at most once per 30 s per pawn.
                                 // Auto-prunes to keep the map bounded.
-                                static std::unordered_map<u64, DWORD> s_pawn_last_diag;
+                                //
+                                // v1.0.38.16: thread_local, not static. Prior
+                                // static shared the map between reader threads
+                                // during stale ah_reader_reattach (old thread
+                                // wedged in kdu IOCTL + new thread spawned).
+                                // Both threads mutating the std::unordered_map
+                                // concurrently is UB (torn find/insert, rehash
+                                // race, iterator invalidation). thread_local =
+                                // each reader thread has its own map, zero
+                                // cross-thread sharing. Audit: HIGH data-race
+                                // #7 (ah_reader_thread.cpp:1565).
+                                thread_local std::unordered_map<u64, DWORD> s_pawn_last_diag;
                                 if (!e->is_me) {
                                     DWORD now_dw = GetTickCount();
                                     auto it = s_pawn_last_diag.find(e_pawn);
