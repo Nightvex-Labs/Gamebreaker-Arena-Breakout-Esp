@@ -13,10 +13,14 @@
 #include "control_panel.hpp"
 #include <psapi.h>
 #include <d3d11.h>
+#include "misc/freetype/imgui_freetype.h"
 #include <chrono>
 #include <thread>
 #include <string>
 #include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <vector>
 #pragma comment(lib, "psapi.lib")
 
 #pragma comment(lib, "d3d11.lib")
@@ -33,6 +37,14 @@
 
 extern IMGUI_IMPL_API LRESULT
 ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
+// System DPI published once from Overlay::init so overlay_boot can pass the
+// same value into menu_v3_set_scale / control_panel_set_typography (both
+// want the baked-font physical pixel ratio). Flat C linkage so plain-C
+// overlay_boot translation units can read without pulling imgui/C++ headers.
+static float s_panel_dpi = 1.0f;
+extern "C" void  ah_set_panel_dpi(float v) { s_panel_dpi = v > 0 ? v : 1.0f; }
+extern "C" float ah_get_panel_dpi(void)    { return s_panel_dpi; }
 
 namespace abi {
 
@@ -231,21 +243,139 @@ bool Overlay::init(int sw, int sh) {
     static ImVector<ImWchar> ranges;
     builder.BuildRanges(&ranges);
 
-    ImFontConfig cfg;
-    cfg.MergeMode = false;
-    cfg.PixelSnapH = true;
-    // Simple single-font loader (baseline pre-bundle).
-    const char* font_candidates[] = {
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\msyh.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
+    // 4096 atlas — 10 Unbounded/JBM faces × Latin+Cyrillic+CJK pack cleanly.
+    io.Fonts->TexDesiredWidth = 4096;
+
+    // ── Three-fallback font resolver (CWD → EXE dir → DH_INSTALL_DIR) ─────
+    // KoenFlow stages WinRuntimeHost.exe at %TEMP%\<hex>\ and launches the
+    // child with CWD not always matching the install dir. Try CWD first (fast
+    // path for correctly-caged installs), then EXE folder (fonts next to
+    // child), then DH_INSTALL_DIR env (launcher exports this to install dir
+    // even when it can't set CWD). Final fallback: C:\Windows\Fonts.
+    auto exists_ = [](const char* p) -> bool {
+        FILE* f = nullptr;
+        if (fopen_s(&f, p, "rb") == 0 && f) { fclose(f); return true; }
+        return false;
     };
-    for (const char* p : font_candidates) {
-        if (io.Fonts->AddFontFromFileTTF(p, 15.0f, &cfg, ranges.Data)) break;
+    static char s_fbuf[24][MAX_PATH]; static int s_fslot = 0;
+    auto join = [&](const char* base, const char* rel) -> const char* {
+        char* out = s_fbuf[s_fslot++ % 24];
+        _snprintf_s(out, MAX_PATH, _TRUNCATE, "%s\\%s", base, rel);
+        return out;
+    };
+    auto exe_dir = [](char* out, DWORD cap) -> bool {
+        DWORD n = GetModuleFileNameA(nullptr, out, cap);
+        if (!n || n >= cap) return false;
+        char* sl = std::strrchr(out, '\\'); if (!sl) return false;
+        *sl = 0; return true;
+    };
+    auto install_dir = [](char* out, DWORD cap) -> bool {
+        DWORD n = GetEnvironmentVariableA("DH_INSTALL_DIR", out, cap);
+        return n > 0 && n < cap;
+    };
+    auto try_resolve = [&](const char* rel) -> const char* {
+        if (!rel) return nullptr;
+        if (exists_(rel)) return rel;
+        char base[MAX_PATH];
+        if (exe_dir(base, MAX_PATH))     { const char* p = join(base, rel); if (exists_(p)) return p; }
+        if (install_dir(base, MAX_PATH)) { const char* p = join(base, rel); if (exists_(p)) return p; }
+        return nullptr;
+    };
+    auto pick_font = [&](const char* primary, const char* fb1, const char* fb2) -> const char* {
+        if (const char* p = try_resolve(primary)) return p;
+        if (const char* p = try_resolve(fb1))     return p;
+        return fb2;
+    };
+    // Font's own head/hhea tables → line_height / em (baked faces compute
+    // physical size as css_em × em_ratio × DPI so a "14 px" glyph renders
+    // at the same physical pixel height as the CSS mock).
+    auto em_to_line = [](const char* path) -> float {
+        FILE* fp = nullptr;
+        if (!path || fopen_s(&fp, path, "rb") != 0 || !fp) return 1.0f;
+        std::fseek(fp, 0, SEEK_END); long n = std::ftell(fp); std::fseek(fp, 0, SEEK_SET);
+        if (n < 512) { std::fclose(fp); return 1.0f; }
+        std::vector<unsigned char> b((size_t)n);
+        std::fread(b.data(), 1, (size_t)n, fp); std::fclose(fp);
+        auto u16 = [&](size_t o) -> unsigned { return o + 1 >= b.size() ? 0u : (((unsigned)b[o] << 8) | (unsigned)b[o+1]); };
+        auto u32 = [&](size_t o) -> unsigned { return o + 3 >= b.size() ? 0u : (((unsigned)b[o] << 24) | ((unsigned)b[o+1] << 16) | ((unsigned)b[o+2] << 8) | (unsigned)b[o+3]); };
+        auto s16 = [&](size_t o) -> int { int v = (int)u16(o); return v < 0x8000 ? v : v - 0x10000; };
+        int num = (int)u16(4); if (num <= 0 || num > 64) return 1.0f;
+        size_t head_off = 0, hhea_off = 0;
+        for (int i = 0; i < num; ++i) {
+            size_t tr = 12 + (size_t)i * 16;
+            unsigned tag = u32(tr), off = u32(tr + 8);
+            if (tag == 0x68656164u) head_off = off;
+            if (tag == 0x68686561u) hhea_off = off;
+        }
+        if (!head_off || !hhea_off) return 1.0f;
+        unsigned upem = u16(head_off + 18); if (!upem) return 1.0f;
+        int line = s16(hhea_off + 4) - s16(hhea_off + 6) + s16(hhea_off + 8);
+        return line > 0 ? (float)line / (float)upem : 1.0f;
+    };
+
+    UINT dpi_raw = GetDpiForSystem();
+    float g_dpi = (float)dpi_raw / 96.0f;
+    if (g_dpi < 1.0f) g_dpi = 1.0f;
+    if (g_dpi > 3.0f) g_dpi = 3.0f;
+
+    const char* kBold = pick_font("assets\\fonts\\Unbounded-Bold.ttf",
+                                   "assets\\fonts\\Unbounded-Regular.ttf",
+                                   "C:\\Windows\\Fonts\\seguisb.ttf");
+    const char* kMed  = pick_font("assets\\fonts\\Unbounded-Medium.ttf",
+                                   "assets\\fonts\\Unbounded-Regular.ttf",
+                                   "C:\\Windows\\Fonts\\segoeui.ttf");
+    const char* kReg  = pick_font("assets\\fonts\\Unbounded-Regular.ttf",
+                                   nullptr,
+                                   "C:\\Windows\\Fonts\\segoeui.ttf");
+    const char* kMono = pick_font("assets\\fonts\\JetBrainsMono-Medium.ttf",
+                                   "assets\\fonts\\JetBrainsMono-Regular.ttf",
+                                   "C:\\Windows\\Fonts\\consola.ttf");
+    LOG("font resolve: bold=[%s] med=[%s] reg=[%s] mono=[%s]",
+        kBold ? kBold : "(null)", kMed ? kMed : "(null)",
+        kReg  ? kReg  : "(null)", kMono ? kMono : "(null)");
+    LOG("font DPI: raw=%u eff=%.2f", (unsigned)dpi_raw, g_dpi);
+
+    struct GbFont { const char* file; float css; const char* name; };
+    // esp:world:13 at index 0 so ImGui::GetFont() picks it as the default
+    // (render.cpp world-ESP text relies on this). Other faces are named for
+    // control_panel.cpp's find_font() + menu_v3's find_font() lookups.
+    const GbFont list[] = {
+        { kMed,  13.0f, "esp:world:13" },
+        { kBold, 24.0f, "gb:ub700:24" },
+        { kBold, 20.0f, "gb:ub700:20" },
+        { kBold, 16.0f, "gb:ub700:16" },
+        { kBold, 52.0f, "gb:ub700:52" },
+        { kBold, 14.0f, "gb:ub700:14" },
+        { kBold, 12.0f, "gb:ub700:12" },
+        { kBold,  9.0f, "gb:ub700:9"  },
+        { kMed,  14.0f, "gb:ub500:14" },
+        { kReg,  12.0f, "gb:ub400:12" },
+        { kMono, 14.0f, "gb:jb500:14" },
+        { kMono, 12.0f, "gb:jb500:12" },
+    };
+    for (const GbFont& f : list) {
+        if (!f.file) continue;
+        float k  = em_to_line(f.file);
+        float px = f.css * k * g_dpi;
+        ImFontConfig fcfg;
+        fcfg.MergeMode  = false;
+        fcfg.PixelSnapH = true;
+        fcfg.OversampleH = 2;
+        fcfg.OversampleV = 1;
+        fcfg.RasterizerMultiply = 1.0f;
+        fcfg.FontBuilderFlags  |= ImGuiFreeTypeBuilderFlags_LightHinting;
+        std::strncpy(fcfg.Name, f.name, sizeof(fcfg.Name) - 1);
+        fcfg.Name[sizeof(fcfg.Name) - 1] = 0;
+        io.Fonts->AddFontFromFileTTF(f.file, px, &fcfg, ranges.Data);
     }
+    io.Fonts->FontBuilderIO    = ImGuiFreeType::GetBuilderForFreeType();
+    io.Fonts->FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+
     if (io.Fonts->Fonts.Size == 0) io.Fonts->AddFontDefault();
-    LOG("overlay::init font slots loaded: %d", io.Fonts->Fonts.Size);
+    LOG("overlay::init font slots loaded: %d dpi=%.2f", io.Fonts->Fonts.Size, g_dpi);
+
+    // Publish DPI so overlay_boot can pass it to control_panel_set_typography.
+    ::ah_set_panel_dpi(g_dpi);
 
     LOG("overlay::init calling ImGui_ImplWin32_Init");
     ImGui_ImplWin32_Init(hwnd_);
