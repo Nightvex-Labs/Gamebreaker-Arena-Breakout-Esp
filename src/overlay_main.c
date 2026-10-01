@@ -192,9 +192,23 @@ static LONG WINAPI ah_overlay_unhandled_seh(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// v1.0.38.15 state-leak fix: register provider teardown with CRT atexit so
+// EVERY normal return path from wmain triggers stop+delete of the kdu SCM
+// service + driver image unload + .sys blob delete. Covers: (1) wmain
+// returning rv from AhOverlayRun, (2) C runtime exit() on main thread, (3)
+// any detached reader thread that didn't reach its own cleanup before
+// process termination. ExitProcess() does NOT invoke atexit — those paths
+// (GWORLD-STUCK self-restart) already call DhProviderShutdownAll directly.
+extern void DhProviderShutdownAll(void);
+static void ah_atexit_teardown(void) {
+    ah_test_trace_write("ah_atexit_teardown: provider shutdown");   // TEST-REMOVE
+    DhProviderShutdownAll();
+}
+
 int wmain(int argc, wchar_t** argv) {
     (void)argc; (void)argv;
     ah_test_trace_write("wmain ENTER argc=%d", argc);   // TEST-REMOVE
+    atexit(ah_atexit_teardown);
     // v1.0.24: VEH FIRST — before hardening, before SEH filter. VEH is the
     // only handler that catches fast-fails (RaiseFailFastException, /GS
     // cookie, CFG violation, heap corruption). These bypass SEH entirely,

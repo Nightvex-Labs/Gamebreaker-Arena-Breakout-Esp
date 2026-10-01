@@ -424,6 +424,15 @@ static void reader_body_impl(void) {
 
     DH_DRIVER drv = {0};
     HANDLE dev = NULL; u32 flags = 0;
+    // v1.0.38.15 state-leak fix: nuke orphan SCM services + stale .sys
+    // blobs left by force-killed prior overlay sessions BEFORE first
+    // DhProviderSelect. Without this, DhDrvInstall's ERROR_SERVICE_EXISTS
+    // path reuses an orphan service pointing at a wedged/deleted .sys,
+    // and the kernel driver image never unloads (stays in-memory until
+    // reboot). Audit: state-leak workflow BLOCKER #5-#11
+    // (scm-service-leak + orphan-sys-blob + resident-driver-reuse).
+    ah_diag("DhProviderNukeOrphans BEGIN");
+    DhProviderNukeOrphans();
     ah_diag("DhProviderSelect BEGIN");
     const DH_PROVIDER* p = DhProviderSelect(&dev, &flags);
     if (!p || !dev) {
@@ -883,8 +892,23 @@ static void reader_body_impl(void) {
                         CloseHandle(pi.hThread);
                         ah_diag("self-restart: spawned fresh overlay pid=%lu — exiting current",
                                 pi.dwProcessId);
-                        // Small delay so log flushes.
-                        Sleep(200);
+                        // v1.0.38.15 state-leak fix: teardown kdu driver +
+                        // SCM service + .sys blob + SYNCHRONIZE handle
+                        // BEFORE ExitProcess. Prior ExitProcess(0) raw-exit
+                        // left the service STARTED, driver image LOADED,
+                        // and \Device\inpoutx64 alive — the fresh overlay
+                        // we just spawned would then inherit this wedged
+                        // kernel state and fail the same way. Audit:
+                        // state-leak workflow finding BLOCKER (ExitProcess
+                        // zero cleanup, ah_reader_thread.cpp:888).
+                        if (g_target_hproc) {
+                            CloseHandle(g_target_hproc);
+                            g_target_hproc = NULL;
+                        }
+                        if (dev) CloseHandle(dev);
+                        DhProviderShutdownAll();
+                        // Small delay so log flushes + SCM finishes teardown.
+                        Sleep(500);
                         ExitProcess(0);
                     }
                     ah_diag("self-restart FAILED: CreateProcess gle=%lu — falling back to another re-attach",
@@ -2340,6 +2364,12 @@ static void reader_body_impl(void) {
 
     CloseHandle(dev);
     if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
+    // v1.0.38.15 state-leak fix: full provider teardown so overlay exit
+    // leaves no SCM service STARTED, no driver image LOADED, no
+    // \Device\inpoutx64 alive, no .sys blob orphan in %TEMP%. Audit:
+    // state-leak workflow BLOCKER #2,#3 (missing-teardown / cross-session-
+    // state-leak at ah_reader_thread.cpp:2341).
+    DhProviderShutdownAll();
     timeEndPeriod(1);
     g_thread_alive.store(false);
 }
@@ -2384,6 +2414,17 @@ extern "C" void ah_reader_reattach(void) {
     if (g_thread_alive.load()) {
         ah_diag("reader_reattach: old thread wedged after 1s — spawning fresh anyway (old dies when its RPM returns)");
     }
+    // v1.0.38.15 BLOCKER fix: close g_target_hproc BEFORE spawning the fresh
+    // reader thread. If the old thread is wedged in a kdu IOCTL (never
+    // reached its normal cleanup at reader_body exit) AND UAGame has died
+    // between stall and reattach, g_target_hproc still points at the dead
+    // PID. Handles to terminated processes stay valid and signal
+    // immediately on WaitForSingleObject, so the new reader's first tick
+    // SYNCHRONIZE check at the top of its loop would see WAIT_OBJECT_0 and
+    // transition straight to AH_READER_GAME_GONE, which triggers overlay
+    // self-destruct (MoveFileEx-reboot delete of the overlay exe). Audit:
+    // workflow finding #1 BLOCKER (ah_reader_thread.cpp:2383, confirmed).
+    if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
     g_reader_hz.store(0.0f);
     g_reader_ticks.store(0);
     g_reader_last_ms.store(0);

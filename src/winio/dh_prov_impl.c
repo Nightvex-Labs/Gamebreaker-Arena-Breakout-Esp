@@ -19,6 +19,24 @@
 // PhysRead/PhysWrite in dh_phys.c consult this to route IOCTLs correctly.
 const DH_PROVIDER* g_active_provider = NULL;
 
+// v1.0.38.15 state-leak fix: retain the DH_DRIVER struct for the active
+// provider so exit paths can call DhDrvStop / DhDrvUninstall / DhDrvCleanup.
+// Prior to this, DhProviderTry's DH_DRIVER was a local stack var — hSvc/hSCM
+// got dropped on return TRUE, so overlay exit left the SCM service STARTED
+// and the driver image LOADED in kernel. Next overlay's reuse-fast-path then
+// opened the stale \Device\inpoutx64 and inherited a wedged kernel-side
+// state → CR3-STALE 500 streak within 3 seconds. Field pattern: 40-50% of
+// 2nd+ runs after any boot fail with this signature.
+static DH_DRIVER g_active_driver = {0};
+static wchar_t   g_active_syspath[MAX_PATH * 2] = {0};
+static int       g_active_driver_valid = 0;
+
+// Forward decl — called on every overlay exit path.
+void DhProviderShutdownAll(void);
+// Boot-time: wipe orphan SCM services + .sys blobs left by force-killed
+// prior overlay sessions. Call BEFORE DhProviderSelect.
+void DhProviderNukeOrphans(void);
+
 // DbUnpack declared in dh_dbunpack.h: BOOL DbUnpack(const void*, DWORD, void**, DWORD*)
 
 // -----------------------------------------------------------------------------
@@ -408,46 +426,181 @@ BOOL DhProviderTry(const DH_PROVIDER* prov, HANDLE* out_dev)
     CloseHandle(h);
     HeapFree(GetProcessHeap(), 0, decoded);
 
-    // Fast-path: resident device from prior session. Reuse handle — even if
-    // it's a different .sys build, IOCTL surface is defined by kdu family so
-    // ours match if protocol tag is correct.
-    wchar_t devPath[128];
-    _snwprintf(devPath, 128, L"\\\\.\\%ws", prov->dev_name);
-    HANDLE probeDev = CreateFileW(devPath, GENERIC_READ | GENERIC_WRITE,
-                                   0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (probeDev != INVALID_HANDLE_VALUE) {
-        DH_INFO("provider %s: device already resident, reusing %ws", prov->name, devPath);
-        *out_dev = probeDev;
-        return TRUE;
-    }
+    // v1.0.38.15 REMOVED: reuse-existing-device fast-path.
+    //
+    // Prior version did CreateFileW(\\\\.\\<dev_name>, OPEN_EXISTING) first
+    // and if the device object was resident from a dead prior overlay (ACE
+    // kill, launcher force-stop, hard-close) it returned that stale handle
+    // as "live provider". Early IOCTLs happened to work (cached phys ranges)
+    // but subsequent dynamic page-walk IOCTLs fired against the wedged
+    // driver's dead FILE_OBJECT returned garbage / zeros → RpmRead64 fail
+    // streak 500 → CR3-STALE tripwire → re-attach loop → GWORLD-STUCK
+    // self-restart → next overlay same wedged driver → 40-50% fail.
+    //
+    // New path: always go through DhDrvInstall which handles
+    // ERROR_SERVICE_EXISTS by opening the existing service entry, calls
+    // DhDrvStart (handles ERROR_SERVICE_ALREADY_RUNNING), then opens a
+    // FRESH FILE_OBJECT via DhDrvOpenDevice. New FILE_OBJECT = fresh
+    // per-handle state in the driver, no wedge inherited.
+    //
+    // Combined with DhProviderNukeOrphans() called from the reader before
+    // first DhProviderSelect, we also stop+delete every orphan
+    // "inpoutx64_<pid>" service so the driver image unloads from kernel
+    // (NO Running handles → ReferenceCount→0 → image unloaded).
 
     // SCM install + start + open device (fresh install)
     wchar_t svcName[64];
     _snwprintf(svcName, 64, L"%ws_%lu", prov->svc_name, GetCurrentProcessId());
     DH_DRIVER drv = {0};
     if (!DhDrvInstall(&drv, svcName, prov->dev_name, sysPath)) return FALSE;
-    if (!DhDrvStart(&drv))  { DhDrvStop(&drv); return FALSE; }
+    if (!DhDrvStart(&drv))  { DhDrvStop(&drv); DhDrvCleanup(&drv); return FALSE; }
 
     // Optional unlock handshake
     if (prov->unlock && !prov->unlock(drv.hDevice)) {
         DH_ERROR("provider %s: unlock failed", prov->name);
-        DhDrvStop(&drv);
+        DhDrvStop(&drv); DhDrvUninstall(&drv); DhDrvCleanup(&drv);
         return FALSE;
     }
 
     if (!DhDrvOpenDevice(&drv)) {
         DH_ERROR("provider %s: open device '\\\\.\\%ws' failed", prov->name, prov->dev_name);
-        DhDrvStop(&drv);
+        DhDrvStop(&drv); DhDrvUninstall(&drv); DhDrvCleanup(&drv);
         return FALSE;
     }
 
-    // NO smoke test — sending wrong IOCTL to wrong driver family = BSOD risk.
-    // Provider is considered "live" if it opened device successfully.
-    // Actual IOCTL verification must happen on caller side after provider selection.
-    DH_INFO("provider %s STARTED: dev=\\\\.\\%ws (no smoke test — safety)",
+    DH_INFO("provider %s STARTED: dev=\\\\.\\%ws (fresh FILE_OBJECT)",
             prov->name, prov->dev_name);
+
+    // v1.0.38.15: retain the full DH_DRIVER so DhProviderShutdownAll on
+    // overlay exit can stop + delete the service, unload the driver image,
+    // and close the device + SCM handles. g_active_syspath remembers the
+    // .sys blob to unlink after the service is torn down.
+    g_active_driver = drv;
+    wcscpy_s(g_active_syspath, MAX_PATH * 2, sysPath);
+    g_active_driver_valid = 1;
+
     *out_dev = drv.hDevice;
     return TRUE;
+}
+
+// -----------------------------------------------------------------------------
+// v1.0.38.15 — teardown & orphan cleanup
+// -----------------------------------------------------------------------------
+
+// Full teardown of the active provider. Call on EVERY overlay exit path:
+//   - normal reader exit (reader_body end)
+//   - GWORLD-STUCK self-restart (ExitProcess)
+//   - any panic / fatal path
+// Stops service → unloads kernel image → closes device → closes SCM →
+// deletes .sys blob. After this, next overlay starts clean.
+void DhProviderShutdownAll(void)
+{
+    if (!g_active_driver_valid) return;
+    DH_INFO("DhProviderShutdownAll: stopping service '%ws'",
+            g_active_driver.svcName);
+    DhDrvStop(&g_active_driver);
+    DhDrvUninstall(&g_active_driver);
+    DhDrvCleanup(&g_active_driver);
+    if (g_active_syspath[0]) {
+        DeleteFileW(g_active_syspath);
+        g_active_syspath[0] = 0;
+    }
+    g_active_driver_valid = 0;
+}
+
+// Enumerate orphan services from past overlay sessions and nuke them.
+// Service naming convention: "<svc_base>_<pid>" (see DhProviderTry svcName
+// construction). We stop+delete any "<base>_<N>" service we did not create
+// ourselves — their <pid> is a dead process from a prior session that was
+// force-killed before shutdown. Also unlinks their .sys blobs from %TEMP%.
+void DhProviderNukeOrphans(void)
+{
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL,
+                                   SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) {
+        DH_ERROR("NukeOrphans: OpenSCManager gle=%lu", GetLastError());
+        return;
+    }
+
+    // Allocate for EnumServicesStatusExW — ~256 KiB covers hundreds of services.
+    DWORD bufSize = 256 * 1024;
+    BYTE* buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, bufSize);
+    if (!buf) { CloseServiceHandle(scm); return; }
+
+    DWORD needed = 0, returned = 0, resumeHandle = 0;
+    BOOL ok = EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO,
+                                    SERVICE_DRIVER, SERVICE_STATE_ALL,
+                                    buf, bufSize, &needed, &returned,
+                                    &resumeHandle, NULL);
+    if (!ok && GetLastError() != ERROR_MORE_DATA) {
+        DH_ERROR("NukeOrphans: EnumServicesStatusEx gle=%lu", GetLastError());
+        HeapFree(GetProcessHeap(), 0, buf); CloseServiceHandle(scm); return;
+    }
+
+    DWORD my_pid = GetCurrentProcessId();
+    ENUM_SERVICE_STATUS_PROCESSW* svcs = (ENUM_SERVICE_STATUS_PROCESSW*)buf;
+    int nuked = 0;
+
+    // Build the set of prefixes we own, from the provider registry.
+    for (int si = 0; si < (int)returned; si++) {
+        const wchar_t* name = svcs[si].lpServiceName;
+        if (!name) continue;
+
+        for (int pi = 0; pi < g_provider_count; pi++) {
+            const wchar_t* base = g_providers[pi].svc_name;
+            size_t base_len = wcslen(base);
+            if (wcsncmp(name, base, base_len) != 0) continue;
+            if (name[base_len] != L'_') continue;
+            // Match "<base>_<digits>" and the <digits> must NOT be our own PID.
+            wchar_t* end = NULL;
+            unsigned long tail = wcstoul(name + base_len + 1, &end, 10);
+            if (!end || *end != 0 || tail == 0) continue;
+            if ((DWORD)tail == my_pid) continue;   // ours, keep
+
+            SC_HANDLE hSvc = OpenServiceW(scm, name,
+                                          SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+            if (!hSvc) continue;
+            SERVICE_STATUS ss = {0};
+            ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);   // may fail if already stopped
+            DeleteService(hSvc);
+            CloseServiceHandle(hSvc);
+            nuked++;
+
+            // Unlink stale .sys blob — path is predictable from svc_name + pid.
+            wchar_t sysPath[MAX_PATH * 2]; wchar_t tempDir[MAX_PATH];
+            GetTempPathW(MAX_PATH, tempDir);
+            _snwprintf(sysPath, MAX_PATH * 2, L"%wsdh_%ws_%lu.sys",
+                       tempDir, base, tail);
+            DeleteFileW(sysPath);
+            break;
+        }
+    }
+
+    // Also sweep any stray dh_<svc>_*.sys files whose service name is already
+    // gone (e.g. service was deleted but blob was leaked). Walk %TEMP%.
+    wchar_t pattern[MAX_PATH]; wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    _snwprintf(pattern, MAX_PATH, L"%wsdh_*.sys", tempDir);
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(pattern, &fd);
+    int blobs_removed = 0;
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            // Skip files owned by this process (dh_<svc>_<my_pid>.sys).
+            wchar_t suffix[32];
+            _snwprintf(suffix, 32, L"_%lu.sys", my_pid);
+            if (wcsstr(fd.cFileName, suffix) != NULL) continue;
+            wchar_t full[MAX_PATH * 2];
+            _snwprintf(full, MAX_PATH * 2, L"%ws%ws", tempDir, fd.cFileName);
+            if (DeleteFileW(full)) blobs_removed++;
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    DH_INFO("NukeOrphans: stopped+deleted %d orphan services, removed %d stale .sys blobs",
+            nuked, blobs_removed);
+    HeapFree(GetProcessHeap(), 0, buf);
+    CloseServiceHandle(scm);
 }
 
 // -----------------------------------------------------------------------------

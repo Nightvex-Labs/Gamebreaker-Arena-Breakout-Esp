@@ -12,11 +12,14 @@ static CRITICAL_SECTION s_tt_cs;
 static volatile LONG    s_tt_init = 0;
 
 static void tt_init_once(void) {
+    // state 0 = unset, 1 = winner initializing, 2 = done.
+    // Loser must wait for state=2, not state!=1 — otherwise it spins forever
+    // because the winner never advanced the sentinel past 1.
     if (InterlockedCompareExchange(&s_tt_init, 1, 0) == 0) {
         InitializeCriticalSection(&s_tt_cs);
+        InterlockedExchange(&s_tt_init, 2);   // signal done
     } else {
-        // Another thread is initializing — spin briefly.
-        while (s_tt_init == 1) SwitchToThread();
+        while (s_tt_init != 2) SwitchToThread();   // wait for winner
     }
 }
 

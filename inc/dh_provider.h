@@ -80,3 +80,16 @@ BOOL DhProviderPhysRead(HANDLE hDev, const DH_PROVIDER* prov,
                         u64 phys, void* dst, u32 size);
 BOOL DhProviderPhysWrite(HANDLE hDev, const DH_PROVIDER* prov,
                          u64 phys, const void* src, u32 size);
+
+// v1.0.38.15 state-leak teardown. Full stop + unload + delete of the active
+// provider. Call on EVERY overlay exit path (normal reader exit,
+// GWORLD-STUCK ExitProcess, panic, fatal). Safe no-op when no provider is
+// active. See dh_prov_impl.c for mechanism.
+void DhProviderShutdownAll(void);
+
+// Boot-time cleanup of orphan SCM services + .sys blobs left by prior
+// overlay sessions that were force-killed before shutdown. Enumerates
+// "<svc_base>_<pid>" services where <pid> is not our PID, stops + deletes
+// each, then sweeps stale dh_*.sys files from %TEMP%. Call BEFORE first
+// DhProviderSelect in the reader thread.
+void DhProviderNukeOrphans(void);
