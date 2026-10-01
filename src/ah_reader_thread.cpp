@@ -1524,22 +1524,40 @@ static void reader_body_impl(void) {
                                                        e_root, &dx, &dy, &dz);
 #ifdef AH_DIAG
                             {
-                                // Log first non-self enemy's decrypt every 3s
-                                // to see if encrypted-path fail is bucket miss.
-                                static DWORD s_last_enemy_diag = 0;
-                                static u64   s_last_pawn = 0;
-                                if (!e->is_me && (e_pawn != s_last_pawn ||
-                                    (GetTickCount() - s_last_enemy_diag) > 3000)) {
-                                    u32 ctl_e = 0;
-                                    RpmReadVirtual(drv.hDevice, procCR3, e_root + AH_ROOT_CTL, &ctl_e, 4);
-                                    ah_diag("ENEMY-DECRYPT pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u key=0x%X ok=%d fail=%d out=(%.0f,%.0f,%.0f)",
-                                            (unsigned long long)e_pawn,
-                                            (unsigned long long)e_root,
-                                            ctl_e, ctl_e >> 29, ctl_e & 0x1FFFFFF,
-                                            (int)dec_ok, (int)AhAceLastFail(),
-                                            dx, dy, dz);
-                                    s_last_pawn = e_pawn;
-                                    s_last_enemy_diag = GetTickCount();
+                                // v1.0.38.13: proper per-pawn throttle. Old
+                                // "pawn != s_last_pawn" fired for EVERY entity
+                                // in a 60-entity raid → ~100 diag lines/sec →
+                                // disk I/O + Defender scan pressure → reader
+                                // tick gaps up to 13s (field 2026-10-01 UI
+                                // freeze). Now: track when each pawn was last
+                                // logged, emit at most once per 30 s per pawn.
+                                // Auto-prunes to keep the map bounded.
+                                static std::unordered_map<u64, DWORD> s_pawn_last_diag;
+                                if (!e->is_me) {
+                                    DWORD now_dw = GetTickCount();
+                                    auto it = s_pawn_last_diag.find(e_pawn);
+                                    if (it == s_pawn_last_diag.end() || (now_dw - it->second) > 30000) {
+                                        u32 ctl_e = 0;
+                                        RpmReadVirtual(drv.hDevice, procCR3, e_root + AH_ROOT_CTL, &ctl_e, 4);
+                                        ah_diag("ENEMY-DECRYPT pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u key=0x%X ok=%d fail=%d out=(%.0f,%.0f,%.0f)",
+                                                (unsigned long long)e_pawn,
+                                                (unsigned long long)e_root,
+                                                ctl_e, ctl_e >> 29, ctl_e & 0x1FFFFFF,
+                                                (int)dec_ok, (int)AhAceLastFail(),
+                                                dx, dy, dz);
+                                        s_pawn_last_diag[e_pawn] = now_dw;
+                                        // Prune stale entries when the map
+                                        // grows past a raid's worth (128) —
+                                        // pool pawns get recycled between raids.
+                                        if (s_pawn_last_diag.size() > 128) {
+                                            for (auto pit = s_pawn_last_diag.begin(); pit != s_pawn_last_diag.end(); ) {
+                                                if ((now_dw - pit->second) > 60000)
+                                                    pit = s_pawn_last_diag.erase(pit);
+                                                else
+                                                    ++pit;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 #endif
@@ -2108,14 +2126,24 @@ static void reader_body_impl(void) {
                         RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_MESH, &mesh);
                         RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_CAPSULE, &cap);
                         RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_ROOT, &root);
-                        if (!mesh || !cap || !root) {
-                            g_bot_vt_kind[vt] = 0;   // structurally not a pawn
+                        // v1.0.38.13: DO NOT permanent-cache vt=0 on a transient
+                        // read failure. Field 2026-10-01: "1 бот не отобразился"
+                        // — bot's vt was probed while kdu slot contended (mesh/
+                        // cap/root all read as 0 for that one shot), vt cached
+                        // as non-pawn FOREVER → every future bot with same vt
+                        // silently skipped until overlay restart. Only cache the
+                        // reject when shape probe SUCCEEDS but reports out-of-
+                        // range capsule dims. Transient failures just skip this
+                        // iteration; next Level.Actors chunk re-probes.
+                        if (!mesh || !cap || !root) continue;
+                        float hh = 0, rr = 0;
+                        BOOL rh = RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_HALFHEIGHT, &hh, 4);
+                        BOOL rr_ok = RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_RADIUS, &rr, 4);
+                        if (!rh || !rr_ok) continue;   // transient read fail — retry next cycle
+                        if (hh < 20.0f || hh > 200.0f || rr < 5.0f || rr > 200.0f) {
+                            g_bot_vt_kind[vt] = 0;   // now legitimate: shape confirmed non-humanoid
                             continue;
                         }
-                        float hh = 0, rr = 0;
-                        RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_HALFHEIGHT, &hh, 4);
-                        RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_RADIUS, &rr, 4);
-                        if (hh < 20.0f || hh > 200.0f || rr < 5.0f || rr > 200.0f) continue;
                         g_bot_vt_kind[vt] = 1;   // cache as pawn-shaped
                     }
                     // Freeze cap on first insert (cheap 2 RPM, static thereafter).
