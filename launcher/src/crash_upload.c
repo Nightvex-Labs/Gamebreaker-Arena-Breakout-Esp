@@ -139,6 +139,7 @@ static void read_head_tail(const wchar_t* path,
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0) { CloseHandle(h); return; }
 
+    // Small file — send whole.
     if ((ULONGLONG)sz.QuadPart <= (ULONGLONG)(head_max + tail_max)) {
         DWORD want = (DWORD)sz.QuadPart;
         uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, want);
@@ -152,6 +153,7 @@ static void read_head_tail(const wchar_t* path,
         return;
     }
 
+    // Big file — split into head + separator + tail.
     char sep[128];
     LONGLONG cut = sz.QuadPart - (LONGLONG)head_max - (LONGLONG)tail_max;
     int sep_n = _snprintf_s(sep, sizeof(sep), _TRUNCATE,
@@ -163,6 +165,7 @@ static void read_head_tail(const wchar_t* path,
     uint8_t* buf = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, total);
     if (!buf) { CloseHandle(h); return; }
 
+    // Head — from offset 0.
     LARGE_INTEGER off; off.QuadPart = 0;
     SetFilePointerEx(h, off, NULL, FILE_BEGIN);
     DWORD gh = 0;
@@ -170,8 +173,10 @@ static void read_head_tail(const wchar_t* path,
         HeapFree(GetProcessHeap(), 0, buf); CloseHandle(h); return;
     }
 
+    // Separator.
     if (sep_n > 0) memcpy(buf + gh, sep, (size_t)sep_n);
 
+    // Tail — from sz - tail_max.
     off.QuadPart = sz.QuadPart - (LONGLONG)tail_max;
     SetFilePointerEx(h, off, NULL, FILE_BEGIN);
     DWORD gt = 0;
@@ -220,8 +225,11 @@ static void read_crash_marker(uint8_t out[2]) {
     ReadFile(h, out, 1, &got, NULL);
     CloseHandle(h);
     out[1] = (got == 1) ? 1 : 0;
-    // v1.0.29: consume the marker after read so the next launcher run
-    // doesn't ship the same stale byte and mis-classify graceful exit.
+    // v1.0.29: consume the marker after read so the NEXT launcher run
+    // doesn't ship the same stale byte and mis-classify a graceful exit
+    // as e.g. READER_AV or OVERLAY_DEVICE_LOST. Field triage of v1.0.28
+    // showed multiple hwids reporting marker=0x0c/0x0a alongside ec=0
+    // (clean exit) — the marker was leaking across process lifetimes.
     if (out[1]) {
         DeleteFileW(p);
     }
@@ -279,8 +287,10 @@ void crash_upload_after_child(DWORD child_pid, DWORD exit_code, const char* vers
 
     uint8_t* reader_buf = NULL; DWORD reader_len = 0;
     uint8_t* procs_buf  = NULL; DWORD procs_len  = 0;
-    // v1.0.28: reader.log gets head+tail split — init phase in head,
-    // recent activity in tail. procs.log stays raw tail.
+    // v1.0.28: reader.log gets head+tail split — init phase (gpu_probe,
+    // WARP marker, LATCH, SIG-SCAN, canary bailout) sits in the head,
+    // recent activity before exit sits in the tail. procs.log stays raw
+    // tail — it's a snapshot of running processes, only the latest matters.
     read_head_tail(L"C:\\Users\\Public\\ah_reader.log",
                    HEAD_BYTES, TAIL_TAIL_BYTES, &reader_buf, &reader_len);
     read_tail(L"C:\\Users\\Public\\ah_procs.log",  &procs_buf,  &procs_len);

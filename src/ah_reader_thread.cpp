@@ -49,6 +49,7 @@ extern "C" {
 #include "../inc/dh_rpm.h"
 #include "../inc/ah_uspace_read.h"   // v1.0.34
 #include "../inc/ah_offsets.h"
+#include "../inc/ah_test_trace.h"    // TEST-REMOVE: instrumentation include
 
 #ifndef AH_CR3_USPACE
 #define AH_CR3_USPACE 1ULL
@@ -226,6 +227,16 @@ static std::atomic<float>    g_reader_hz{0.0f};
 
 // Publisher — atomically swap the whole struct.
 static void publish(const AH_LIVE_SNAP& s) {
+    // TEST-REMOVE: publish freq is ~200Hz; sample every 300 calls (~1.5s) so
+    // log isn't drowned but we see snap contents around any crash.
+    static unsigned long long tt_pub_ctr = 0;
+    tt_pub_ctr++;
+    if ((tt_pub_ctr % 300) == 0) {
+        ah_test_trace_write("publish #%llu ent_n=%d loot_n=%d roomid=0x%llX scene=%u cam=(%.0f,%.0f,%.0f)",
+            tt_pub_ctr, (int)s.ent_n, (int)s.loot_n,
+            (unsigned long long)s.roomid, (unsigned)s.scene_type,
+            s.x, s.y, s.z);
+    }
     std::lock_guard<std::mutex> lk(g_snap_lock);
     g_snap = s;
 }
@@ -357,6 +368,7 @@ static u64 ah_sig_scan_gworld(HANDLE hDev, u64 procCR3, u64 imageBase)
 static void reader_body_impl(void);
 
 static void reader_body(void) {
+    ah_test_trace_write("reader_body ENTER");   // TEST-REMOVE
     // Install terminate handler once. std::call_once used to be safe against
     // races if reattach spawns a fresh reader thread mid-crash of the first.
     static std::once_flag s_term_once;
@@ -365,6 +377,7 @@ static void reader_body(void) {
             // Fast, single-byte marker before termination. VEH v1.0.24 may or
             // may not fire depending on how the exception unwound; the marker
             // is the belt-and-suspenders channel.
+            ah_test_trace_write("std::terminate handler fired — _Exit(0x0D)");   // TEST-REMOVE
             crash_marker::write(crash_marker::TERMINATE_HANDLER);
             _Exit(0x0D);
         });
@@ -372,7 +385,9 @@ static void reader_body(void) {
 
     try {
         reader_body_impl();
+        ah_test_trace_write("reader_body_impl returned normally");   // TEST-REMOVE
     } catch (const std::bad_alloc&) {
+        ah_test_trace_write("reader_body caught bad_alloc — _Exit(0xE0000009)");   // TEST-REMOVE
         // Out-of-memory in std::unordered_map (g_pmc_corpses / g_human_snap /
         // g_bot_cap etc.) — write a distinct marker so field triage doesn't
         // confuse this with a real AV.
@@ -381,17 +396,21 @@ static void reader_body(void) {
         g_thread_alive.store(false);
         _Exit(0xE0000009);
     } catch (const std::exception& e) {
+        ah_test_trace_write("reader_body caught std::exception what=%s — _Exit(0xE0000EEE)",   // TEST-REMOVE
+                            e.what() ? e.what() : "(null)");
         ah_diag("!!! reader_body: std::exception caught: what()='%s' — marker=READER_UNKNOWN_EXC",
                 e.what() ? e.what() : "(null)");
         crash_marker::write(crash_marker::READER_UNKNOWN_EXC);
         g_thread_alive.store(false);
         _Exit(0xE0000EEE);
     } catch (...) {
+        ah_test_trace_write("reader_body caught unknown C++ exception — _Exit(0xE0000EEE)");   // TEST-REMOVE
         ah_diag("!!! reader_body: unknown C++ exception caught — marker=READER_UNKNOWN_EXC");
         crash_marker::write(crash_marker::READER_UNKNOWN_EXC);
         g_thread_alive.store(false);
         _Exit(0xE0000EEE);
     }
+    ah_test_trace_write("reader_body EXIT normal");   // TEST-REMOVE
 }
 
 static void reader_body_impl(void) {
@@ -405,6 +424,15 @@ static void reader_body_impl(void) {
 
     DH_DRIVER drv = {0};
     HANDLE dev = NULL; u32 flags = 0;
+    // v1.0.38.15 state-leak fix: nuke orphan SCM services + stale .sys
+    // blobs left by force-killed prior overlay sessions BEFORE first
+    // DhProviderSelect. Without this, DhDrvInstall's ERROR_SERVICE_EXISTS
+    // path reuses an orphan service pointing at a wedged/deleted .sys,
+    // and the kernel driver image never unloads (stays in-memory until
+    // reboot). Audit: state-leak workflow BLOCKER #5-#11
+    // (scm-service-leak + orphan-sys-blob + resident-driver-reuse).
+    ah_diag("DhProviderNukeOrphans BEGIN");
+    DhProviderNukeOrphans();
     ah_diag("DhProviderSelect BEGIN");
     const DH_PROVIDER* p = DhProviderSelect(&dev, &flags);
     if (!p || !dev) {
@@ -520,14 +548,39 @@ static void reader_body_impl(void) {
     DWORD attach_ms  = 0;    // time we latched — for bailout timers
     BOOL  gworld_seen = FALSE;   // set TRUE the first tick gworld != 0
     BOOL  canary_seen = FALSE;   // v0.9.462: TRUE once GObjects OR FNamePool read != 0
+    // v1.0.38.5: TRUE once ANY user-space read through procCR3 returned rd_ok.
+    // Distinguishes wrong-CR3 latch (rd_ok never set) from menu-load with valid
+    // CR3 (rd_ok set but data still 0). Gates the blacklist push on bogus_canary
+    // / bogus_gworld — we only blacklist genuinely-broken CR3 latches, not
+    // long menu loads.
+    BOOL  read_ok_ever = FALSE;
+    // v1.0.38.10: counts consecutive GWORLD-STUCK triggers without gworld_seen
+    // coming back non-zero in between. First stuck → v1.0.38.9 re-attach.
+    // Second stuck → the re-attach didn't cure it (same eproc/CR3, kdu driver
+    // state fully wedged). Self-restart the whole overlay process — Maik's
+    // manual "если рестартнуть софт то всё работает" automated.
+    int   gworld_stuck_count = 0;
+    // v1.0.38.7: SIG-SCAN state moved out of the inner block's function-local
+    // static scope. Field-report PC1 2026-10-01: overlay attach + game menu
+    // where GWorld=0 → 5 sig-scan misses at 30 s cadence → s_scan_misses=5
+    // → SIG-SCAN never retries. On next attach cycle in the same overlay
+    // process the static counter is STILL 5, so we never even TRY to find
+    // GWorld after that — permanent silent failure. Only fresh overlay
+    // process resets it. Now these are outer-scope locals reset on every
+    // ATTACH LATCH success + on every detach path.
+    DWORD sig_scan_last_ms  = 0;
+    int   sig_scan_misses   = 0;
 
-    // v0.9.462: recent-fail EPROCESS blacklist. On LATCH BAILOUT we push
-    // the eproc pointer + PID here for 60s so the next RpmFindProcess pass
-    // doesn't re-latch the same decoy. Reader thread only — RpmFindProcess
-    // is called from one place so a local skip-check works.
-    struct FailedAttach { u64 eproc; u64 pid; DWORD stamp_ms; };
-    FailedAttach failed_attachments[4] = {};   // ring buffer
-    int failed_idx = 0;
+    // v1.0.38.6: EPROCESS blacklist REMOVED. Historically it hedged against
+    // walker re-latching on a decoy right after a bogus_canary/gworld bailout.
+    // With target_pid-authoritative accept in RpmFindProcess + wrapper reject
+    // (<4 GB) + MZ probe already gating attach, walker won't return a decoy
+    // in the first place. The only remaining "wrong CR3" signal is
+    // sustained RpmRead64 translate failure — handled by CR3-STALE watchdog
+    // (s_rpm_fail_streak). Blacklist caused false-positive 15 s lockouts
+    // during menu load (PC1 field 2026-10-01: game loaded to menu → canary=0
+    // for 8 s → old blacklist → 400+ subsequent walker successes all skipped
+    // even though pid matched live UAGame).
     ah_diag("entering main loop -- waiting for UAGame process (GWorld initial RVA=0x%llX)",
             (unsigned long long)gworld_rva_live);
     g_reader_state.store(AH_READER_WAITING_GAME);
@@ -536,6 +589,12 @@ static void reader_body_impl(void) {
     int   find_attempts = 0;
     while (g_run.load()) {
         DWORD now = GetTickCount();
+        // TEST-REMOVE: tick counter — 200Hz publisher so sample every 600 ticks (~3s).
+        static unsigned long long tt_tick_no = 0;
+        tt_tick_no++;
+        bool tt_tick_log = (tt_tick_no % 600) == 0;
+        if (tt_tick_log) ah_test_trace_write("reader tick #%llu top attached_pid=%llu state=%d",
+            tt_tick_no, (unsigned long long)attached_pid, g_reader_state.load());
 
         // v1.0.37 (top-of-tick hard death check): SYNCHRONIZE handle stays
         // open across CR3-STALE resets and re-attach cycles so the game-gone
@@ -545,6 +604,7 @@ static void reader_body_impl(void) {
         if (g_target_hproc &&
             WaitForSingleObject(g_target_hproc, 0) == WAIT_OBJECT_0)
         {
+            ah_test_trace_write("GAME-GONE via SYNCHRONIZE tick=%llu pid=%llu", tt_tick_no, (unsigned long long)attached_pid);   // TEST-REMOVE
             ah_diag("GAME-GONE: SYNCHRONIZE wait on prior pid=%llu signaled — process terminated",
                     (unsigned long long)attached_pid);
             CloseHandle(g_target_hproc);
@@ -574,38 +634,9 @@ static void reader_body_impl(void) {
             if (now - last_find >= find_interval) {
                 find_attempts++;
                 if (RpmFindProcess(drv.hDevice, sysCR3, AH_PROC_NAME, &procCR3, &eproc)) {
-                    // v0.9.462: skip recently-failed eproc/pid combos so the
-                    // second-chance probe doesn't hand us back the same decoy.
-                    // 60s cooldown per entry, ring of 4 slots.
-                    BOOL blacklisted = FALSE;
                     u64 tmp_pid = 0;
                     RpmRead64(drv.hDevice, sysCR3, eproc + g_eproc_pid, &tmp_pid);
-                    // v1.0.29: blacklist cooldown 60s -> 15s. First-bailout
-                    // is often a wrong-CR3 decoy that clears itself once ACE
-                    // stabilises; a 60s dead zone in the middle of user's
-                    // "why is ESP not on" panic was aggressive. 15s is long
-                    // enough that we don't re-latch the same failing eproc
-                    // in the same tick, short enough that the recovery
-                    // window is invisible to the user.
-                    for (int fi = 0; fi < 4; fi++) {
-                        FailedAttach& fa = failed_attachments[fi];
-                        if (!fa.stamp_ms) continue;
-                        if ((now - fa.stamp_ms) > 15000) continue;
-                        if (fa.eproc == eproc || fa.pid == tmp_pid) {
-                            blacklisted = TRUE; break;
-                        }
-                    }
-                    if (blacklisted) {
-                        if (now - last_diag_ms > 3000) {
-                            ah_diag("RpmFindProcess #%d SKIP recently-failed eproc=0x%llX pid=%llu",
-                                    find_attempts, (unsigned long long)eproc,
-                                    (unsigned long long)tmp_pid);
-                            last_diag_ms = now;
-                        }
-                        procCR3 = 0; eproc = 0;   // reset so next iter retries
-                        last_find = now;
-                        continue;
-                    }
+                    // v1.0.38.6: blacklist removed — see comment near top-of-run.
 
                     // v1.0.34: USPACE path — RpmFindProcess returned the
                     // sentinel CR3, and imageBase/pid are known from
@@ -625,6 +656,15 @@ static void reader_body_impl(void) {
                     attach_ms = now;
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
+                    read_ok_ever = FALSE;   // v1.0.38.5: fresh attach = fresh CR3 to prove
+                    // v1.0.38.7: fresh attach = fresh sig-scan budget. Prevents
+                    // one bad attach's exhausted misses from silently killing
+                    // GWorld resolve on every subsequent attach.
+                    sig_scan_last_ms = 0;
+                    sig_scan_misses  = 0;
+                    ah_test_trace_write("ATTACH LATCH pid=%llu procCR3=0x%llX eproc=0x%llX imgBase=0x%llX",   // TEST-REMOVE
+                        (unsigned long long)attached_pid, (unsigned long long)procCR3,
+                        (unsigned long long)eproc, (unsigned long long)imageBase);
                     g_reader_state.store(AH_READER_ATTACHED);
                     // v1.0.37: open SYNCHRONIZE handle to target for reliable
                     // process-death detection. SYNCHRONIZE is the lightest
@@ -632,6 +672,8 @@ static void reader_body_impl(void) {
                     // and the wait check is O(1) per tick.
                     if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
                     g_target_hproc = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)attached_pid);
+                    ah_test_trace_write("ATTACH SYNCHRONIZE handle=%p gle=%lu",   // TEST-REMOVE
+                        (void*)g_target_hproc, GetLastError());
                     ah_diag("ATTACH LATCH #%d pid=%llu procCR3=0x%llX eproc=0x%llX peb=0x%llX imageBase=0x%llX %s (SYNC handle=%p)",
                             find_attempts,
                             (unsigned long long)attached_pid,
@@ -659,8 +701,9 @@ static void reader_body_impl(void) {
             // decoy/dead EPROCESS, not the real process.
             if (!canary_seen && imageBase && (now - attach_ms) > 500) {
                 u64 gob = 0, fnp = 0;
-                RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_GOBJECTS, &gob);
-                RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_FNAMEPOOL, &fnp);
+                BOOL rg = RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_GOBJECTS, &gob);
+                BOOL rf = RpmRead64(drv.hDevice, procCR3, imageBase + AH_RVA_FNAMEPOOL, &fnp);
+                if (rg || rf) read_ok_ever = TRUE;   // v1.0.38.5: CR3 translates
                 if (gob || fnp) canary_seen = TRUE;
             }
 
@@ -676,77 +719,68 @@ static void reader_body_impl(void) {
                 BOOL rd;
                 BOOL liveness_lost;
                 if (procCR3 == AH_CR3_USPACE) {
+                    // v1.0.34: USPACE liveness via MZ probe (VM_READ handle).
+                    // Reverted the v1.0.38 "mark-broken permanently" fix —
+                    // that killed all attach attempts after the first 10s
+                    // (ACE revokes VM_READ but re-attach cycle can still get
+                    // a fresh 10s window). Prefer 10s-per-attach over 0s.
                     rd = AhUspaceVerify();
                     liveness_lost = !rd;
-                    if (!rd) {
-                        snprintf(img, sizeof(img), "uspace-dead");
-                    }
+                    if (!rd) snprintf(img, sizeof(img), "uspace-dead");
                 } else {
-                    rd = RpmReadVirtual(drv.hDevice, sysCR3,
-                                        eproc + g_eproc_imgname, img, 15);
-                    liveness_lost = (!rd || _strnicmp(img, AH_PROC_NAME, 6) != 0);
+                    // v1.0.38.4: kdu-path liveness DOES NOT re-verify
+                    // EPROCESS.ImageFileName any more. Field evidence
+                    // (PC1 log 2026-10-01): ACE reclaims the game's
+                    // EPROCESS pool block ~10 s after every latch and
+                    // Windows reuses it for another process (updater.exe,
+                    // game-asset string cache, etc.). ImageFileName then
+                    // reads garbage / wrong-process, we mark LATCH LOST,
+                    // and next RpmFindProcess can't re-find the live
+                    // game (fully DKOM-unlinked from ActiveProcessLinks —
+                    // bidir walker walks past it). Net: 10-sec-per-attach
+                    // ceiling, useless in raid.
+                    //
+                    // The SYNCHRONIZE handle we opened at attach (see
+                    // top-of-tick block near line 570) is the AUTHORITATIVE
+                    // liveness signal — ACE can't cheaply strip SYNCHRONIZE.
+                    // Wrong-CR3 latch is caught by bogus_canary / bogus_gworld
+                    // watchdogs below. That is sufficient — no need to
+                    // re-verify the name field, which we now know ACE actively
+                    // scrambles under us.
+                    rd = TRUE;
+                    liveness_lost = FALSE;
+                    (void)img;
                 }
-                // v0.9.462: bogus-CR3 hard bailout tightened 30s → 10s.
-                // GWorld may legitimately be null in main menu (game not
-                // yet loaded), but 10s is more than enough for it to appear
-                // once user hits Play. Users no longer suffer 30s "UI-alive,
-                // ESP-dead" window on wrong-PID attach.
-                // v1.0.27: bogus_gworld 10s → 15s. Slow rigs (Win10 21H2 on
-                // b19045 boxes) can take 10s just to load main menu; earlier
-                // bailout was misfiring on legitimate slow clients.
-                // v1.0.34: USPACE path is authoritative (Toolhelp gives the
-                // real UAGame — cannot be a decoy). Skip canary+gworld
-                // bailouts entirely on USPACE — gworld=null just means the
-                // user is sitting in the main menu, not that we latched
-                // the wrong process.
-                BOOL bogus_gworld = (procCR3 != AH_CR3_USPACE)
-                                    && !gworld_seen
-                                    && (now - attach_ms) > 15000;
-                BOOL bogus_canary = (procCR3 != AH_CR3_USPACE)
-                                    && !canary_seen
-                                    && (now - attach_ms) > 8000;
+                // v1.0.38.6: bogus_canary + bogus_gworld REMOVED. Both were
+                // "gworld/canary stayed 0 for N seconds → wrong CR3" heuristics.
+                // Field evidence: they misfired on menu load (game legitimately
+                // has GWorld/GObjects=0 in main menu). Wrong-CR3 is now caught
+                // by CR3-STALE watchdog (s_rpm_fail_streak below at line ~860)
+                // which fires on translate FAILURE — the actual wrong-CR3
+                // signature — not on data-value-zero. Process death still
+                // caught by SYNCHRONIZE handle at top-of-tick.
+                //
+                // liveness_lost still relevant only for USPACE path (MZ probe
+                // via VM_READ handle — dies at ~10 s when ACE strips access).
 
                 if (liveness_lost) {
-                    ah_diag("LATCH LOST — eproc ImageFileName check failed (rd=%d name='%s'). Re-probing.",
+                    ah_diag("LATCH LOST — %s (rd=%d name='%s'). Re-probing.",
+                            (procCR3 == AH_CR3_USPACE) ? "USPACE handle stripped by ACE"
+                                                       : "eproc ImageFileName mismatch",
                             (int)rd, img);
-                } else if (bogus_canary) {
-                    ah_diag("LATCH BAILOUT (canary) — GObjects+FNamePool both 0 for 3s (pid=%llu eproc=0x%llX). "
-                            "Wrong process — full re-probe, blacklisting for 60s.",
-                            (unsigned long long)attached_pid,
-                            (unsigned long long)eproc);
-                } else if (bogus_gworld) {
-                    ah_diag("LATCH BAILOUT (gworld) — GWorld stayed 0 for 10s (pid=%llu procCR3=0x%llX). "
-                            "Probably wrong CR3 latched — full re-probe, blacklisting for 60s.",
-                            (unsigned long long)attached_pid,
-                            (unsigned long long)procCR3);
-                }
-                if (liveness_lost || bogus_canary || bogus_gworld) {
-                    // Push the failed attach into the blacklist ring so the
-                    // next RpmFindProcess pass skips this eproc/pid for 60s.
-                    // Skip liveness_lost — that just means the game exited,
-                    // no reason to blacklist its PID slot.
-                    if (bogus_canary || bogus_gworld) {
-                        failed_attachments[failed_idx] = { eproc, attached_pid, now };
-                        failed_idx = (failed_idx + 1) & 3;
-                    }
-                    // v1.0.34: USPACE handle held by ah_uspace_read.c —
-                    // detach so the next RpmFindProcess re-tries a fresh
-                    // Toolhelp lookup (game may have relaunched with a new
-                    // PID between our reads).
                     if (procCR3 == AH_CR3_USPACE) {
                         AhUspaceDetach();
                     }
-                    // v1.0.37: keep g_target_hproc OPEN across the detach so
-                    // top-of-tick SYNCHRONIZE check still catches the death
-                    // signal from prior latch. Only closed on a fresh attach
-                    // (line 604) or thread exit.
                     attached_pid = 0;
                     procCR3 = 0; eproc = 0; imageBase = 0;
-                    gworld_scan_state = 0;   // allow sig-scan again for fresh instance
+                    gworld_scan_state = 0;
                     gworld_rva_live = AH_RVA_GWORLD;
                     gworld_seen = FALSE;
                     canary_seen = FALSE;
-                    last_find = 0;   // don't wait 5s more — probe immediately
+                    read_ok_ever = FALSE;
+                    sig_scan_last_ms = 0;   // v1.0.38.7
+                    sig_scan_misses  = 0;   // v1.0.38.7
+                    last_find = 0;
                     g_reader_state.store(AH_READER_WAITING_GAME);
                 } else {
                     last_find = now;
@@ -766,6 +800,7 @@ static void reader_body_impl(void) {
         if (procCR3 && imageBase) {
             u64 gworld = 0;
             BOOL rd_ok = RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
+            if (rd_ok)  read_ok_ever = TRUE;   // v1.0.38.5: any successful translate marks CR3-good
             if (gworld) gworld_seen = TRUE;
 
             // v1.0.27: CR3-stale auto-resync. When RpmRead64 itself returns
@@ -786,10 +821,14 @@ static void reader_body_impl(void) {
                                 cur, (unsigned long long)procCR3);
                     }
                     if (cur >= 500) {
-                        ah_diag("CR3-STALE tripped: 500 consecutive translate FAIL — "
-                                "force re-attach, blacklist current eproc/pid for 60s");
-                        failed_attachments[failed_idx] = { eproc, attached_pid, now };
-                        failed_idx = (failed_idx + 1) & 3;
+                        ah_test_trace_write("CR3-STALE TRIPPED pid=%llu eproc=0x%llX cr3=0x%llX",   // TEST-REMOVE
+                            (unsigned long long)attached_pid, (unsigned long long)eproc,
+                            (unsigned long long)procCR3);
+                        ah_diag("CR3-STALE tripped: 500 consecutive translate FAIL — force re-attach");
+                        // v1.0.38.6: blacklist push removed here too — walker
+                        // is authoritative via NtQSI(5) target_pid; if the same
+                        // eproc keeps coming back with dead CR3, walker's PID
+                        // match will handle re-latching on the fresh instance.
                         // v1.0.37: keep g_target_hproc open across CR3-STALE
                         // reset so top-of-tick SYNCHRONIZE check keeps working.
                         attached_pid = 0;
@@ -798,6 +837,9 @@ static void reader_body_impl(void) {
                         gworld_rva_live = AH_RVA_GWORLD;
                         gworld_seen = FALSE;
                         canary_seen = FALSE;
+                        read_ok_ever = FALSE;   // v1.0.38.5
+                        sig_scan_last_ms = 0;   // v1.0.38.7
+                        sig_scan_misses  = 0;   // v1.0.38.7
                         last_find = 0;
                         s_rpm_fail_streak = 0;
                         continue;
@@ -811,37 +853,113 @@ static void reader_body_impl(void) {
                 }
             }
 
-            // v0.9.455 game-gone watchdog. UAGame HWND is unreliable —
-            // Steam-wrapper holds the window handle for 30-60 s after the game
-            // closes, so game_owns_foreground() keeps returning true and the
-            // overlay hangs empty. gworld dropping to 0 for a sustained window
-            // is the reliable "game gone" signal. Overlay reads g_reader_state
-            // and self-exits cleanly on AH_READER_GAME_GONE.
+            // v1.0.38.9: GWorld-stuck watchdog. When canary_seen=1 (proves
+            // CR3 translates the RIGHT process) but gworld_seen stays 0 for
+            // 60 s+, we're not on menu (menu populates GWorld within seconds
+            // per PC2 field). Almost always kdu-stuck state: sig-scan may
+            // have LOCKED an RVA, so v1.0.38.8's miss-based auto-reattach
+            // won't fire. Force detach+re-attach here — new attach cycle
+            // often unsticks kdu reads.
+            if (canary_seen && !gworld_seen && attach_ms && procCR3 != AH_CR3_USPACE
+                && (now - attach_ms) > 60000)
+            {
+                gworld_stuck_count++;
+                ah_diag("GWORLD-STUCK watchdog #%d: canary_seen=1 gworld_seen=0 for %us "
+                        "(pid=%llu procCR3=0x%llX)",
+                        gworld_stuck_count,
+                        (unsigned)((now - attach_ms) / 1000),
+                        (unsigned long long)attached_pid,
+                        (unsigned long long)procCR3);
+
+                if (gworld_stuck_count >= 2) {
+                    // v1.0.38.10: re-attach at 1st stuck didn't cure it. kdu
+                    // driver state is fully wedged for this session — same
+                    // eproc/CR3 returned, sig-scan still misses. Spawn a
+                    // fresh overlay instance and exit current. New process
+                    // gets fresh kdu handle via DhProviderSelect — reliably
+                    // unsticks per Maik's field-verified manual restart.
+                    ah_diag("GWORLD-STUCK escalation: %d consecutive stucks — self-restart",
+                            gworld_stuck_count);
+                    wchar_t exe_path[MAX_PATH] = {0};
+                    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+                    STARTUPINFOW si = { sizeof(si) };
+                    PROCESS_INFORMATION pi = {};
+                    if (CreateProcessW(exe_path, nullptr, nullptr, nullptr, FALSE,
+                                       DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                                       nullptr, nullptr, &si, &pi))
+                    {
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        ah_diag("self-restart: spawned fresh overlay pid=%lu — exiting current",
+                                pi.dwProcessId);
+                        // v1.0.38.15 state-leak fix: teardown kdu driver +
+                        // SCM service + .sys blob + SYNCHRONIZE handle
+                        // BEFORE ExitProcess. Prior ExitProcess(0) raw-exit
+                        // left the service STARTED, driver image LOADED,
+                        // and \Device\inpoutx64 alive — the fresh overlay
+                        // we just spawned would then inherit this wedged
+                        // kernel state and fail the same way. Audit:
+                        // state-leak workflow finding BLOCKER (ExitProcess
+                        // zero cleanup, ah_reader_thread.cpp:888).
+                        if (g_target_hproc) {
+                            CloseHandle(g_target_hproc);
+                            g_target_hproc = NULL;
+                        }
+                        if (dev) CloseHandle(dev);
+                        DhProviderShutdownAll();
+                        // Small delay so log flushes + SCM finishes teardown.
+                        Sleep(500);
+                        ExitProcess(0);
+                    }
+                    ah_diag("self-restart FAILED: CreateProcess gle=%lu — falling back to another re-attach",
+                            GetLastError());
+                    // If CreateProcess failed, keep trying re-attach cycle.
+                }
+
+                attached_pid = 0;
+                procCR3 = 0; eproc = 0; imageBase = 0;
+                gworld_scan_state = 0;
+                gworld_rva_live = AH_RVA_GWORLD;
+                gworld_seen = FALSE;
+                canary_seen = FALSE;
+                read_ok_ever = FALSE;
+                sig_scan_last_ms = 0;
+                sig_scan_misses  = 0;
+                last_find = 0;
+                g_reader_state.store(AH_READER_WAITING_GAME);
+                continue;
+            }
+            // Clear consecutive stuck counter when gworld comes online.
+            if (gworld_seen && gworld_stuck_count) {
+                ah_diag("GWORLD-STUCK cleared: counter was %d, gworld_seen=1 now",
+                        gworld_stuck_count);
+                gworld_stuck_count = 0;
+            }
+
+            // v0.9.455 legacy watchdog: gworld=0 for 150 ticks used to mean
+            // "game gone". Field report 2026-09-29 (Discord user USMC2072G):
+            // gworld transient-drops on raid end / player death while
+            // UAGame.exe is STILL RUNNING — this trigger false-fires,
+            // overlay self-destructs mid-session, user has to relaunch and
+            // wait 10 min for re-attach. v1.0.37 SYNCHRONIZE handle
+            // (top-of-tick check) is the authoritative "process died"
+            // signal — gworld transitions no longer trip GAME_GONE.
+            // Diag streak kept for observability.
             {
                 static int s_gworld_zero_streak = 0;
                 if (gworld_seen) {
                     if (gworld == 0) {
                         int cur = ++s_gworld_zero_streak;
-                        // Log every 30 ticks to visualise how long we spin,
-                        // and log the exact tick we transition to GAME_GONE.
-                        if (cur == 30 || cur == 60 || cur == 100) {
-                            ah_diag("GAME-GONE watchdog: gworld=0 streak=%d (attached_pid=%llu)",
-                                    cur, (unsigned long long)attached_pid);
-                        }
-                        if (cur >= 150) {
-                            if (g_reader_state.load() != AH_READER_GAME_GONE) {
-                                ah_diag("GAME-GONE tripped: gworld=0 for 150 ticks — reader signaling overlay exit");
-                                g_reader_state.store(AH_READER_GAME_GONE);
-                            }
+                        if (cur == 30 || cur == 150 || cur == 500) {
+                            ah_diag("GAME-GONE watchdog: gworld=0 streak=%d (diag only — NOT tripping GAME_GONE, SYNCHRONIZE handle is authoritative)",
+                                    cur);
                         }
                     } else {
                         if (s_gworld_zero_streak > 0) {
-                            ah_diag("GAME-GONE cleared: gworld=0x%llX after streak=%d",
+                            ah_diag("gworld reappeared 0x%llX after streak=%d",
                                     (unsigned long long)gworld, s_gworld_zero_streak);
                             s_gworld_zero_streak = 0;
                         }
-                        if (g_reader_state.load() == AH_READER_GAME_GONE)
-                            g_reader_state.store(AH_READER_ATTACHED);
                     }
                 }
             }
@@ -861,14 +979,12 @@ static void reader_body_impl(void) {
             // servicing to the point of a hung PC without a bugcheck. 30 s
             // + 5-miss abort gives a ~90 % IOCTL cut on the failure path.
             if (!gworld && gworld_scan_state != 1 && procCR3) {
-                static DWORD s_last_scan_ms = 0;
-                static int   s_scan_misses  = 0;
                 DWORD now_ms = GetTickCount();
-                if (s_scan_misses < 5 &&
-                    (s_last_scan_ms == 0 || (now_ms - s_last_scan_ms) > 30000)) {
-                    s_last_scan_ms = now_ms;
+                if (sig_scan_misses < 5 &&
+                    (sig_scan_last_ms == 0 || (now_ms - sig_scan_last_ms) > 30000)) {
+                    sig_scan_last_ms = now_ms;
                     ah_diag("SIG-SCAN attempt #%d (state=%d gworld_rva=0x%llX gave NULL)",
-                            s_scan_misses + 1,
+                            sig_scan_misses + 1,
                             gworld_scan_state,
                             (unsigned long long)gworld_rva_live);
                     u64 found = ah_sig_scan_gworld(drv.hDevice, procCR3, imageBase);
@@ -879,11 +995,37 @@ static void reader_body_impl(void) {
                                 (long long)((int64_t)found - (int64_t)gworld_rva_live));
                         gworld_rva_live = found;
                         gworld_scan_state = 1;   // locked in — trust this RVA
-                        s_scan_misses = 0;
+                        sig_scan_misses = 0;
                         RpmRead64(drv.hDevice, procCR3, imageBase + gworld_rva_live, &gworld);
                     } else {
-                        s_scan_misses++;
-                        ah_diag("SIG-SCAN miss (%d/5) — next retry in 30s", s_scan_misses);
+                        sig_scan_misses++;
+                        ah_diag("SIG-SCAN miss (%d/5) — next retry in 30s", sig_scan_misses);
+                        // v1.0.38.8: at 5-miss cap with a working CR3 (canary
+                        // read OK), we're PROBABLY stuck on kdu-read failing
+                        // for GWorld's .text pages — field-observed PC1
+                        // 2026-10-01: same overlay, same UAGame, sig-scan can
+                        // find pattern on PC2 but ALL 5 attempts on PC1 return
+                        // 0 despite canary_seen=1. Fresh overlay restart cures
+                        // it. Automate the cure: force a full detach + walker
+                        // re-attach here. New attach cycle resets kdu context
+                        // and often unsticks reads.
+                        if (sig_scan_misses >= 5 && canary_seen && procCR3 != AH_CR3_USPACE) {
+                            ah_diag("SIG-SCAN EXHAUSTED with canary_seen — force detach+re-attach "
+                                    "(kdu-read pages of GWorld stuck)");
+                            if (procCR3 == AH_CR3_USPACE) AhUspaceDetach();
+                            attached_pid = 0;
+                            procCR3 = 0; eproc = 0; imageBase = 0;
+                            gworld_scan_state = 0;
+                            gworld_rva_live = AH_RVA_GWORLD;
+                            gworld_seen = FALSE;
+                            canary_seen = FALSE;
+                            read_ok_ever = FALSE;
+                            sig_scan_last_ms = 0;
+                            sig_scan_misses  = 0;
+                            last_find = 0;
+                            g_reader_state.store(AH_READER_WAITING_GAME);
+                            continue;
+                        }
                     }
                 }
             }
@@ -931,24 +1073,70 @@ static void reader_body_impl(void) {
                 RpmRead64(drv.hDevice, procCR3, gworld + AH_UW_GAMEINSTANCE, &gi);
                 RpmRead64(drv.hDevice, procCR3, gworld + AH_UW_GAMESTATE, &gs);
             }
-            // v0.9.455: LIVE transition — snapshot is only meaningful once both
-            // gworld AND gs are non-null. Between ATTACHED (process latched)
-            // and LIVE (world+state ready) we could publish garbage roomid or
-            // NULL pawn — overlay would see "in_raid" briefly and render
-            // empties. Now overlay checks state and gates its own render.
+            // v0.9.455: LIVE transition — snapshot is only meaningful once
+            // both gworld AND gs are non-null.
+            //
+            // v1.0.38 (root cause from crash-upload 7a1c90a5 @ 00:15:19):
+            // Between raids UAGame destroys the raid ASGGameState — UWorld's
+            // GameState pointer briefly targets deallocated memory. Windows
+            // debug heap (and ACE-adjacent alloc pools) fill freed regions
+            // with 0xCC, so the read returns gs=0xCCCCCCCCCCCCCCCC. Old gate
+            // `if (gworld && gs)` accepted this because 0xCCCC != 0 — reader
+            // went LIVE, published a snap sourced from that garbage pointer,
+            // overlay dereferenced roomid/scene/entities into the freed
+            // region → SIGSEGV, ec=0x1, "software disconnect" between raids.
+            //
+            // Fix: require gs to look like a canonical user-space heap ptr —
+            // upper 16 bits zero AND value above the lowest user page. This
+            // rejects 0xCC-filled freed memory, kernel VA, and near-null
+            // garbage. Gworld itself stays cached across the transition
+            // (per user: 'gworld присваивается при загрузке игры, он не
+            // должен падать во время рейда или перезагрузки').
+            //
+            // v1.0.38 (second half): decouple reader_state from gs. Between
+            // raids gs briefly becomes NULL then 0xCC-filled (freed
+            // GameState during lobby transition). Old code downgraded
+            // LIVE→ATTACHED on every gs miss — UI status HUD popped up
+            // ("GAME ATTACHED" / "waiting"), user perceived "attach
+            // обрывается между катками". Since gworld is persistent (fixed
+            // at game load per user report), we treat LIVE as sticky: once
+            // gworld+valid-gs seen at least ONCE this attach, stay LIVE
+            // regardless of gs transient misses. Snap.in_raid still tracks
+            // roomid/scene/ent_n so HUD hides during transitions, but the
+            // reader_state-driven overlay status message no longer flashes.
+            // Only reset to ATTACHED on: attach change (handled elsewhere),
+            // gworld becomes NULL (major loss), or GAME_GONE.
             {
+                auto looks_like_heap = [](u64 p) {
+                    return p && (p >> 48) == 0 && p > 0x10000ULL;
+                };
                 int st = g_reader_state.load();
-                if (gworld && gs) {
+                if (gworld && looks_like_heap(gs)) {
                     if (st == AH_READER_ATTACHED) {
+                        ah_test_trace_write("STATE ATTACHED->LIVE gworld=0x%llX gs=0x%llX", (unsigned long long)gworld, (unsigned long long)gs);   // TEST-REMOVE
                         ah_diag("READER-LIVE: gworld=0x%llX gs=0x%llX — publishing real snapshot",
                                 (unsigned long long)gworld, (unsigned long long)gs);
                         g_reader_state.store(AH_READER_LIVE);
                     }
-                } else if (st == AH_READER_LIVE) {
-                    ah_diag("READER-LIVE lost: gworld=0x%llX gs=0x%llX — back to ATTACHED",
-                            (unsigned long long)gworld, (unsigned long long)gs);
-                    g_reader_state.store(AH_READER_ATTACHED);
+                } else if (gworld && gs && !looks_like_heap(gs)) {
+                    if (tt_tick_log) {
+                        ah_test_trace_write("gs non-heap gate rejected gs=0x%llX gworld=0x%llX (probably freed GameState, keep state)",
+                            (unsigned long long)gs, (unsigned long long)gworld);
+                    }
+                } else if (!gworld) {
+                    // Only a NULL gworld triggers ATTACHED downgrade — gs
+                    // going 0/0xCC is normal between raids and does not
+                    // count as "world lost". Attach change is handled by
+                    // separate detach block resetting state to WAITING/INIT.
+                    if (st == AH_READER_LIVE) {
+                        ah_test_trace_write("STATE LIVE->ATTACHED gworld=0x0 (persistent world went NULL, unexpected)");   // TEST-REMOVE
+                        ah_diag("READER-LIVE lost: gworld=0x0 — back to ATTACHED (persistent world went NULL, unexpected)");
+                        g_reader_state.store(AH_READER_ATTACHED);
+                    }
                 }
+                // else: gworld valid, gs transient (0 or 0xCC pattern). Keep
+                // current state. snap.in_raid still tracks roomid/scene, so
+                // HUD gates hide during transitions without state flapping.
             }
             // v0.9.454: authoritative in-raid flag from ASGGameState+0x430.
             // Server sets on real raid start, clears on match end / return to
@@ -1360,22 +1548,51 @@ static void reader_body_impl(void) {
                                                        e_root, &dx, &dy, &dz);
 #ifdef AH_DIAG
                             {
-                                // Log first non-self enemy's decrypt every 3s
-                                // to see if encrypted-path fail is bucket miss.
-                                static DWORD s_last_enemy_diag = 0;
-                                static u64   s_last_pawn = 0;
-                                if (!e->is_me && (e_pawn != s_last_pawn ||
-                                    (GetTickCount() - s_last_enemy_diag) > 3000)) {
-                                    u32 ctl_e = 0;
-                                    RpmReadVirtual(drv.hDevice, procCR3, e_root + AH_ROOT_CTL, &ctl_e, 4);
-                                    ah_diag("ENEMY-DECRYPT pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u key=0x%X ok=%d fail=%d out=(%.0f,%.0f,%.0f)",
-                                            (unsigned long long)e_pawn,
-                                            (unsigned long long)e_root,
-                                            ctl_e, ctl_e >> 29, ctl_e & 0x1FFFFFF,
-                                            (int)dec_ok, (int)AhAceLastFail(),
-                                            dx, dy, dz);
-                                    s_last_pawn = e_pawn;
-                                    s_last_enemy_diag = GetTickCount();
+                                // v1.0.38.13: proper per-pawn throttle. Old
+                                // "pawn != s_last_pawn" fired for EVERY entity
+                                // in a 60-entity raid → ~100 diag lines/sec →
+                                // disk I/O + Defender scan pressure → reader
+                                // tick gaps up to 13s (field 2026-10-01 UI
+                                // freeze). Now: track when each pawn was last
+                                // logged, emit at most once per 30 s per pawn.
+                                // Auto-prunes to keep the map bounded.
+                                //
+                                // v1.0.38.16: thread_local, not static. Prior
+                                // static shared the map between reader threads
+                                // during stale ah_reader_reattach (old thread
+                                // wedged in kdu IOCTL + new thread spawned).
+                                // Both threads mutating the std::unordered_map
+                                // concurrently is UB (torn find/insert, rehash
+                                // race, iterator invalidation). thread_local =
+                                // each reader thread has its own map, zero
+                                // cross-thread sharing. Audit: HIGH data-race
+                                // #7 (ah_reader_thread.cpp:1565).
+                                thread_local std::unordered_map<u64, DWORD> s_pawn_last_diag;
+                                if (!e->is_me) {
+                                    DWORD now_dw = GetTickCount();
+                                    auto it = s_pawn_last_diag.find(e_pawn);
+                                    if (it == s_pawn_last_diag.end() || (now_dw - it->second) > 30000) {
+                                        u32 ctl_e = 0;
+                                        RpmReadVirtual(drv.hDevice, procCR3, e_root + AH_ROOT_CTL, &ctl_e, 4);
+                                        ah_diag("ENEMY-DECRYPT pawn=0x%llX root=0x%llX ctl=0x%08X algo=%u key=0x%X ok=%d fail=%d out=(%.0f,%.0f,%.0f)",
+                                                (unsigned long long)e_pawn,
+                                                (unsigned long long)e_root,
+                                                ctl_e, ctl_e >> 29, ctl_e & 0x1FFFFFF,
+                                                (int)dec_ok, (int)AhAceLastFail(),
+                                                dx, dy, dz);
+                                        s_pawn_last_diag[e_pawn] = now_dw;
+                                        // Prune stale entries when the map
+                                        // grows past a raid's worth (128) —
+                                        // pool pawns get recycled between raids.
+                                        if (s_pawn_last_diag.size() > 128) {
+                                            for (auto pit = s_pawn_last_diag.begin(); pit != s_pawn_last_diag.end(); ) {
+                                                if ((now_dw - pit->second) > 60000)
+                                                    pit = s_pawn_last_diag.erase(pit);
+                                                else
+                                                    ++pit;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 #endif
@@ -1944,14 +2161,24 @@ static void reader_body_impl(void) {
                         RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_MESH, &mesh);
                         RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_CAPSULE, &cap);
                         RpmRead64(drv.hDevice, procCR3, a + AH_PAWN_ROOT, &root);
-                        if (!mesh || !cap || !root) {
-                            g_bot_vt_kind[vt] = 0;   // structurally not a pawn
+                        // v1.0.38.13: DO NOT permanent-cache vt=0 on a transient
+                        // read failure. Field 2026-10-01: "1 бот не отобразился"
+                        // — bot's vt was probed while kdu slot contended (mesh/
+                        // cap/root all read as 0 for that one shot), vt cached
+                        // as non-pawn FOREVER → every future bot with same vt
+                        // silently skipped until overlay restart. Only cache the
+                        // reject when shape probe SUCCEEDS but reports out-of-
+                        // range capsule dims. Transient failures just skip this
+                        // iteration; next Level.Actors chunk re-probes.
+                        if (!mesh || !cap || !root) continue;
+                        float hh = 0, rr = 0;
+                        BOOL rh = RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_HALFHEIGHT, &hh, 4);
+                        BOOL rr_ok = RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_RADIUS, &rr, 4);
+                        if (!rh || !rr_ok) continue;   // transient read fail — retry next cycle
+                        if (hh < 20.0f || hh > 200.0f || rr < 5.0f || rr > 200.0f) {
+                            g_bot_vt_kind[vt] = 0;   // now legitimate: shape confirmed non-humanoid
                             continue;
                         }
-                        float hh = 0, rr = 0;
-                        RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_HALFHEIGHT, &hh, 4);
-                        RpmReadVirtual(drv.hDevice, procCR3, cap + AH_CAPSULE_RADIUS, &rr, 4);
-                        if (hh < 20.0f || hh > 200.0f || rr < 5.0f || rr > 200.0f) continue;
                         g_bot_vt_kind[vt] = 1;   // cache as pawn-shaped
                     }
                     // Freeze cap on first insert (cheap 2 RPM, static thereafter).
@@ -2148,6 +2375,12 @@ static void reader_body_impl(void) {
 
     CloseHandle(dev);
     if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
+    // v1.0.38.15 state-leak fix: full provider teardown so overlay exit
+    // leaves no SCM service STARTED, no driver image LOADED, no
+    // \Device\inpoutx64 alive, no .sys blob orphan in %TEMP%. Audit:
+    // state-leak workflow BLOCKER #2,#3 (missing-teardown / cross-session-
+    // state-leak at ah_reader_thread.cpp:2341).
+    DhProviderShutdownAll();
     timeEndPeriod(1);
     g_thread_alive.store(false);
 }
@@ -2171,13 +2404,16 @@ extern "C" void ah_reader_stop(void) {
 // Now waits 3 s and REFUSES to spawn a duplicate if the old thread hasn't
 // unwound. User can press F10 again after the previous attempt finishes.
 extern "C" void ah_reader_reattach(void) {
+    ah_test_trace_write("ah_reader_reattach ENTRY");   // TEST-REMOVE
     static std::atomic<int> s_in_progress{0};
     int expected = 0;
     if (!s_in_progress.compare_exchange_strong(expected, 1)) {
+        ah_test_trace_write("ah_reader_reattach REJECTED — CAS failed");   // TEST-REMOVE
         ah_diag("=== reader_reattach REJECTED — previous attach still in progress ===");
         return;
     }
     ah_diag("=== reader_reattach requested ===");
+    ah_test_trace_write("ah_reader_reattach CAS OK, setting g_run=false");   // TEST-REMOVE
     g_run.store(false);
     // v1.0.38: field report — F10 не помогает when reader is wedged on a
     // multi-second kdu IOCTL stall. Old logic refused to spawn a fresh
@@ -2189,6 +2425,17 @@ extern "C" void ah_reader_reattach(void) {
     if (g_thread_alive.load()) {
         ah_diag("reader_reattach: old thread wedged after 1s — spawning fresh anyway (old dies when its RPM returns)");
     }
+    // v1.0.38.15 BLOCKER fix: close g_target_hproc BEFORE spawning the fresh
+    // reader thread. If the old thread is wedged in a kdu IOCTL (never
+    // reached its normal cleanup at reader_body exit) AND UAGame has died
+    // between stall and reattach, g_target_hproc still points at the dead
+    // PID. Handles to terminated processes stay valid and signal
+    // immediately on WaitForSingleObject, so the new reader's first tick
+    // SYNCHRONIZE check at the top of its loop would see WAIT_OBJECT_0 and
+    // transition straight to AH_READER_GAME_GONE, which triggers overlay
+    // self-destruct (MoveFileEx-reboot delete of the overlay exe). Audit:
+    // workflow finding #1 BLOCKER (ah_reader_thread.cpp:2383, confirmed).
+    if (g_target_hproc) { CloseHandle(g_target_hproc); g_target_hproc = NULL; }
     g_reader_hz.store(0.0f);
     g_reader_ticks.store(0);
     g_reader_last_ms.store(0);

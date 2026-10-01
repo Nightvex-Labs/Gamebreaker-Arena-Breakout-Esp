@@ -11,15 +11,18 @@
 #include <math.h>
 #include <stdio.h>
 #include <imgui.h>
+extern "C" {
+#include "../inc/ah_test_trace.h"    // TEST-REMOVE: instrumentation
+}
 #include "abi_ui/overlay.hpp"
 #include "abi_ui/control_panel.hpp"
 #include "abi_ui/menu_v3.hpp"
+
+extern "C" float ah_get_panel_dpi(void);
 #include "abi_ui/render.hpp"
 #include "abi_ui/snapshot.hpp"
 #include "abi_ui/image_loader.hpp"
 #include <d3d11.h>
-
-extern "C" float ah_get_panel_dpi(void);
 
 namespace abi {
     void render_radar    (const Snapshot* snap, const RenderConfig& cfg);
@@ -80,10 +83,17 @@ static void hotkey_thread(void) {
 }
 
 extern "C" int AhOverlayRun(void) {
+    ah_test_trace_write("AhOverlayRun ENTER");   // TEST-REMOVE
     abi::Overlay ov;
     const int sw = GetSystemMetrics(SM_CXSCREEN);
     const int sh = GetSystemMetrics(SM_CYSCREEN);
-    if (!ov.init(sw, sh)) { DH_ERROR("abi::Overlay::init failed"); return 1; }
+    ah_test_trace_write("AhOverlayRun screen=%dx%d, calling ov.init", sw, sh);   // TEST-REMOVE
+    if (!ov.init(sw, sh)) {
+        ah_test_trace_write("AhOverlayRun ov.init FAILED — return 1 (this IS ec=0x1 source at startup)");   // TEST-REMOVE
+        DH_ERROR("abi::Overlay::init failed");
+        return 1;
+    }
+    ah_test_trace_write("AhOverlayRun ov.init OK");   // TEST-REMOVE
 
     // Load operator.png. Primary path: embedded byte array — the overlay is
     // self-contained, no sidecar file needed. Sidecar fallbacks kept for dev
@@ -182,6 +192,7 @@ extern "C" int AhOverlayRun(void) {
         bool async_bit = (GetAsyncKeyState(VK_HOME) & 1) != 0;
         if (!toggle && async_bit) toggle = true;
         if (toggle) {
+            ah_test_trace_write("HOME toggle → show_control_panel=%d", (int)!cfg.show_control_panel);   // TEST-REMOVE
             cfg.show_control_panel = !cfg.show_control_panel;
             ov.set_input_capture(cfg.show_control_panel);
         }
@@ -194,8 +205,10 @@ extern "C" int AhOverlayRun(void) {
             static bool f10_edge = false;
             bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
             if (f10_down && !f10_edge) {
+                ah_test_trace_write("F10 edge → ah_reader_reattach() call");   // TEST-REMOVE
                 DH_INFO("F10 pressed → ah_reader_reattach()");
                 ah_reader_reattach();
+                ah_test_trace_write("F10 ah_reader_reattach() returned");   // TEST-REMOVE
             }
             f10_edge = f10_down;
         }
@@ -315,11 +328,22 @@ extern "C" int AhOverlayRun(void) {
         // Restore only under a build flag if needed for field diag.
         (void)alive_n;
 
+        // TEST-REMOVE: frame counter for lambda so log lines correlate with
+        // Overlay::run frame counter above.
+        static unsigned long long tt_lambda_frame = 0;
+        tt_lambda_frame++;
+        bool tt_this = (tt_lambda_frame % 300) == 0;
+        if (tt_this) TEST_TRACE("lambda frame=%llu ent_n=%d in_raid=%d",
+                                tt_lambda_frame, (int)stub_snap.entities.size(), (int)stub_snap.in_raid);
         // World ESP: boxes, names, HP for each entity. Draws on background
         // list so menu (foreground) sits above.
+        if (tt_this) TEST_TRACE("render_frame call frame=%llu", tt_lambda_frame);
         abi::render_frame(&stub_snap, cfg);
+        if (tt_this) TEST_TRACE("render_frame returned frame=%llu", tt_lambda_frame);
         // Floor-loot markers (colored dots + price text via rarity).
+        if (tt_this) TEST_TRACE("render_loot call frame=%llu", tt_lambda_frame);
         abi::render_loot(&stub_snap, cfg);
+        if (tt_this) TEST_TRACE("render_loot returned frame=%llu", tt_lambda_frame);
         // Fey HUD stack (per ABIFINAL main.cpp:1535+): stats chips + nearest
         // enemy cards (with mag column N/M — this is the requested enemy
         // ammo counter), top-loot list, own-ammo circular.  Wrap in
@@ -330,9 +354,15 @@ extern "C" int AhOverlayRun(void) {
             const float user_scale  = (float)cfg.text_scale_pct * 0.01f;
             io_hud.FontGlobalScale  = saved_scale * user_scale;
             float hud_bottom = 0.0f;
+            if (tt_this) TEST_TRACE("stats_and_nearest call frame=%llu", tt_lambda_frame);
             abi::hud::stats_and_nearest(&stub_snap, cfg, 60.0f, &hud_bottom);
+            if (tt_this) TEST_TRACE("stats_and_nearest returned bottom=%.1f", hud_bottom);
+            if (tt_this) TEST_TRACE("top_loot call frame=%llu", tt_lambda_frame);
             abi::hud::top_loot(&stub_snap, cfg, hud_bottom);
+            if (tt_this) TEST_TRACE("top_loot returned frame=%llu", tt_lambda_frame);
+            if (tt_this) TEST_TRACE("ammo_counter call frame=%llu", tt_lambda_frame);
             abi::hud::ammo_counter(&stub_snap, cfg);
+            if (tt_this) TEST_TRACE("ammo_counter returned frame=%llu", tt_lambda_frame);
             io_hud.FontGlobalScale = saved_scale;
         }
 
@@ -416,15 +446,22 @@ extern "C" int AhOverlayRun(void) {
         }
 
         if (cfg.show_control_panel) {
+            if (tt_this) TEST_TRACE("menu_v3 call frame=%llu", tt_lambda_frame);
             abi::menu_v3_pull(cfg);
             abi::render_menu_v3();
             abi::menu_v3_push(cfg);
+            if (tt_this) TEST_TRACE("menu_v3 returned frame=%llu", tt_lambda_frame);
         }
     });
 
+    ah_test_trace_write("AhOverlayRun post-lambda — ov.run returned normally");   // TEST-REMOVE
     g_hk_run.store(false);
+    ah_test_trace_write("AhOverlayRun hotkey thread join");   // TEST-REMOVE
     if (hk.joinable()) hk.join();
+    ah_test_trace_write("AhOverlayRun ah_reader_stop");   // TEST-REMOVE
     ah_reader_stop();
+    ah_test_trace_write("AhOverlayRun ov.shutdown");   // TEST-REMOVE
     ov.shutdown();
+    ah_test_trace_write("AhOverlayRun EXIT rv=0 (normal)");   // TEST-REMOVE
     return 0;
 }

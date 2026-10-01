@@ -28,7 +28,16 @@
 // the same section shift. If ACE decrypt returns garbage after this,
 // port sig_scanner ACE_CACHE hunt from ABIFINAL.
 #define AH_RVA_FNAME_MASK_KEY   0xBB02FACULL
-#define AH_RVA_ACE_CACHE        0xB5E4D40ULL   // 2026-09-24 try2: GObjects-section delta (+0x24940)
+// v1.0.38.14 2026-10-01: match github.com/Nightvex-Labs/
+// Arena-Breakout-Infinite-Radar prod value (2026-09-25 runtime
+// sig-discovery, key-verified: key=0x12FF, LEA @ 0xCEB08E in ACE
+// bucket-hash fn). Prior 0xB5E4D40 (local 09-24 "+0x24940 delta"
+// guess) was off by 0x30 (6 buckets). Our murmur/hash code bytes-identical
+// to radar's → same algo, same baseline → encrypted enemies now decrypt.
+// Field evidence that forced this: voiddrift / warriormaster algo=7 fail=5
+// BUCKET_MISS every attempt (0xB5E4D40), web radar same build worked
+// (0xB5E4D70).
+#define AH_RVA_ACE_CACHE        0xB5E4D70ULL   // 2026-09-25 radar-verified
 
 #define AH_FNAME_POOL_OFF       0x7D000        // pool base -> entry 0 offset (Tencent-fork)
 #define AH_FNAME_MASK_LITERAL   0x4A           // literal in mask_eff derive

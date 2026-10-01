@@ -11,7 +11,7 @@ struct RenderConfig {
     // === PLAYERS (PMC) ===
     // Defaults ON per user request (2026-09-24): "оставь 1 где всё вкл".
     // Skeleton stays OFF — not implemented.
-    int   box_mode{2};                // 0=off, 2=2D, 3=3D  (Players box) — 2D как в превью
+    int   box_mode{3};                // 0=off, 2=2D, 3=3D  (Players box)
     bool  show_box_pmc{true};
     bool  show_name{true};
     bool  show_team_id{true};
@@ -38,7 +38,7 @@ struct RenderConfig {
     bool  show_stats{false};              // v0.9.337: default OFF — dev-only panel
     bool  box_corners{true};              // v0.9.430: PMC corner-bracket style
     bool  box_corners_bot{true};          // v0.9.430: BOT corner-bracket style (separated)
-    int   armor_display{1};               // 0=Off, 1=Text (default), 2=Bar
+    int   armor_display{1};               // v0.9.337: 0=Off, 1=Text (default), 2=Bar
     bool  show_armor_master{true};         // ME-tab master toggle; when false suppresses ALL armor rendering
     float armor_bar_font_scale{1.35f};    // label size multiplier over auto-computed base
     bool  armor_bar_no_distance_clamp{true}; // when true the armor bar draws regardless of box height
@@ -77,13 +77,13 @@ struct RenderConfig {
     bool  visible_check_on{true};     // v0.9.393 color box green when enemy visible (LastRenderTime check)
     ImU32 col_visible{IM_COL32(80,255,80,255)};  // v0.9.410 configurable visible-check tint
     bool  show_connection{false};      // "net OK/DOWN" status line
-    bool  show_top_loot{false};        // list удалён из UI (мировые маркеры остаются)
+    bool  show_top_loot{true};         // right-side sidebar
     int   top_loot_max{10};
     float top_loot_range_m{150.0f};
-    int   min_loot_value{75000};      // 1..1000000
+    int   min_loot_value{25000};      // 1..1000000
 
     // === RADAR ===
-    bool  show_radar{false};   // радар выключен по умолчанию — пользователь включает из UI
+    bool  show_radar{true};
     bool  show_radar_bots{true};
     bool  show_radar_pmc{true};
     float radar_range_m{100.0f};      // 50..400 (v0.9.470: 100m standard)
@@ -177,23 +177,21 @@ struct RenderConfig {
     // "Visible" green tint still overrides for enemies you can shoot; dead
     // grey still overrides for dropped entities. Everything else uses these.
     // Format: IM_COL32(R,G,B,A) — 0xAABBGGRR little-endian on disk.
-    // Military-muted palette — darker, less saturated versions of the peach
-    // scheme so labels sit calmly on top of the raid rather than shouting.
-    ImU32 col_box_pmc      {IM_COL32(190, 118,  95, 255)}; // muted terracotta
-    ImU32 col_box_bot      {IM_COL32(190, 118,  95, 255)}; // muted terracotta
-    ImU32 col_name_pmc     {IM_COL32(200, 200, 192, 255)}; // bone (not pure white)
-    ImU32 col_name_bot     {IM_COL32(200, 200, 192, 255)}; // bone
-    ImU32 col_team         {IM_COL32(130, 140, 160, 255)}; // dusty steel-blue
-    ImU32 col_weapon_pmc   {IM_COL32(170, 160, 138, 255)}; // khaki
-    ImU32 col_weapon_bot   {IM_COL32(170, 160, 138, 255)};
-    ImU32 col_ammo_pmc     {IM_COL32(130, 148, 165, 255)}; // dark steel-blue
-    ImU32 col_ammo_bot     {IM_COL32(130, 148, 165, 255)};
-    ImU32 col_armor_pmc    {IM_COL32(170, 160, 138, 255)}; // khaki (fallback only)
-    ImU32 col_armor_bot    {IM_COL32(170, 160, 138, 255)};
-    ImU32 col_distance_pmc {IM_COL32(118, 152, 118, 255)}; // olive/army green
-    ImU32 col_distance_bot {IM_COL32(118, 152, 118, 255)}; // olive/army green
-    ImU32 col_corpses_pmc  {IM_COL32(125, 131, 158, 255)}; // #7D839E
-    ImU32 col_corpses_bot  {IM_COL32(125, 131, 158, 255)};
+    ImU32 col_box_pmc      {IM_COL32(255, 255, 255, 255)}; // white
+    ImU32 col_box_bot      {IM_COL32(255,  90,  90, 255)}; // red
+    ImU32 col_name_pmc     {IM_COL32(150, 170, 255, 255)}; // pale blue
+    ImU32 col_name_bot     {IM_COL32(150, 170, 255, 255)};
+    ImU32 col_team         {IM_COL32(212,  82, 122, 255)}; // rose
+    ImU32 col_weapon_pmc   {IM_COL32(200, 140, 255, 255)}; // purple
+    ImU32 col_weapon_bot   {IM_COL32(200, 140, 255, 255)};
+    ImU32 col_ammo_pmc     {IM_COL32( 96, 204, 168, 255)}; // teal
+    ImU32 col_ammo_bot     {IM_COL32( 96, 204, 168, 255)};
+    ImU32 col_armor_pmc    {IM_COL32(230, 120, 150, 255)}; // pink
+    ImU32 col_armor_bot    {IM_COL32(230, 120, 150, 255)};
+    ImU32 col_distance_pmc {IM_COL32( 96, 204, 168, 255)}; // teal
+    ImU32 col_distance_bot {IM_COL32( 96, 204, 168, 255)};
+    ImU32 col_corpses_pmc  {IM_COL32(150, 150, 150, 255)}; // grey
+    ImU32 col_corpses_bot  {IM_COL32(150, 150, 150, 255)};
     ImU32 col_allies       {IM_COL32( 80, 220, 130, 255)}; // green
     ImU32 col_nearest      {IM_COL32(212,  82, 122, 255)}; // rose
     ImU32 col_head         {IM_COL32(230,  90,  90, 255)}; // red

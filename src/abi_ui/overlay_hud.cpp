@@ -8,6 +8,9 @@
 //   • угол радара берётся из cfg.radar_position, а не из дефолтного аргумента.
 
 #include "overlay_hud.hpp"
+extern "C" {
+#include "../../inc/ah_test_trace.h"   // TEST-REMOVE
+}
 #include "palette.hpp"
 
 #include <imgui.h>
@@ -156,6 +159,10 @@ ImVec2 corner_origin(int position_idx, float size, float pad,
 // эталонная строка из §5 была на экране.
 void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
                        float framerate, float* out_bottom_y) {
+    // TEST-REMOVE
+    static unsigned long long tt_sn = 0; tt_sn++;
+    if ((tt_sn % 300) == 0) ah_test_trace_write("stats_and_nearest ENTER #%llu snap=%p ent=%zu",
+        tt_sn, (void*)snap, snap ? snap->entities.size() : 0);
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
     ImFont* fmono = font_mono();
@@ -227,11 +234,23 @@ void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
         return;
     }
 
+    // v1.0.38.17 HIGH fix: nearest-cards list honored only self + BOT_*
+    // skip. Teammates (same team as local player) fell through and rendered
+    // with full card chrome (name, weapon, mag counter, armor pill, VIS/DEAD),
+    // which contradicted every sibling render path that respects
+    // cfg.show_mates (overlay_hud.cpp radar, render.cpp ESP). Apply the
+    // same team filter the radar uses. Audit workflow HIGH
+    // (overlay_hud.cpp:243 info-leak, trek B).
+    int my_team = -1;
+    for (const auto& e : snap->entities) {
+        if (e.me) { my_team = e.team; break; }
+    }
     std::vector<const Entity*> es;
     es.reserve(snap->entities.size());
     for (const auto& e : snap->entities) {
         if (e.me) continue;
         if (e.cls.starts_with("BOT")) continue;
+        if (!cfg.show_mates && my_team >= 0 && e.team == my_team) continue;
         es.push_back(&e);
     }
     std::sort(es.begin(), es.end(), [&](const Entity* a, const Entity* b) {
@@ -314,8 +333,11 @@ void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
         }
 
         // 5. Броня — пилюля по правому краю R_ARMOR, токены окрашены по тиру.
+        // v1.0.38.12: боты in-game брони не носят — скрываем пилюлю целиком
+        // для BOT-класса (иначе рисуем EN_DASH placeholder, засоряет HUD).
         {
-            bool has_armor = (e->helm >= 0 || e->vest >= 0);
+            bool is_bot_ent = e->cls.starts_with("BOT");
+            bool has_armor  = !is_bot_ent && (e->helm >= 0 || e->vest >= 0);
             if (has_armor) {
                 char hbuf[8] = "", vbuf[8] = "";
                 if (e->helm >= 0) std::snprintf(hbuf, sizeof(hbuf), "H%d", e->helm);
@@ -338,7 +360,9 @@ void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
                     dl->AddText(fmono, CARD_FS_ARMOR, ImVec2(tx_, ty_),
                                 e->dead ? P::TEXT_DIM : P::armor_tier_col(e->vest), vbuf);
                 }
-            } else {
+            } else if (!is_bot_ent) {
+                // v1.0.38.12: EN_DASH только для PMC без прочитанной брони;
+                // для ботов вообще не рисуем.
                 float dw = fmono->CalcTextSizeA(CARD_FS_ARMOR, FLT_MAX, 0.0f, EN_DASH).x;
                 dl->AddText(fmono, CARD_FS_ARMOR,
                             ImVec2(R_ARMOR - dw, cap_top(fmono, cy, CARD_FS_ARMOR)),
@@ -403,6 +427,10 @@ void stats_and_nearest(const Snapshot* snap, const RenderConfig& cfg,
 // заполненной пропорционально price / max(price). Цвет тира лежит и на цене,
 // и на полосе, поэтому легендарная строка читается золотом целиком.
 void top_loot(const Snapshot* snap, const RenderConfig& cfg, float y_anchor) {
+    // TEST-REMOVE
+    static unsigned long long tt_tl = 0; tt_tl++;
+    if ((tt_tl % 300) == 0) ah_test_trace_write("top_loot ENTER #%llu snap=%p loot=%zu",
+        tt_tl, (void*)snap, snap ? snap->loot.size() : 0);
     if (!cfg.show_top_loot) return;
     if (!snap || !snap->in_raid) return;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
@@ -703,6 +731,10 @@ void radar_at(const Snapshot* snap, const RenderConfig& cfg,
 
 // Боевой вызов: угол и размер берутся из конфига, рисуем в передний слой.
 void radar(const Snapshot* snap, const RenderConfig& cfg) {
+    // TEST-REMOVE
+    static unsigned long long tt_r = 0; tt_r++;
+    if ((tt_r % 300) == 0) ah_test_trace_write("radar ENTER #%llu snap=%p",
+        tt_r, (void*)snap);
     if (!cfg.show_radar) return;
     if (!snap || !snap->in_raid) return;
     const float S = (float)cfg.radar_px_radius * 2.0f;
@@ -720,6 +752,10 @@ void radar(const Snapshot* snap, const RenderConfig& cfg) {
 // тенью, чтобы читалось на светлом кадре. На нуле дуга исчезает, а нижняя
 // строка становится «RELOAD» бордовым.
 void ammo_counter(const Snapshot* snap, const RenderConfig& cfg) {
+    // TEST-REMOVE
+    static unsigned long long tt_ac = 0; tt_ac++;
+    if ((tt_ac % 300) == 0) ah_test_trace_write("ammo_counter ENTER #%llu snap=%p show_my=%d",
+        tt_ac, (void*)snap, (int)cfg.show_my_ammo);
     if (!cfg.show_my_ammo || !snap) return;
     const auto& cam = snap->cam;
     int cur = cam.mag_cur_a;

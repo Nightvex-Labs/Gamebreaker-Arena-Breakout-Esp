@@ -36,6 +36,5 @@ build_log.txt
 *.vmp
 *.vmp.exe
 *.vmp_out.exe
-
-# Vendored freetype import library (needed for fresh checkouts)
-!deps/freetype/lib/freetype.lib
+tools/*.exe
+/* generated binaries */

@@ -62,6 +62,13 @@ u64 AhUspaceBase(void);
 // PROCESS_VM_READ post-open, so we probe before publishing "attached".
 BOOL AhUspaceVerify(void);
 
+// v1.0.38: session-scope disable state. Set by AhUspaceMarkBroken() when
+// reads start failing mid-session (ACE ObRegisterCallbacks revoked
+// PROCESS_VM_READ ~10s after OpenProcess). Once TRUE, AhUspaceAttach()
+// refuses, RpmFindProcess falls through to kdu path.
+BOOL AhUspaceDisabled(void);
+void AhUspaceMarkBroken(void);
+
 #ifdef __cplusplus
 }
 #endif

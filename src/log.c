@@ -3,6 +3,24 @@
 #include <time.h>
 #include <shlobj.h>
 
+// v1.0.38.16 atomicity fix: dh_log is called from multiple threads
+// (reader_body, overlay UI, atexit teardown). Prior implementation did
+// unlocked fprintf+vfprintf+fputc sequences → interleaved output when two
+// threads log concurrently → forensics show garbled "[hh:mm:ss ...] <half
+// line A><half line B>\n<rest A>\n". Lock around every emit so each log
+// line is atomic. Init-once pattern (0→1→2 sentinel) matches
+// ah_test_trace.c, loser waits for state=2.
+static CRITICAL_SECTION s_log_cs;
+static volatile LONG    s_log_cs_init = 0;
+static void log_cs_init_once(void) {
+    if (InterlockedCompareExchange(&s_log_cs_init, 1, 0) == 0) {
+        InitializeCriticalSection(&s_log_cs);
+        InterlockedExchange(&s_log_cs_init, 2);
+    } else {
+        while (s_log_cs_init != 2) SwitchToThread();
+    }
+}
+
 static const char* dh_lvl_tag(dh_log_level l) {
     switch (l) {
         case DH_LOG_TRACE: return "TRACE";
@@ -43,10 +61,13 @@ void dh_log(dh_log_level lvl, const char* fmt, ...) {
     // reach the file — enough for crash post-mortem, no gameplay leak.
     if (lvl == DH_LOG_INFO || lvl == DH_LOG_TRACE) return;
 #endif
+    log_cs_init_once();
     if (!g_dh_log_fp) dh_log_open();
 
     SYSTEMTIME st;
     GetLocalTime(&st);
+
+    EnterCriticalSection(&s_log_cs);
 
     va_list ap;
     va_start(ap, fmt);
@@ -72,4 +93,6 @@ void dh_log(dh_log_level lvl, const char* fmt, ...) {
     }
 
     va_end(ap);
+
+    LeaveCriticalSection(&s_log_cs);
 }

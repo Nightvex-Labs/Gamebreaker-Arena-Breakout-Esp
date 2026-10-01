@@ -25,6 +25,23 @@ static u64                   g_base  = 0;
 static DWORD                 g_pid   = 0;
 static pNtReadVirtualMemory  g_ntrvm = NULL;
 
+// v1.0.38: session-scope disable flag. Set by AhUspaceMarkBroken() when
+// reads start failing mid-session — indicates ACE ObRegisterCallbacks
+// revoked PROCESS_VM_READ after ~10s (classic pattern). Once tripped
+// USPACE stays off for the rest of this overlay process life; reader
+// re-probe falls through to kdu path (survives VM_READ revoke because
+// it uses physical memory + CR3 translation instead of NtReadVirtualMemory).
+static BOOL                  g_uspace_disabled = FALSE;
+
+BOOL AhUspaceDisabled(void) { return g_uspace_disabled; }
+
+void AhUspaceMarkBroken(void) {
+    // Callers already log via ah_diag; no local diag call needed here.
+    g_uspace_disabled = TRUE;
+    if (g_hproc) { CloseHandle(g_hproc); g_hproc = NULL; }
+    g_pid = 0; g_base = 0;
+}
+
 static void diag_log(const char* fmt, ...) {
 #ifdef AH_DIAG
     HANDLE h = CreateFileA("C:\\Users\\Public\\ah_procs.log",
@@ -154,17 +171,28 @@ BOOL AhUspaceAttach(const char* procName, DWORD* out_pid, u64* out_base) {
         }
     }
 
+    // v1.0.38.1: Module32-fallback. ACE strips
+    // CreateToolhelp32Snapshot(TH32CS_SNAPMODULE) access on the game
+    // process — every Module32FirstW returns base=0/size=0. We used to
+    // reject on that, which killed USPACE on every attach.
+    //
+    // Falling back to fixed UE4 shipping base 0x140000000: the MZ probe
+    // below still validates that we're pointed at a real UAGame image;
+    // the IsWow64 gate above already killed 32-bit wrappers; and Toolhelp
+    // process-name whitelist (UAGame.exe / UAGameShipping.exe) locked
+    // the identity before we got here. Losing the SizeOfImage sanity
+    // check is a tolerable trade — no size-legit-but-wrong-process
+    // scenario survives the previous belts.
     u64 base = 0, msize = 0;
-    if (!module_info_via_toolhelp(pid, &base, &msize) || !base) {
-        diag_log("USPACE: Module32 failed PID=%lu (base=0x%llX size=%llu)",
-                 pid, (unsigned long long)base, (unsigned long long)msize);
-        CloseHandle(h);
-        return FALSE;
+    (void)module_info_via_toolhelp(pid, &base, &msize);
+    if (!base) {
+        diag_log("USPACE: Module32 access stripped by ACE — using fixed UE4 base 0x140000000, MZ probe will validate");
+        base = 0x140000000ULL;
+        msize = 0;
     }
 
-    // Second belt: UE4 shipping build links at 0x140000000 and stays high
-    // even with ASLR — always >= 4 GB. Wrappers/.NET loaders sit at
-    // 0x400000 (below 4 GB). Reject anything under.
+    // UE4 shipping links at 0x140000000. Anything below 4 GB is a
+    // wrapper (arena_breakout_infinite_launcher.exe sits at 0x400000).
     if (base < 0x100000000ULL) {
         diag_log("USPACE: REJECT wrapper PID=%lu base=0x%llX (< 4GB)",
                  pid, (unsigned long long)base);
@@ -172,11 +200,10 @@ BOOL AhUspaceAttach(const char* procName, DWORD* out_pid, u64* out_base) {
         return FALSE;
     }
 
-    // Third belt: SizeOfImage sanity. UAGame.exe ~200-500 MB.
-    // arena_breakout_infinite_launcher.exe ~20 MB in working set (field
-    // observation). SizeOfImage of a small .NET loader stays well under
-    // 100 MB. Cut at 100 MB — dead middle of the gap.
-    if (msize < 100ULL * 1024ULL * 1024ULL) {
+    // SizeOfImage sanity ONLY if we got a real value from Module32.
+    // When Module32 was stripped (msize=0) we skip this belt — MZ probe
+    // below is enough to validate the image identity.
+    if (msize > 0 && msize < 100ULL * 1024ULL * 1024ULL) {
         diag_log("USPACE: REJECT PID=%lu ModSize=%llu MB (< 100 MB, not UAGame)",
                  pid, (unsigned long long)(msize / (1024ULL * 1024ULL)));
         CloseHandle(h);

